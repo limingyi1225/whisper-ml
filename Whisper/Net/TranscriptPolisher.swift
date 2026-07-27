@@ -196,7 +196,7 @@ final class TranscriptPolisher {
     /// both bounds: "对" → "对。" doubles, and a filler-heavy
     /// "嗯嗯嗯那个那个我觉得就是嗯可以" legitimately collapses to "可以。" —
     /// exactly the input this feature exists for.
-    private func isPlausible(_ cleaned: String, from raw: String) -> Bool {
+    func isPlausible(_ cleaned: String, from raw: String) -> Bool {
         guard !cleaned.isEmpty else { return false }
         let ratio = Double(cleaned.count) / Double(max(raw.count, 1))
         let shortEnoughToJudgeByEye = raw.count <= 30

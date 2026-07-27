@@ -27,6 +27,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previousApplication: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Unit tests use this app as their host process. Starting the real
+        // pipeline there would install an event tap, spin up audio, and pop
+        // permission prompts in the middle of a test run.
+        if ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("XCTest") }) {
+            return
+        }
         // Menu-bar only; LSUIElement already keeps us out of the Dock, but be explicit
         // so the app never steals focus from whatever the user is typing into.
         NSApp.setActivationPolicy(.accessory)

@@ -693,7 +693,7 @@ enum TextInjector {
         }
     }
 
-    private static func chunked(_ units: [UniChar]) -> [[UniChar]] {
+    static func chunked(_ units: [UniChar]) -> [[UniChar]] {
         guard units.count > maxUnitsPerEvent else { return [units] }
         var result: [[UniChar]] = []
         var index = 0
@@ -707,7 +707,7 @@ enum TextInjector {
         return result
     }
 
-    private static func isHighSurrogate(_ unit: UniChar) -> Bool {
+    static func isHighSurrogate(_ unit: UniChar) -> Bool {
         (0xD800...0xDBFF).contains(unit)
     }
 }

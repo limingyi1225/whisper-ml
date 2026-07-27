@@ -822,7 +822,7 @@ final class DictationController {
             return
         }
 
-        let shared = commonPrefixLength(typed, final)
+        let shared = Self.commonPrefixLength(typed, final)
         let deleteCount = typed.count - shared
         let addition = String(Array(final)[shared...])
         log.info("rewriting from char \(shared): -\(deleteCount) +\(addition.count)")
@@ -861,7 +861,7 @@ final class DictationController {
         }
     }
 
-    private func commonPrefixLength(_ lhs: String, _ rhs: String) -> Int {
+    static func commonPrefixLength(_ lhs: String, _ rhs: String) -> Int {
         var count = 0
         var left = lhs.startIndex
         var right = rhs.startIndex
@@ -885,7 +885,7 @@ final class DictationController {
     /// whether the service's habitual leading space is load-bearing: Latin text
     /// needs it (dictating "world" right after "Hello" must not produce
     /// "Helloworld"), CJK never does. Kept as exactly one space when kept.
-    private static func normalizeLeadingSpace(_ text: String) -> String {
+    static func normalizeLeadingSpace(_ text: String) -> String {
         let stripped = String(text.drop(while: { $0 == " " || $0 == "\t" }))
         guard stripped.count < text.count else { return text }
         if let first = stripped.first, first.isASCII, first.isLetter || first.isNumber {
@@ -1034,7 +1034,7 @@ extension DictationController.Phase {
     }
 }
 
-private extension String {
+extension String {
     /// Used to decide whether a rewrite is worth the visible churn.
     var ignoringWhitespace: String {
         filter { !$0.isWhitespace }

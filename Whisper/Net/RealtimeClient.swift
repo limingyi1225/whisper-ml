@@ -661,7 +661,7 @@ final class RealtimeClient {
         }
     }
 
-    private func turnSequence(fromClientEventID eventID: String?) -> Int? {
+    func turnSequence(fromClientEventID eventID: String?) -> Int? {
         guard let eventID else { return nil }
         let components = eventID.split(separator: "-", maxSplits: 3)
         guard components.count == 4,
