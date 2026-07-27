@@ -1,0 +1,253 @@
+import AVFoundation
+import Combine
+import ServiceManagement
+import SwiftUI
+
+struct SettingsView: View {
+    let controller: DictationController
+
+    var body: some View {
+        TabView {
+            GeneralSettingsTab(controller: controller)
+                .tabItem { Label("通用", systemImage: "slider.horizontal.3") }
+            AccountSettingsTab(controller: controller)
+                .tabItem { Label("账号与权限", systemImage: "lock.shield") }
+        }
+        .frame(width: 500, height: 400)
+    }
+}
+
+// MARK: - General
+
+private struct GeneralSettingsTab: View {
+    let controller: DictationController
+    @Bindable private var settings = AppSettings.shared
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLoginError: String?
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("按住哪个键", selection: $settings.triggerKey) {
+                    ForEach(TriggerKey.allCases) { key in
+                        Text(key.displayName).tag(key)
+                    }
+                }
+                .onChange(of: settings.triggerKey) { controller.restartHotKey() }
+
+                Picker("触发灵敏度", selection: $settings.holdThreshold) {
+                    ForEach(HoldThreshold.allCases) { threshold in
+                        Text(threshold.displayName).tag(threshold)
+                    }
+                }
+            } header: {
+                Text("热键")
+            } footer: {
+                Text("短按仍然是普通修饰键，按住期间再按别的键会自动取消。如果你经常用这个键敲快捷键，选「沉稳」。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Picker("转写模型", selection: $settings.transcriptionModel) {
+                    ForEach(TranscriptionModel.allCases) { model in
+                        Text(model.displayName).tag(model)
+                    }
+                }
+                .onChange(of: settings.transcriptionModel) { controller.reconnect() }
+
+                if settings.transcriptionModel.supportsLiveTyping {
+                    Picker("出字前先听多久", selection: $settings.transcriptionDelay) {
+                        ForEach(TranscriptionDelay.allCases) { delay in
+                            Text(delay.displayName).tag(delay)
+                        }
+                    }
+                    .onChange(of: settings.transcriptionDelay) { controller.reconnect() }
+                }
+            } header: {
+                Text("文字")
+            } footer: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(settings.transcriptionModel.summary)
+                    if settings.transcriptionModel.supportsLiveTyping {
+                        Text("「出字前先听多久」决定模型吐字前先听多少后续语音。开头几个字被认成别的语言时，调长一档通常会改善，代价是首字更晚出现。")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("松手后整理") {
+                Toggle("自动去掉口头禅、补标点", isOn: $settings.polishEnabled)
+                Toggle("去掉句尾的句号", isOn: $settings.stripTrailingPeriod)
+            }
+
+            Section {
+                Toggle("登录时自动启动", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, enabled in
+                        setLaunchAtLogin(enabled)
+                    }
+                if let launchAtLoginError {
+                    Text(launchAtLoginError).font(.caption).foregroundStyle(Color.red)
+                }
+            } header: {
+                Text("启动")
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        // The toggle can fire from our own revert below; only touch the service
+        // when its state actually differs.
+        let currentlyEnabled = SMAppService.mainApp.status == .enabled
+        guard enabled != currentlyEnabled else {
+            launchAtLoginError = nil
+            return
+        }
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginError = nil
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            launchAtLoginError = "设置失败：\(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Account & permissions
+
+private struct AccountSettingsTab: View {
+    let controller: DictationController
+
+    @State private var apiKeyField = ""
+    @State private var savedNotice = false
+    @State private var saveFailed = false
+    @State private var accessibilityGranted = Permissions.hasAccessibility
+    @State private var microphoneStatus = Permissions.microphoneStatus
+    @State private var secureInputEnabled = Permissions.isSecureInputEnabled
+
+    private let refresh = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Form {
+            Section("系统权限") {
+                permissionRow(
+                    title: "辅助功能",
+                    detail: "监听全局热键、把文字打进其它 App",
+                    granted: accessibilityGranted
+                ) {
+                    Permissions.promptForAccessibility()
+                    Permissions.openAccessibilitySettings()
+                }
+
+                permissionRow(
+                    title: "麦克风",
+                    detail: "录制你说的话",
+                    granted: microphoneStatus == .authorized
+                ) {
+                    if microphoneStatus == .notDetermined {
+                        Task { _ = await Permissions.requestMicrophone() }
+                    } else {
+                        Permissions.openMicrophoneSettings()
+                    }
+                }
+            }
+
+            Section {
+                SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
+                    .onChange(of: apiKeyField) { _, newValue in
+                        // Typing a new key invalidates the notices. Saving clears
+                        // the field, which must not clear them.
+                        if !newValue.isEmpty {
+                            savedNotice = false
+                            saveFailed = false
+                        }
+                    }
+                HStack {
+                    Button("保存") {
+                        // The keychain can genuinely refuse the write; claiming
+                        // success then would leave the old (or no) key in use.
+                        if KeychainStore.saveAPIKey(apiKeyField) {
+                            apiKeyField = ""
+                            savedNotice = true
+                            controller.reconnect()
+                        } else {
+                            saveFailed = true
+                        }
+                    }
+                    .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if saveFailed {
+                        Text("写入钥匙串失败").font(.caption).foregroundStyle(Color.red)
+                    } else if savedNotice {
+                        Text("已存入钥匙串").font(.caption).foregroundStyle(Color.green)
+                    } else if KeychainStore.loadAPIKey() != nil {
+                        Text("钥匙串中已有").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("尚未设置").font(.caption).foregroundStyle(Color.orange)
+                    }
+
+                    Spacer()
+                    Text(connectionLabel).font(.caption).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("OpenAI")
+            }
+
+            Section("诊断") {
+                LabeledContent("热键监听") {
+                    Text(controller.isHotKeyActive ? "运行中" : "未启动")
+                        .foregroundStyle(controller.isHotKeyActive ? Color.green : Color.orange)
+                }
+                LabeledContent("安全输入") {
+                    Text(secureInputEnabled ? "已启用，听写暂停" : "未启用")
+                        .foregroundStyle(secureInputEnabled ? Color.orange : Color.secondary)
+                }
+                Button("重新启动热键监听") { controller.restartHotKey() }
+            }
+        }
+        .formStyle(.grouped)
+        .onReceive(refresh) { _ in
+            accessibilityGranted = Permissions.hasAccessibility
+            microphoneStatus = Permissions.microphoneStatus
+            secureInputEnabled = Permissions.isSecureInputEnabled
+        }
+    }
+
+    private var connectionLabel: String {
+        switch controller.connectionStatus {
+        case .ready: return "● 已连接"
+        case .connecting: return "○ 连接中"
+        case .disconnected: return "○ 未连接"
+        case .failed(let message): return "✗ \(DictationController.friendlyMessage(message))"
+        }
+    }
+
+    private func permissionRow(
+        title: String,
+        detail: String,
+        granted: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .foregroundStyle(granted ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if !granted {
+                Button("去授权", action: action)
+            }
+        }
+    }
+}
