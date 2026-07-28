@@ -162,7 +162,10 @@ struct RecordingHUDView: View {
         case .idle: return 46
         case .arming: return 56
         case .listening, .transcribing: return 84
-        case .failed: return 200
+        // Sized against the longest message the app can actually produce, measured
+        // at this font — a truncated error is a message nobody can act on. Stays
+        // inside the 260pt panel with room for the capsule's own margins.
+        case .failed: return 230
         }
     }
 

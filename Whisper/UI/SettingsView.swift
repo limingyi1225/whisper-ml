@@ -13,7 +13,7 @@ struct SettingsView: View {
             AccountSettingsTab(controller: controller)
                 .tabItem { Label("账号与权限", systemImage: "lock.shield") }
         }
-        .frame(width: 500, height: 400)
+        .frame(width: 500, height: 470)
     }
 }
 
@@ -64,6 +64,8 @@ private struct GeneralSettingsTab: View {
                     }
                     .onChange(of: settings.transcriptionDelay) { controller.reconnect() }
                 }
+
+                Toggle("繁体自动转简体", isOn: $settings.simplifyChinese)
             } header: {
                 Text("文字")
             } footer: {
@@ -72,6 +74,7 @@ private struct GeneralSettingsTab: View {
                     if settings.transcriptionModel.supportsLiveTyping {
                         Text("「出字前先听多久」决定模型吐字前先听多少后续语音。开头几个字被认成别的语言时，调长一档通常会改善，代价是首字更晚出现。")
                     }
+                    Text("转写偶尔会把同一段话认成繁体。转换在出字前就做掉，所以屏幕上不会先闪一下繁体。")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -80,6 +83,30 @@ private struct GeneralSettingsTab: View {
             Section("松手后整理") {
                 Toggle("自动去掉口头禅、补标点", isOn: $settings.polishEnabled)
                 Toggle("去掉句尾的句号", isOn: $settings.stripTrailingPeriod)
+            }
+
+            Section {
+                TextEditor(text: $settings.vocabulary)
+                    .font(.body.monospaced())
+                    .frame(height: 96)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+                    .disabled(!settings.polishEnabled)
+                    .opacity(settings.polishEnabled ? 1 : 0.5)
+            } header: {
+                Text("常用词汇")
+            } footer: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("一行一个：人名、产品名、术语。整理时会把读音接近的词按这里的写法改过来。常见英文名（Amy、Kevin）不写也会自动转成英文，所以这里主要放模型猜不到的：同事的名字、内部术语、项目代号。")
+                    Text(vocabularyStatus)
+                    if !settings.polishEnabled {
+                        Text("需要先打开上面的「自动去掉口头禅、补标点」才会生效。")
+                            .foregroundStyle(Color.orange)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section {
@@ -98,6 +125,23 @@ private struct GeneralSettingsTab: View {
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
+    }
+
+    /// Reports what actually made it into the list. The parser drops lines rather
+    /// than truncating them, so a line that will never reach the model has to be
+    /// visible here — otherwise the user sits waiting for a fix that cannot come.
+    private var vocabularyStatus: String {
+        let accepted = AppSettings.parseVocabulary(settings.vocabulary).count
+        let written = settings.vocabulary
+            .split(whereSeparator: \.isNewline)
+            .count { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard written > 0 else { return "还没有添加词汇。" }
+        guard written > accepted else { return "已采用 \(accepted) 个词。" }
+        return """
+        已采用 \(accepted) 个词，忽略了 \(written - accepted) 行\
+        （重复、单行超过 \(AppSettings.vocabularyTermLengthLimit) 个字，\
+        或超出 \(AppSettings.vocabularyTermLimit) 个的上限）。
+        """
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {

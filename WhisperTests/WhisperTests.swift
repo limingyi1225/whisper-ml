@@ -27,6 +27,123 @@ import Testing
     }
 }
 
+@Suite struct SimplifiedChineseTests {
+    @Test func convertsTraditionalToSimplified() {
+        #expect(DictationController.simplifiedChinese("這個功能很好用") == "这个功能很好用")
+        #expect(DictationController.simplifiedChinese("餘額不足") == "余额不足")
+        #expect(DictationController.simplifiedChinese("他說的沒錯") == "他说的没错")
+    }
+
+    @Test func picksTheRightSimplifiedFormForMergedCharacters() {
+        // The characters simplified Chinese merges are where a character-level
+        // transform can go wrong; these are the ones it gets right.
+        #expect(DictationController.simplifiedChinese("頭髮很長") == "头发很长")
+        #expect(DictationController.simplifiedChinese("幹活了") == "干活了")
+        #expect(DictationController.simplifiedChinese("皇后／後來") == "皇后／后来")
+        #expect(DictationController.simplifiedChinese("麵條") == "面条")
+        // Already correct in both scripts — must not be "corrected" into 着.
+        #expect(DictationController.simplifiedChinese("著名的作家") == "著名的作家")
+    }
+
+    @Test func leavesSimplifiedAndLatinAlone() {
+        #expect(DictationController.simplifiedChinese("这个已经是简体了") == "这个已经是简体了")
+        #expect(DictationController.simplifiedChinese("backend deadline") == "backend deadline")
+        #expect(DictationController.simplifiedChinese("") == "")
+        // Mixed dictation is the normal case here.
+        #expect(DictationController.simplifiedChinese("Kevin 說明天開會") == "Kevin 说明天开会")
+    }
+
+    @Test func isIdempotent() {
+        // `finish` converts text the deltas already converted; a second pass must
+        // be a no-op or every live-typed sentence would trigger a rewrite.
+        let once = DictationController.simplifiedChinese("這個範圍後面還有頭髮")
+        #expect(DictationController.simplifiedChinese(once) == once)
+    }
+
+    @Test func theTransformReadsAcrossCharacters() {
+        // The reason `stableSimplifiedPrefix` exists. If this ever stops holding,
+        // the lookahead is dead weight — but it holds on the shipping ICU.
+        #expect(DictationController.simplifiedChinese("著") == "着")
+        #expect(DictationController.simplifiedChinese("著名") == "著名")
+    }
+}
+
+@Suite struct StableSimplifiedPrefixTests {
+    /// Sentences whose conversion depends on characters that follow, mixed with
+    /// ordinary ones so the corpus is not only pathological cases.
+    private let corpus = [
+        "這個著名的作家寫了很多書",
+        "書上著錄了這件事",
+        "他著手處理這件事情",
+        "穿著一件衣服出門",
+        "一著急就這樣",
+        "我們著重討論",
+        "土著居民的生活",
+        "顯著提高了效率",
+        "這本書著者不詳",
+        "這個著名。他著手了",
+        "乾隆的頭髮，還有著名的畫",
+        "麵條和麵包都很好吃",
+        "後來我發現範圍不對",
+        "只有一隻貓在裡面",
+        "臺灣的資料庫工程師",
+        "頭髮長了該剪了",
+        "Kevin 說明天開會討論這個範圍",
+    ]
+
+    @Test func everyPrefixShownIsAPrefixOfTheFinalText() {
+        // The property live typing depends on: whatever is on screen mid-utterance
+        // must still be correct once the rest of the sentence arrives. Any
+        // violation means a character was typed that the completed transcript
+        // disagrees with — a visible flicker at best, a wrong character at worst.
+        for line in corpus {
+            let whole = DictationController.simplifiedChinese(line)
+            let characters = Array(line)
+            for split in 1...characters.count {
+                let shown = DictationController.stableSimplifiedPrefix(
+                    String(characters[0..<split])
+                )
+                #expect(
+                    whole.hasPrefix(shown),
+                    "「\(String(characters[0..<split]))」 showed 「\(shown)」, not a prefix of 「\(whole)」"
+                )
+            }
+        }
+    }
+
+    @Test func convertingEachDeltaAloneWouldBreakThatProperty() {
+        // Guards the fix, not just the behavior: the naive per-delta conversion
+        // this replaced really does produce a character the whole sentence never
+        // would, so the test above is not vacuous.
+        let pieces = ["這個著", "名的作家"]
+        let naive = pieces.map(DictationController.simplifiedChinese).joined()
+        let whole = DictationController.simplifiedChinese(pieces.joined())
+        #expect(naive == "这个着名的作家")
+        #expect(whole == "这个著名的作家")
+        #expect(naive != whole)
+    }
+
+    @Test func withheldTailIsTakenAfterConvertingTheWholeText() {
+        // The subtle half of the fix. Converting `raw.dropLast()` would answer
+        // 「这个着」 here — correct-looking, and wrong, because dropping 名 also
+        // drops the context that keeps 著 as 著.
+        #expect(DictationController.stableSimplifiedPrefix("這個著名") == "这个著")
+        #expect(DictationController.stableSimplifiedPrefix("這個著") == "这个")
+    }
+
+    @Test func completeTextIsNeverWithheld() {
+        // The flush path: once the transcript is complete, nothing is held back.
+        #expect(DictationController.simplifiedChinese("這個著名的作家") == "这个著名的作家")
+    }
+
+    @Test func latinAndPunctuationDoNotLag() {
+        // Only CJK can be rewritten, so English dictation must stream at full speed.
+        #expect(DictationController.stableSimplifiedPrefix("hello") == "hello")
+        #expect(DictationController.stableSimplifiedPrefix("這個範圍。") == "这个范围。")
+        #expect(DictationController.stableSimplifiedPrefix("") == "")
+    }
+}
+
 @Suite struct CommonPrefixLengthTests {
     @Test func countsMatchingGraphemes() {
         #expect(DictationController.commonPrefixLength("abc", "abd") == 2)
@@ -76,6 +193,13 @@ import Testing
 
     @Test func unknownEnglishPassesThrough() {
         #expect(DictationController.friendlyMessage("something unexpected") == "something unexpected")
+    }
+
+    @Test func translatesTheGeoBlock() {
+        // The message OpenAI actually returns when the request leaves over
+        // un-proxied UDP; without this it reaches the pill as raw English.
+        #expect(DictationController.friendlyMessage("Country, region, or territory not supported")
+            == "OpenAI 不支持这个地区")
     }
 }
 
@@ -160,6 +284,108 @@ import Testing
         let raw = "嗯我觉得这个方案就是那个整体上是可以接受的但是有一些细节需要再讨论一下"
         let cleaned = "我觉得这个方案整体上是可以接受的，但有一些细节需要再讨论。"
         #expect(polisher.isPlausible(cleaned, from: raw))
+    }
+
+    @Test func transliteratedNamesMayExpand() {
+        // The exact output measured from the model. 9 characters becoming 16 is
+        // 1.8×, past the plain 1.6× ceiling — rejecting it would hand the user
+        // back "凯文和艾米", which is what the name rule exists to fix.
+        #expect(polisher.isPlausible("Kevin 和 Amy 明天过来", from: "凯文和艾米明天过来"))
+        #expect(polisher.isPlausible("Kevin", from: "凯文"))
+    }
+
+    @Test func vocabularyExpansionIsAllowedWithTheList() {
+        // A Chinese term that is longer than what was misheard gets no help from
+        // the Latin measure; it has to be covered by the list itself.
+        #expect(polisher.isPlausible(
+            "中国科学技术大学",
+            from: "中科大",
+            vocabulary: ["中国科学技术大学"]
+        ))
+        #expect(!polisher.isPlausible("中国科学技术大学", from: "中科大"))
+    }
+
+    @Test func slackOnlyCoversTermsThatActuallyCameBack() {
+        // A long list must not silently disarm the guard: the reply below contains
+        // none of the listed terms, so it gets no slack and stays implausible.
+        #expect(!polisher.isPlausible(
+            String(repeating: "这是一个膨胀了很多倍的回答", count: 3),
+            from: "今天天气怎么样",
+            vocabulary: ["Anthropic", "Kubernetes", "TypeScript", "李明一"]
+        ))
+    }
+
+    @Test func anEnglishReplyStillTripsTheGuard() {
+        // Latin slack is capped at roughly the raw length, so the model answering
+        // in English cannot buy its way past the ceiling one letter at a time.
+        #expect(!polisher.isPlausible(
+            "The weather today is quite nice and sunny outside.",
+            from: "今天天气怎么样"
+        ))
+    }
+}
+
+// MARK: - Cleanup prompt
+
+@Suite struct PolishInstructionsTests {
+    @Test func emptyVocabularyAddsNothing() {
+        // Users who never open that box should be running exactly the prompt that
+        // was tuned without it.
+        #expect(!TranscriptPolisher.instructions(vocabulary: []).contains("常用词汇表"))
+    }
+
+    @Test func vocabularyIsListedVerbatimAndIsAdditive() {
+        let base = TranscriptPolisher.instructions(vocabulary: [])
+        let withTerms = TranscriptPolisher.instructions(vocabulary: ["Kevin", "李明一"])
+        #expect(withTerms.hasPrefix(base))
+        #expect(withTerms.contains("Kevin"))
+        #expect(withTerms.contains("李明一"))
+    }
+
+    @Test func properNounsAreNoLongerOffLimits() {
+        // The old blanket "never touch names" rule is what made a vocabulary
+        // list unusable; if it comes back, the feature silently stops working.
+        #expect(!TranscriptPolisher.instructions(vocabulary: ["Kevin"])
+            .contains("人名、产品名、专业术语、代码标识符即使看起来奇怪也不要动"))
+    }
+
+    @Test func transliteratedNameRuleAppliesWithoutAVocabulary() {
+        // The name rule is part of the base prompt, not the vocabulary block —
+        // an empty list must still turn 艾米 into Amy.
+        let base = TranscriptPolisher.instructions(vocabulary: [])
+        #expect(base.contains("艾米→Amy"))
+        #expect(base.contains("中文名字保持中文"))
+    }
+}
+
+// MARK: - Vocabulary parsing
+
+@Suite struct VocabularyParsingTests {
+    @Test func splitsTrimsAndKeepsOrder() {
+        #expect(AppSettings.parseVocabulary("Kevin\n  李明一  \nAnthropic")
+            == ["Kevin", "李明一", "Anthropic"])
+    }
+
+    @Test func dropsBlanksAndDuplicates() {
+        #expect(AppSettings.parseVocabulary("\n\nKevin\n \nKevin\n") == ["Kevin"])
+        #expect(AppSettings.parseVocabulary("") == [])
+        #expect(AppSettings.parseVocabulary("   \n\t\n") == [])
+    }
+
+    @Test func dropsOverlongLinesRatherThanTruncating() {
+        // Half a sentence is not a spelling anybody wants enforced.
+        let essay = String(repeating: "词", count: AppSettings.vocabularyTermLengthLimit + 1)
+        #expect(AppSettings.parseVocabulary("Kevin\n\(essay)") == ["Kevin"])
+        let atLimit = String(repeating: "词", count: AppSettings.vocabularyTermLengthLimit)
+        #expect(AppSettings.parseVocabulary(atLimit) == [atLimit])
+    }
+
+    @Test func capsTheListLength() {
+        // Every term rides along in every cleanup request.
+        let many = (1...(AppSettings.vocabularyTermLimit + 20))
+            .map { "term\($0)" }
+            .joined(separator: "\n")
+        #expect(AppSettings.parseVocabulary(many).count == AppSettings.vocabularyTermLimit)
     }
 }
 

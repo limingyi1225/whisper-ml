@@ -45,6 +45,11 @@ final class DictationController {
 
     /// What we have actually typed into the target app this utterance.
     @ObservationIgnored private var injectedText = ""
+    /// The deltas as they came off the wire, before simplified-Chinese conversion.
+    /// Kept because that conversion reads across characters, so it has to be redone
+    /// over the whole accumulated transcript rather than per delta — see
+    /// `stableSimplifiedPrefix`.
+    @ObservationIgnored private var rawPartial = ""
     @ObservationIgnored private var utteranceStart: Date?
     @ObservationIgnored private var maxDurationTimer: Timer?
     /// Bumped per utterance so a cleanup call that is still in flight when the user
@@ -95,6 +100,10 @@ final class DictationController {
     /// Guards the 3s auto-dismiss of an error banner, so a newer error is not
     /// dismissed early by the previous error's timer.
     @ObservationIgnored private var errorEpoch = 0
+    /// The cleanup failure already shown. A blocked region or a dead key fails on
+    /// every single sentence; telling the user once is information, telling them
+    /// every time is noise. Cleared by the next successful cleanup.
+    @ObservationIgnored private var reportedPolishNotice: String?
     @ObservationIgnored private var deferredStartTimer: Timer?
     @ObservationIgnored private var hotKeyHealthTimer: Timer?
 
@@ -333,6 +342,7 @@ final class DictationController {
                 stopMaxDurationTimer()
                 phase = .idle
                 partialText = ""
+                rawPartial = ""
                 injectedText = ""
             case .idle, .error:
                 // `phase` may have changed underneath a speculative gesture when the
@@ -397,6 +407,7 @@ final class DictationController {
         cancelPolish()
         phase = .recording
         partialText = ""
+        rawPartial = ""
         injectedText = ""
         pendingRawText = nil
         // A fresh start clears a capture-failure marker from a gesture whose queue
@@ -480,19 +491,50 @@ final class DictationController {
 
     private func handleDelta(_ delta: String) {
         guard phase == .recording || phase == .finalizing else { return }
+        rawPartial += delta
+        emitPartial(complete: false)
+    }
 
+    /// No more deltas are coming for this utterance, so the character withheld for
+    /// lookahead is now final. Without this the last character of every Chinese
+    /// sentence would sit off-screen until `finish` — which, with cleanup enabled,
+    /// is a second and a half later.
+    private func flushPartial() {
+        guard !rawPartial.isEmpty else { return }
+        emitPartial(complete: true)
+    }
+
+    /// Types whatever part of the utterance is now settled but not yet on screen.
+    ///
+    /// Conversion runs over the *accumulated* transcript rather than the delta that
+    /// just arrived: ICU's transform is context-sensitive, so converting a delta in
+    /// isolation can produce a character the same text would never produce as part
+    /// of a sentence (「著」 alone is 「着」; 「著名」 stays 「著名」). Everything
+    /// already emitted therefore has to stay valid as more text lands, which is what
+    /// `stableSimplifiedPrefix` guarantees by withholding the trailing character
+    /// until something follows it.
+    private func emitPartial(complete: Bool) {
+        var text = rawPartial
+        if settings.simplifyChinese {
+            text = complete
+                ? Self.simplifiedChinese(text)
+                : Self.stableSimplifiedPrefix(text)
+        }
         // The service tends to open an utterance with a leading space. Whether that
         // space is wanted depends on the language at the caret — see
         // `normalizeLeadingSpace`, which `normalize` mirrors so the final transcript
         // and the typed deltas never disagree about character zero (a mismatch there
         // would make `reconcile` rewrite the entire sentence).
-        var text = delta
-        if partialText.isEmpty {
-            text = Self.normalizeLeadingSpace(text)
-            if text.isEmpty { return }
-        }
+        text = Self.normalizeLeadingSpace(text)
 
-        partialText += text
+        // Indexing past what is already on screen, rather than asserting a prefix
+        // relation: one character of lookahead covers every rule this transform
+        // applies, but if a longer one ever appeared, the right answer is to let
+        // `reconcile` repair it at `finish` with its full caret proof — never to
+        // backspace mid-stream on the strength of a guess.
+        guard text.count > partialText.count else { return }
+        let addition = String(Array(text)[partialText.count...])
+        partialText = text
         guard utteranceTypesWhileSpeaking, !injectionAbandoned else { return }
 
         // Deltas keep arriving for ~700ms after the key is released. If the user has
@@ -507,11 +549,15 @@ final class DictationController {
             return
         }
 
-        TextInjector.type(text)
-        injectedText += text
+        TextInjector.type(addition)
+        injectedText += addition
     }
 
     private func handleCompleted(_ transcript: String) {
+        // The last delta has landed, so nothing is left to disambiguate the
+        // character being withheld for lookahead. Must run before the checks below,
+        // which reason about what is on screen.
+        flushPartial()
         let final = normalize(transcript)
 
         // The completed transcript is authoritative — when it comes back empty,
@@ -562,7 +608,7 @@ final class DictationController {
         cancelPolish()
         polishTask = Task { [weak self] in
             guard let self else { return }
-            let polished = await self.polisher.polish(final)
+            let outcome = await self.polisher.polish(final)
             guard !Task.isCancelled,
                   self.utteranceGeneration == generation,
                   self.pendingRawText == final else {
@@ -571,12 +617,26 @@ final class DictationController {
             }
             self.polishTask = nil
             self.pendingRawText = nil
-            var result = polished ?? final
+
+            var result = final
+            var notice: String?
+            switch outcome {
+            case .cleaned(let text):
+                result = text
+                // Working again — so if it breaks a second time, say so a second time.
+                self.reportedPolishNotice = nil
+            case .unchanged(let reason):
+                notice = reason
+            }
+
             // The polisher trims outer whitespace, which would undo the deliberate
             // leading space kept by `normalizeLeadingSpace` and glue the sentence
             // to the word before the caret.
             if final.hasPrefix(" "), !result.hasPrefix(" ") { result = " " + result }
             self.finish(with: result)
+            // After `finish`, never before: its `defer` resets the phase, which would
+            // wipe the notice off the pill in the same frame it went up.
+            if let notice { self.reportPolishFailure(notice) }
         }
     }
 
@@ -694,6 +754,7 @@ final class DictationController {
         }
         cancelPolish()
         partialText = ""
+        rawPartial = ""
         injectedText = ""
         pendingRawText = nil
         utteranceGeneration += 1
@@ -717,6 +778,10 @@ final class DictationController {
     /// Settles the utterance now, without waiting for cleanup to come back.
     private func settleImmediately() {
         guard phase == .finalizing else { return }
+        // The utterance ends here whether or not its transcript ever arrives, so the
+        // withheld character has to go out now — `finish(with: nil)` below reconciles
+        // nothing, and it would otherwise be lost for good.
+        flushPartial()
         cancelPolish()
         // Invalidate the in-flight cleanup so its result cannot arrive later and
         // rewrite text that by then belongs to a different sentence.
@@ -740,11 +805,18 @@ final class DictationController {
     private func finish(with text: String?) {
         defer {
             partialText = ""
+            rawPartial = ""
             injectedText = ""
             phase = .idle
         }
 
         guard var text, !text.isEmpty else { return }
+
+        // Every path into `finish` carries text straight off the network — the raw
+        // transcript, the cleaned one, or the raw one settled early — so this is the
+        // one chokepoint that covers all three. Idempotent against the deltas, which
+        // were already converted on the way in.
+        if settings.simplifyChinese { text = Self.simplifiedChinese(text) }
 
         // Strip at the very end only, and only one: "3.14" and "U.S." mid-sentence
         // stay intact. Question and exclamation marks are deliberate and kept. In
@@ -881,6 +953,53 @@ final class DictationController {
         return Self.normalizeLeadingSpace(result)
     }
 
+    /// Rewrites traditional Chinese as simplified, using ICU's `Hant-Hans` transform.
+    ///
+    /// Applied to the deltas as they arrive, not left to the cleanup pass: a whole
+    /// sentence of 繁体 differs from its cleaned version at character zero, and
+    /// `reconcile` can only fix that by deleting and retyping the entire line. Doing
+    /// it here means the 繁体 never reaches the screen at all.
+    ///
+    /// The transform is character-level, so the few characters simplified Chinese
+    /// keeps distinct by context can land wrong. Measured on this machine: 頭髮→头发,
+    /// 幹活→干活, 皇后/後來→皇后/后来, 餘額→余额, 麵條→面条, 著名→著名 (correctly left
+    /// alone) are all right; 乾隆→干隆 is the known miss. That one is now within reach
+    /// of the cleanup pass, which is allowed to repair proper nouns.
+    static func simplifiedChinese(_ text: String) -> String {
+        // Nothing to do for the pure-Latin deltas that make up mixed-language
+        // dictation; skip the bridge to NSMutableString entirely.
+        guard text.unicodeScalars.contains(where: { $0.value >= 0x2E80 }) else { return text }
+        let mutable = NSMutableString(string: text)
+        guard CFStringTransform(mutable as CFMutableString, nil, "Hant-Hans" as NSString, false)
+        else { return text }
+        return mutable as String
+    }
+
+    /// The converted prefix of a partial transcript that later text cannot change.
+    ///
+    /// `Hant-Hans` reads across characters: 「著」 on its own becomes 「着」, but
+    /// 「著名」 stays 「著名」. So the trailing character is never safe to commit —
+    /// whatever arrives next may be what decides it.
+    ///
+    /// Note the order: the *whole* accumulated text is converted and then the last
+    /// character of the result is withheld. Converting `raw.dropLast()` instead
+    /// looks equivalent and is not — it throws away the context the dropped
+    /// character *provides*, so 「這個著名」 would render as 「这个着」 and every
+    /// such sentence would flicker when the real text arrived.
+    ///
+    /// One withheld character is enough for every rule this transform applies;
+    /// `StableSimplifiedPrefixTests` re-checks that against the installed ICU at
+    /// every split point of a corpus rather than trusting it. Punctuation and Latin
+    /// are neither rewritten nor context for what precedes them (also measured), so
+    /// English and mixed-script dictation streams without lag.
+    static func stableSimplifiedPrefix(_ raw: String) -> String {
+        let converted = simplifiedChinese(raw)
+        guard let last = raw.last,
+              last.unicodeScalars.contains(where: { $0.properties.isIdeographic })
+        else { return converted }
+        return String(converted.dropLast())
+    }
+
     /// We cannot see what sits before the caret, so language is the best signal for
     /// whether the service's habitual leading space is load-bearing: Latin text
     /// needs it (dictating "world" right after "Hello" must not produce
@@ -896,6 +1015,9 @@ final class DictationController {
 
     private func handleFailure(_ message: String) {
         log.error("dictation failed: \(message)")
+        // Whatever was typed before the failure stays on screen; leaving it one
+        // character short of what the user actually said helps nobody.
+        flushPartial()
         cancelPolish()
         // Only stop capture when no next dictation is using the pipeline. It may be
         // queued (`startWhenSettled`), or still speculative — armed while this
@@ -910,6 +1032,7 @@ final class DictationController {
         }
         stopMaxDurationTimer()
         partialText = ""
+        rawPartial = ""
         injectedText = ""
         pendingRawText = nil
         showError(Self.friendlyMessage(message))
@@ -928,6 +1051,19 @@ final class DictationController {
                 }
             }
         }
+    }
+
+    /// Says once that cleanup is failing for a reason that will keep failing.
+    ///
+    /// Deliberately *not* on the failure path: the sentence itself was delivered,
+    /// just un-tidied, so this reuses the error pill only as a place to put words.
+    /// It runs after `finish`, so nothing about the transcript depends on it.
+    private func reportPolishFailure(_ message: String) {
+        let display = "整理没生效：\(Self.friendlyMessage(message))"
+        guard reportedPolishNotice != display else { return }
+        reportedPolishNotice = display
+        log.error("cleanup is failing persistently: \(message, privacy: .public)")
+        showError(display)
     }
 
     /// Puts an error on the HUD and schedules its dismissal. Every `.error` phase
@@ -1018,6 +1154,15 @@ final class DictationController {
         }
         if message.localizedCaseInsensitiveContains("rate limit") {
             return "请求太频繁，稍等几秒再试"
+        }
+        // Seen for real: the proxy only covers TCP, so a request that got upgraded
+        // to HTTP/3 leaves over un-proxied UDP and arrives from an IP OpenAI blocks.
+        // Same host, same key — transcription's WebSocket is TCP and stays fine,
+        // which is exactly why this is worth naming rather than calling it a network
+        // error.
+        if message.localizedCaseInsensitiveContains("country, region, or territory")
+            || message.localizedCaseInsensitiveContains("unsupported_country") {
+            return "OpenAI 不支持这个地区"
         }
         return message
     }

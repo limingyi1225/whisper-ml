@@ -146,6 +146,44 @@ final class AppSettings {
     /// rather than by prompting: the realtime transcriber adds one too, so a prompt
     /// to the cleanup model alone could never cover both paths.
     var stripTrailingPeriod: Bool { didSet { store.set(stripTrailingPeriod, forKey: Key.stripTrailingPeriod) } }
+    /// Rewrite traditional Chinese as simplified. The transcriber returns 繁体 for
+    /// some of the same speech it usually returns 简体 for. Done in code, on the way
+    /// in, rather than by asking the cleanup model: a whole sentence of 繁体 differs
+    /// from its cleaned version at character zero, and `reconcile` would then rewrite
+    /// every such sentence in full — the exact flash the whitespace rule exists to avoid.
+    var simplifyChinese: Bool { didSet { store.set(simplifyChinese, forKey: Key.simplifyChinese) } }
+    /// Proper nouns the transcriber keeps mis-hearing — names, products, jargon — one
+    /// per line, spelled the way the user wants them. Handed to the cleanup model,
+    /// which is the only channel available: `gpt-realtime-whisper` rejects `prompt`,
+    /// the one vocabulary-bias slot the transcription side has.
+    var vocabulary: String { didSet { store.set(vocabulary, forKey: Key.vocabulary) } }
+
+    /// The vocabulary as the cleanup pass sees it.
+    var vocabularyTerms: [String] { Self.parseVocabulary(vocabulary) }
+
+    /// One term per line; blank lines and duplicates dropped, order preserved.
+    ///
+    /// Both caps exist because this list rides along in *every* cleanup request:
+    /// pasting an essay into the box would slow down every sentence the user speaks.
+    /// Over-long lines are dropped rather than truncated — a 40+ character "term" is
+    /// prose someone typed into the wrong box, and half of it is not a spelling
+    /// anybody wants enforced. The settings pane shows the accepted count so a
+    /// dropped line is visible rather than silent.
+    static let vocabularyTermLimit = 100
+    static let vocabularyTermLengthLimit = 40
+
+    static func parseVocabulary(_ raw: String) -> [String] {
+        var seen = Set<String>()
+        var terms: [String] = []
+        for line in raw.split(whereSeparator: \.isNewline) {
+            let term = line.trimmingCharacters(in: .whitespaces)
+            guard !term.isEmpty, term.count <= vocabularyTermLengthLimit else { continue }
+            guard seen.insert(term).inserted else { continue }
+            terms.append(term)
+            if terms.count == vocabularyTermLimit { break }
+        }
+        return terms
+    }
 
     private enum Key {
         static let triggerKey = "triggerKey"
@@ -154,6 +192,8 @@ final class AppSettings {
         static let transcriptionModel = "transcriptionModel"
         static let polishEnabled = "polishEnabled"
         static let stripTrailingPeriod = "stripTrailingPeriod"
+        static let simplifyChinese = "simplifyChinese"
+        static let vocabulary = "vocabulary"
     }
 
     private init() {
@@ -167,5 +207,7 @@ final class AppSettings {
         transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .realtimeWhisper
         polishEnabled = store.object(forKey: Key.polishEnabled) as? Bool ?? true
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
+        simplifyChinese = store.object(forKey: Key.simplifyChinese) as? Bool ?? true
+        vocabulary = store.string(forKey: Key.vocabulary) ?? ""
     }
 }
