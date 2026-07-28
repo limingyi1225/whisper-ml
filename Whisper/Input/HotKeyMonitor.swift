@@ -48,7 +48,12 @@ final class HotKeyMonitor {
     private var didLongPress = false
 
     private var trigger: TriggerKey { AppSettings.shared.triggerKey }
-    private var threshold: TimeInterval { AppSettings.shared.holdThreshold.milliseconds / 1000 }
+
+    /// How long the trigger key must be held before it counts as dictation rather than
+    /// an ordinary modifier press. Was briefly a three-tier setting; the middle tier is
+    /// the only one anyone wanted, and a shortcut typed with this key cancels the arm
+    /// anyway, so the other two bought nothing worth a row in Settings.
+    private let threshold: TimeInterval = 0.3
 
     /// The real tap state, rather than the optimistic bookkeeping flag. TCC changes
     /// and Secure Event Input can invalidate or disable the Mach port underneath us.

@@ -110,31 +110,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     }
 }
 
-/// How long the trigger key must be held before it counts as dictation rather than an
-/// ordinary modifier press. Exposed as named tiers — the exact millisecond value is an
-/// implementation detail nobody should have to reason about.
-enum HoldThreshold: String, CaseIterable, Identifiable {
-    case quick, standard, deliberate
-
-    var id: String { rawValue }
-
-    var milliseconds: Double {
-        switch self {
-        case .quick: return 200
-        case .standard: return 300
-        case .deliberate: return 500
-        }
-    }
-
-    var displayName: String {
-        switch self {
-        case .quick: return "灵敏 · 按下几乎立刻开始录"
-        case .standard: return "标准"
-        case .deliberate: return "沉稳 · 几乎不会误触发"
-        }
-    }
-}
-
 /// How much audio the model hears before it commits to words.
 enum TranscriptionDelay: String, CaseIterable, Identifiable {
     case minimal, low, medium, high, xhigh
@@ -163,7 +138,6 @@ final class AppSettings {
         didSet { store.set(connectionMode.rawValue, forKey: Key.connectionMode) }
     }
     var triggerKey: TriggerKey { didSet { store.set(triggerKey.rawValue, forKey: Key.triggerKey) } }
-    var holdThreshold: HoldThreshold { didSet { store.set(holdThreshold.rawValue, forKey: Key.holdThreshold) } }
     var transcriptionDelay: TranscriptionDelay { didSet { store.set(transcriptionDelay.rawValue, forKey: Key.transcriptionDelay) } }
     var transcriptionModel: TranscriptionModel { didSet { store.set(transcriptionModel.rawValue, forKey: Key.transcriptionModel) } }
 
@@ -219,7 +193,6 @@ final class AppSettings {
     private enum Key {
         static let connectionMode = "connectionMode"
         static let triggerKey = "triggerKey"
-        static let holdThreshold = "holdThreshold"
         static let transcriptionDelay = "transcriptionDelay"
         static let transcriptionModel = "transcriptionModel"
         static let polishEnabled = "polishEnabled"
@@ -233,8 +206,6 @@ final class AppSettings {
         connectionMode = mode.flatMap(ConnectionMode.init(rawValue:)) ?? .direct
         let trigger = store.string(forKey: Key.triggerKey)
         triggerKey = trigger.flatMap(TriggerKey.init(rawValue:)) ?? .rightCommand
-        let hold = store.string(forKey: Key.holdThreshold)
-        holdThreshold = hold.flatMap(HoldThreshold.init(rawValue:)) ?? .standard
         let delay = store.string(forKey: Key.transcriptionDelay)
         transcriptionDelay = delay.flatMap(TranscriptionDelay.init(rawValue:)) ?? .low
         let model = store.string(forKey: Key.transcriptionModel)

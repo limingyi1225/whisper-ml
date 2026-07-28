@@ -13,7 +13,9 @@ struct SettingsView: View {
             AccountSettingsTab(controller: controller)
                 .tabItem { Label("账号与权限", systemImage: "lock.shield") }
         }
-        .frame(width: 500, height: 470)
+        // Shorter than it was: cutting the explanatory footers took roughly 150pt of
+        // text out of the 通用 tab, and leaving the old height behind an empty gap.
+        .frame(width: 500, height: 420)
     }
 }
 
@@ -39,9 +41,14 @@ private struct GeneralSettingsTab: View {
                 }
 
                 LabeledContent("连接状态") {
-                    Text(connectionLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(connectionTint)
+                            .frame(width: 6, height: 6)
+                        Text(connectionLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             } header: {
                 Text("连接")
@@ -51,25 +58,13 @@ private struct GeneralSettingsTab: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section {
+            Section("热键") {
                 Picker("按住哪个键", selection: $settings.triggerKey) {
                     ForEach(TriggerKey.allCases) { key in
                         Text(key.displayName).tag(key)
                     }
                 }
                 .onChange(of: settings.triggerKey) { controller.restartHotKey() }
-
-                Picker("触发灵敏度", selection: $settings.holdThreshold) {
-                    ForEach(HoldThreshold.allCases) { threshold in
-                        Text(threshold.displayName).tag(threshold)
-                    }
-                }
-            } header: {
-                Text("热键")
-            } footer: {
-                Text("短按仍然是普通修饰键，按住期间再按别的键会自动取消。如果你经常用这个键敲快捷键，选「沉稳」。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -93,15 +88,9 @@ private struct GeneralSettingsTab: View {
             } header: {
                 Text("文字")
             } footer: {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(settings.transcriptionModel.summary)
-                    if settings.transcriptionModel.supportsLiveTyping {
-                        Text("「出字前先听多久」决定模型吐字前先听多少后续语音。开头几个字被认成别的语言时，调长一档通常会改善，代价是首字更晚出现。")
-                    }
-                    Text("转写偶尔会把同一段话认成繁体。转换在出字前就做掉，所以屏幕上不会先闪一下繁体。")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text(settings.transcriptionModel.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("松手后整理") {
@@ -121,16 +110,9 @@ private struct GeneralSettingsTab: View {
             } header: {
                 Text("常用词汇")
             } footer: {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("一行一个：人名、产品名、术语。整理时会把读音接近的词按这里的写法改过来。常见英文名（Amy、Kevin）不写也会自动转成英文，所以这里主要放模型猜不到的：同事的名字、内部术语、项目代号。")
-                    Text(vocabularyStatus)
-                    if !settings.polishEnabled {
-                        Text("需要先打开上面的「自动去掉口头禅、补标点」才会生效。")
-                            .foregroundStyle(Color.orange)
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text(vocabularyStatus)
+                    .font(.caption)
+                    .foregroundStyle(settings.polishEnabled ? .secondary : Color.orange)
             }
 
             Section {
@@ -151,29 +133,36 @@ private struct GeneralSettingsTab: View {
         }
     }
 
-    /// Reports what actually made it into the list. The parser drops lines rather
-    /// than truncating them, so a line that will never reach the model has to be
-    /// visible here — otherwise the user sits waiting for a fix that cannot come.
+    /// The single line under the editor. It says what to type only while there is
+    /// nothing to report; once there is, it reports. The parser drops lines rather
+    /// than truncating them, so a line that will never reach the model has to show
+    /// up here — otherwise the user sits waiting for a fix that cannot come.
     private var vocabularyStatus: String {
+        guard settings.polishEnabled else { return "需要先打开上面的整理开关。" }
         let accepted = AppSettings.parseVocabulary(settings.vocabulary).count
         let written = settings.vocabulary
             .split(whereSeparator: \.isNewline)
             .count { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard written > 0 else { return "还没有添加词汇。" }
+        guard written > 0 else { return "一行一个：同事的名字、内部术语、项目代号。" }
         guard written > accepted else { return "已采用 \(accepted) 个词。" }
-        return """
-        已采用 \(accepted) 个词，忽略了 \(written - accepted) 行\
-        （重复、单行超过 \(AppSettings.vocabularyTermLengthLimit) 个字，\
-        或超出 \(AppSettings.vocabularyTermLimit) 个的上限）。
-        """
+        return "已采用 \(accepted) 个词，忽略了 \(written - accepted) 行（重复、过长或超出上限）。"
     }
 
     private var connectionLabel: String {
         switch controller.connectionStatus {
-        case .ready: return "● 已连接"
-        case .connecting: return "○ 连接中"
-        case .disconnected: return "○ 未连接"
-        case .failed(let message): return "✗ \(DictationController.friendlyMessage(message))"
+        case .ready: return "已连接"
+        case .connecting: return "连接中"
+        case .disconnected: return "未连接"
+        case .failed(let message): return DictationController.friendlyMessage(message)
+        }
+    }
+
+    private var connectionTint: Color {
+        switch controller.connectionStatus {
+        case .ready: return .green
+        case .connecting: return .orange
+        case .disconnected: return .secondary
+        case .failed: return .red
         }
     }
 
@@ -222,7 +211,7 @@ private struct AccountSettingsTab: View {
             Section("系统权限") {
                 permissionRow(
                     title: "辅助功能",
-                    detail: "监听全局热键、把文字打进其它 App",
+                    detail: "监听热键、把文字打进其它 App",
                     granted: accessibilityGranted
                 ) {
                     Permissions.promptForAccessibility()
@@ -231,7 +220,7 @@ private struct AccountSettingsTab: View {
 
                 permissionRow(
                     title: "麦克风",
-                    detail: "录制你说的话",
+                    detail: nil,
                     granted: microphoneStatus == .authorized
                 ) {
                     if microphoneStatus == .notDetermined {
@@ -261,8 +250,7 @@ private struct AccountSettingsTab: View {
                 } header: {
                     Text("设备 Token")
                 } footer: {
-                    Text("在服务器上跑 `npm run generate-token` 生成，粘贴一次即可；"
-                         + "服务器只保存它的 hash，随时可以在服务器上撤销。")
+                    Text("在服务器上跑 `npm run generate-token` 生成，粘贴一次即可。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -372,7 +360,7 @@ private struct AccountSettingsTab: View {
 
     private func permissionRow(
         title: String,
-        detail: String,
+        detail: String?,
         granted: Bool,
         action: @escaping () -> Void
     ) -> some View {
@@ -381,7 +369,9 @@ private struct AccountSettingsTab: View {
                 .foregroundStyle(granted ? Color.green : Color.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                if let detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer()
             if !granted {

@@ -418,11 +418,6 @@ import Testing
 }
 
 @Suite struct SettingsTableTests {
-    @Test func holdThresholdsAreOrdered() {
-        #expect(HoldThreshold.quick.milliseconds < HoldThreshold.standard.milliseconds)
-        #expect(HoldThreshold.standard.milliseconds < HoldThreshold.deliberate.milliseconds)
-    }
-
     @Test func onlyTheRealtimeModelTypesLive() {
         // Measured behavior the whole output-mode design hangs on: the
         // gpt-4o-transcribe models emit zero deltas before the commit.
