@@ -97,6 +97,9 @@ final class DictationController {
     /// would let a model switch mid-utterance flip the mode halfway through — deltas
     /// already typed, then the final text pasted again on top.
     @ObservationIgnored private var utteranceTypesWhileSpeaking = false
+    /// Same route the Realtime socket uses for this utterance. The cleanup pass keeps
+    /// this snapshot even if the user switches connection mode while speaking.
+    @ObservationIgnored private var utteranceRoute: ServiceRoute?
     /// Guards the 3s auto-dismiss of an error banner, so a newer error is not
     /// dismissed early by the previous error's timer.
     @ObservationIgnored private var errorEpoch = 0
@@ -344,6 +347,7 @@ final class DictationController {
                 partialText = ""
                 rawPartial = ""
                 injectedText = ""
+                utteranceRoute = nil
             case .idle, .error:
                 // `phase` may have changed underneath a speculative gesture when the
                 // previous utterance completed or failed during the hold threshold.
@@ -386,14 +390,17 @@ final class DictationController {
             showError("没有麦克风权限")
             return
         }
-        // Without a key the client cannot even open a socket, and nothing downstream
-        // would ever deliver a result or an error — recording into that void would
-        // leave the app showing "转写中" forever.
-        guard KeychainStore.loadAPIKey() != nil else {
+        // Reject an incomplete direct or relay configuration before capture begins;
+        // otherwise no socket can ever deliver a result and the recording would sit
+        // buffered until its connection timeout.
+        let route: ServiceRoute
+        do {
+            route = try client.routeForNextUtterance()
+        } catch {
             audio.stop()
             gestureOwnsCapture = false
             gestureCaptureGeneration = nil
-            showError("还没有设置 API Key")
+            showError(error.localizedDescription)
             return
         }
         guard let targetAnchor = currentAnchor() else {
@@ -417,6 +424,7 @@ final class DictationController {
         utteranceGeneration += 1
         utteranceStart = Date()
         utteranceTypesWhileSpeaking = settings.typesWhileSpeaking
+        utteranceRoute = route
         // Taken once, at the start. Refreshing it as each delta lands would let an
         // edit the user made mid-sentence be masked by the next delta, and the later
         // rewrite would then chew through their change.
@@ -605,10 +613,16 @@ final class DictationController {
         // something is still happening.
         pendingRawText = final
         let generation = utteranceGeneration
+        guard let route = utteranceRoute else {
+            pendingRawText = nil
+            finish(with: final)
+            reportPolishFailure("当前听写没有可用的网络路由")
+            return
+        }
         cancelPolish()
         polishTask = Task { [weak self] in
             guard let self else { return }
-            let outcome = await self.polisher.polish(final)
+            let outcome = await self.polisher.polish(final, route: route)
             guard !Task.isCancelled,
                   self.utteranceGeneration == generation,
                   self.pendingRawText == final else {
@@ -680,15 +694,48 @@ final class DictationController {
         deferredStartTimer = nil
 
         if !queuedUtterances.isEmpty {
+            // Committing a queued utterance has exactly one way to fail — resolving the
+            // route — and that failure is never per-sentence: a credential deleted, or a
+            // connection mode switched to one that has none, breaks every entry behind
+            // this one too. So probe before dequeuing. Dequeuing first and discovering
+            // it afterwards destroyed already-spoken audio one entry at a time and put
+            // the same error pill on screen once per sentence, 1.2 s apart. The audio
+            // still cannot go anywhere — it is raw PCM with no transcript, so there is
+            // nothing to fall back to the clipboard with — but say it once, and say how
+            // many sentences went with it.
+            if case .captured = queuedUtterances[0], let reason = queuedRouteFailure() {
+                let lost = queuedUtterances.count
+                queuedUtterances.removeAll()
+                let hasAnotherGesture = hotKey.isGestureActive
+                    || queuedGestureFailureMessage != nil
+                if hasAnotherGesture {
+                    startWhenSettled = true
+                    audio.setPrerollCapacity(seconds: queuedPrerollCapacitySeconds)
+                } else {
+                    audio.setPrerollCapacity(seconds: 1)
+                }
+                handleFailure(lost > 1 ? "\(reason)（排队的 \(lost) 句听写已丢弃）" : reason)
+                return
+            }
+
             // Already spoken and released — settle the oldest outcome in FIFO order.
             // A capture failure is an outcome too; keeping it in the queue prevents a
             // later healthy gesture from erasing or inheriting that failure.
             let next = queuedUtterances.removeFirst()
             switch next {
             case .captured:
-                commitQueuedUtterance(next)
-                if !queuedUtterances.isEmpty || hotKey.isGestureActive
-                    || queuedGestureFailureMessage != nil {
+                let hasAnotherGesture = !queuedUtterances.isEmpty
+                    || hotKey.isGestureActive
+                    || queuedGestureFailureMessage != nil
+                if let message = commitQueuedUtterance(next) {
+                    if hasAnotherGesture {
+                        startWhenSettled = true
+                        audio.setPrerollCapacity(seconds: queuedPrerollCapacitySeconds)
+                    } else {
+                        audio.setPrerollCapacity(seconds: 1)
+                    }
+                    handleFailure(message)
+                } else if hasAnotherGesture {
                     waitForPreviousUtterance()
                 } else {
                     audio.setPrerollCapacity(seconds: 1)
@@ -736,6 +783,19 @@ final class DictationController {
         min(600, 150 + queuedUtterances.count * 40)
     }
 
+    /// Why no queued utterance can be committed right now, or nil if one can.
+    ///
+    /// Cheap: with a socket already up this returns the live route without touching the
+    /// Keychain, and it is only consulted on the queued path.
+    private func queuedRouteFailure() -> String? {
+        do {
+            _ = try client.routeForNextUtterance()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     /// Sends a fully captured utterance straight to the transcriber.
     ///
     /// Unlike `beginRecording` this never touches the microphone pipeline: the audio
@@ -748,9 +808,15 @@ final class DictationController {
     /// current now (a settings change mid-queue reconnects at the settle boundary,
     /// right before this call) — a mode frozen at release time would expect deltas
     /// from a model that no longer streams them, or vice versa.
-    private func commitQueuedUtterance(_ utterance: QueuedUtterance) {
+    private func commitQueuedUtterance(_ utterance: QueuedUtterance) -> String? {
         guard case .captured(let audio, let anchor) = utterance else {
-            return
+            return "排队的听写内容无效"
+        }
+        let route: ServiceRoute
+        do {
+            route = try client.routeForNextUtterance()
+        } catch {
+            return error.localizedDescription
         }
         cancelPolish()
         partialText = ""
@@ -759,6 +825,7 @@ final class DictationController {
         pendingRawText = nil
         utteranceGeneration += 1
         utteranceStart = Date()
+        utteranceRoute = route
         injectionAnchor = anchor
         // Captured now, not at release: this is where live deltas are about to
         // land, and where a later rewrite would delete from.
@@ -773,6 +840,7 @@ final class DictationController {
         if !audio.isEmpty { client.appendAudio(audio) }
         client.commitUtterance()
         log.info("committed a queued utterance of \(audio.count) bytes")
+        return nil
     }
 
     /// Settles the utterance now, without waiting for cleanup to come back.
@@ -807,6 +875,7 @@ final class DictationController {
             partialText = ""
             rawPartial = ""
             injectedText = ""
+            utteranceRoute = nil
             phase = .idle
         }
 
@@ -1035,6 +1104,7 @@ final class DictationController {
         rawPartial = ""
         injectedText = ""
         pendingRawText = nil
+        utteranceRoute = nil
         showError(Self.friendlyMessage(message))
         let epoch = errorEpoch
 

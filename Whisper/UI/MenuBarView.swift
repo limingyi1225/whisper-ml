@@ -4,17 +4,69 @@ struct MenuBarLabel: View {
     let controller: DictationController
 
     var body: some View {
-        Image(systemName: symbolName)
-            .symbolRenderingMode(.hierarchical)
+        // `.bottomTrailing` is for the 5pt error dot. The slash has to sit in the
+        // icon's own overlay instead of sharing that alignment: it is a full-height
+        // 18pt bar, so bottom-trailing pins it to the right edge and the -44° rotation
+        // then swings roughly 40% of it past the 19pt frame, where the menu bar clips
+        // it into a stub in the top-right corner rather than a line across the icon.
+        ZStack(alignment: .bottomTrailing) {
+            Image("MenuBarIcon")
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 18, height: 18)
+                .foregroundStyle(.primary)
+                .opacity(iconOpacity)
+                .overlay {
+                    if showsDisconnectedSlash {
+                        Capsule()
+                            .fill(.primary)
+                            .frame(width: 1.6, height: 18)
+                            .rotationEffect(.degrees(-44))
+                    }
+                }
+
+            if case .error = controller.phase {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 5, height: 5)
+                    .overlay {
+                        Circle().stroke(.background, lineWidth: 1)
+                    }
+                    .offset(x: 1, y: 1)
+            }
+        }
+        .frame(width: 19, height: 18)
+        .accessibilityLabel(accessibilityLabel)
     }
 
-    private var symbolName: String {
+    private var iconOpacity: Double {
         switch controller.phase {
-        case .recording: return "mic.fill"
-        case .finalizing: return "waveform"
-        case .error: return "exclamationmark.triangle.fill"
+        case .recording: return 1
+        case .finalizing: return 0.62
+        case .error: return 0.82
+        case .arming: return 0.78
+        case .idle: return controller.connectionStatus.isReady ? 1 : 0.5
+        }
+    }
+
+    private var showsDisconnectedSlash: Bool {
+        switch controller.phase {
+        case .recording, .finalizing, .error:
+            return false
         case .idle, .arming:
-            return controller.connectionStatus.isReady ? "mic" : "mic.slash"
+            return !controller.connectionStatus.isReady
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch controller.phase {
+        case .recording: return "Whisper 正在录音"
+        case .finalizing: return "Whisper 正在转写"
+        case .error: return "Whisper 出错"
+        case .arming: return "Whisper 正在准备录音"
+        case .idle:
+            return controller.connectionStatus.isReady ? "Whisper 已就绪" : "Whisper 未连接"
         }
     }
 }

@@ -1,0 +1,17 @@
+{
+  "name": "whisper-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "test": "node --test",
+    "generate-token": "node scripts/generate-token.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
+  }
+}

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Whisper
 
@@ -408,9 +409,11 @@ import Testing
         #expect(TriggerKey.leftOption.foreignModifierMask & option == 0)
     }
 
-    @Test func fnTreatsAllStandardModifiersAsForeign() {
-        let all: UInt64 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000
-        #expect(TriggerKey.fn.foreignModifierMask == all)
+    @Test func onlySupportedTriggerKeysAreExposed() {
+        #expect(TriggerKey.allCases.map(\.rawValue) == [
+            "rightCommand", "leftCommand", "rightOption", "leftOption"
+        ])
+        #expect(TriggerKey(rawValue: "fn") == nil)
     }
 }
 
@@ -438,6 +441,141 @@ import Testing
         #expect(!KeychainStore.saveAPIKey(""))
         #expect(!KeychainStore.saveAPIKey("   "))
         #expect(!KeychainStore.saveAPIKey(" \n\t"))
+    }
+
+    @Test func whitespaceOnlyRelayTokensAreRejectedWithoutTouchingTheKeychain() {
+        #expect(!KeychainStore.saveRelayToken(""))
+        #expect(!KeychainStore.saveRelayToken("   "))
+        #expect(!KeychainStore.saveRelayToken(" \n\t"))
+    }
+}
+
+// MARK: - Relay routing
+
+/// `.serialized` because `onlyALoopbackOverrideIsHonoured` writes the app's real
+/// `UserDefaults` domain. Nothing else reads that key today, so this is locking in the
+/// precondition rather than fixing an observed flake.
+@Suite(.serialized) struct ServiceRouteTests {
+    @Test func configuredRelayUsesHTTPS() {
+        #expect(ServiceRoute.relayBaseURL.scheme == "https")
+        #expect(ServiceRoute.relayBaseURL.host == "limingyi.com")
+        #expect(ServiceRoute.relayBaseURL.path == "/whisper-relay")
+    }
+
+    @Test func loopbackHTTPIsAllowedForDevelopment() {
+        #expect(ServiceRoute.relayBaseURL(from: "http://localhost:8787") != nil)
+        #expect(ServiceRoute.relayBaseURL(from: "http://127.0.0.1:8787") != nil)
+        #expect(ServiceRoute.relayBaseURL(from: "http://[::1]:8787") != nil)
+    }
+
+    @Test func credentialsQueryAndFragmentAreRejected() {
+        #expect(ServiceRoute.relayBaseURL(from: "https://user@relay.example.com") == nil)
+        #expect(ServiceRoute.relayBaseURL(from: "https://relay.example.com?token=secret") == nil)
+        #expect(ServiceRoute.relayBaseURL(from: "https://relay.example.com/#secret") == nil)
+    }
+
+    @Test func relayPathsPreserveAnOptionalBasePath() throws {
+        let base = try #require(
+            ServiceRoute.relayBaseURL(from: "https://relay.example.com/whisper/")
+        )
+        #expect(base.appendingPathComponent("v1/polish").absoluteString
+            == "https://relay.example.com/whisper/v1/polish")
+        #expect(ServiceRoute.relayRealtimeURL(baseURL: base).absoluteString
+            == "wss://relay.example.com/whisper/v1/realtime?intent=transcription")
+    }
+
+    /// The deployed relay is published under a path prefix, so these are the exact
+    /// strings the server has to answer on.
+    @Test func productionRelayPathsMatchTheDeployedPrefix() {
+        #expect(ServiceRoute.relayBaseURL.appendingPathComponent("v1/polish")
+            .absoluteString == "https://limingyi.com/whisper-relay/v1/polish")
+        #expect(ServiceRoute.relayRealtimeURL(baseURL: ServiceRoute.relayBaseURL)
+            .absoluteString
+            == "wss://limingyi.com/whisper-relay/v1/realtime?intent=transcription")
+    }
+
+    /// A stale or malformed development override must not be able to brick the app,
+    /// and — the reason this is loopback-only — must never be usable to point a build
+    /// holding a real device token at someone else's server. `UserDefaults` is writable
+    /// by anything running as this user, so an override honouring arbitrary HTTPS hosts
+    /// would make the app itself hand the Keychain token to an attacker on reconnect.
+    @Test func onlyALoopbackOverrideIsHonoured() {
+        let key = ServiceRoute.relayBaseURLOverrideKey
+        let store = UserDefaults.standard
+        let saved = store.string(forKey: key)
+        defer {
+            if let saved { store.set(saved, forKey: key) } else { store.removeObject(forKey: key) }
+        }
+
+        let rejected = [
+            "", "not a url", "ftp://relay.example.com",
+            "http://relay.example.com",
+            // Valid, TLS, parses fine — and still refused, because it is not loopback.
+            "https://attacker.example.com",
+            "https://127.0.0.1.attacker.example.com",
+        ]
+        for bad in rejected {
+            store.set(bad, forKey: key)
+            #expect(
+                ServiceRoute.effectiveRelayBaseURL == ServiceRoute.relayBaseURL,
+                "override \"\(bad)\" must not be honoured"
+            )
+        }
+
+        store.removeObject(forKey: key)
+        #expect(ServiceRoute.effectiveRelayBaseURL == ServiceRoute.relayBaseURL)
+
+        store.set("http://127.0.0.1:8787", forKey: key)
+        #if DEBUG
+        #expect(ServiceRoute.effectiveRelayBaseURL.absoluteString == "http://127.0.0.1:8787")
+        #else
+        #expect(ServiceRoute.effectiveRelayBaseURL == ServiceRoute.relayBaseURL)
+        #endif
+    }
+
+    /// The struct holds a plaintext credential and now survives a whole utterance, so
+    /// the one thing that must never happen is it being interpolated into a log line.
+    @Test func interpolatingARouteNeverPrintsTheCredential() {
+        let route = ServiceRoute(
+            mode: .relay,
+            realtimeURL: URL(string: "wss://relay.example.com/v1/realtime")!,
+            polishURL: URL(string: "https://relay.example.com/v1/polish")!,
+            credential: "relay_super-secret-token"
+        )
+        let logged = "route=\(route)"
+        #expect(!logged.contains("relay_super-secret-token"))
+        // Still has to be worth logging: mode and host are the two facts that matter.
+        #expect(logged.contains("relay"))
+        #expect(logged.contains("relay.example.com"))
+    }
+
+    /// `URLSessionWebSocketTask` collapses every rejected handshake into one opaque
+    /// `NSURLErrorBadServerResponse` ("There was a bad response from the server"), so
+    /// without reading the status off the task's `response` a revoked device token is
+    /// indistinguishable from a dead café Wi-Fi — and the app burns all six backoff
+    /// attempts on a credential that will never start working.
+    @Test func aRejectedHandshakeSaysWhichPeerRefusedItAndWhetherRetryingHelps() {
+        let unauthorized = RealtimeClient.handshakeRejection(statusCode: 401, viaRelay: true)
+        #expect(unauthorized.message.contains("设备 Token"))
+        #expect(unauthorized.retryable == false)
+
+        let badKey = RealtimeClient.handshakeRejection(statusCode: 403, viaRelay: false)
+        #expect(badKey.message.contains("API Key"))
+        #expect(badKey.retryable == false)
+
+        // Usually this device's own sleep/wake zombies still holding their slots. The
+        // relay's heartbeat reaps them within a sweep or two, so this one must keep
+        // retrying rather than stranding the user on a self-healing error.
+        let throttled = RealtimeClient.handshakeRejection(statusCode: 429, viaRelay: true)
+        #expect(throttled.message.contains("429"))
+        #expect(throttled.retryable)
+
+        // Anything unclassified still beats "There was a bad response from the server":
+        // the status is the one fact that says whether it is the relay or the edge.
+        let gateway = RealtimeClient.handshakeRejection(statusCode: 502, viaRelay: true)
+        #expect(gateway.message.contains("502"))
+        #expect(gateway.message.contains("转发服务器"))
+        #expect(gateway.retryable)
     }
 }
 

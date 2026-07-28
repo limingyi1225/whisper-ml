@@ -28,6 +28,30 @@ private struct GeneralSettingsTab: View {
     var body: some View {
         Form {
             Section {
+                Picker("连接方式", selection: $settings.connectionMode) {
+                    ForEach(ConnectionMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: settings.connectionMode) {
+                    controller.reconnect()
+                }
+
+                LabeledContent("连接状态") {
+                    Text(connectionLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("连接")
+            } footer: {
+                Text(settings.connectionMode.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Picker("按住哪个键", selection: $settings.triggerKey) {
                     ForEach(TriggerKey.allCases) { key in
                         Text(key.displayName).tag(key)
@@ -144,6 +168,15 @@ private struct GeneralSettingsTab: View {
         """
     }
 
+    private var connectionLabel: String {
+        switch controller.connectionStatus {
+        case .ready: return "● 已连接"
+        case .connecting: return "○ 连接中"
+        case .disconnected: return "○ 未连接"
+        case .failed(let message): return "✗ \(DictationController.friendlyMessage(message))"
+        }
+    }
+
     private func setLaunchAtLogin(_ enabled: Bool) {
         // The toggle can fire from our own revert below; only touch the service
         // when its state actually differs.
@@ -171,9 +204,13 @@ private struct GeneralSettingsTab: View {
 private struct AccountSettingsTab: View {
     let controller: DictationController
 
+    @Bindable private var settings = AppSettings.shared
     @State private var apiKeyField = ""
-    @State private var savedNotice = false
-    @State private var saveFailed = false
+    @State private var apiKeySavedNotice = false
+    @State private var apiKeySaveFailed = false
+    @State private var relayTokenField = ""
+    @State private var relayTokenSavedNotice = false
+    @State private var relayTokenSaveFailed = false
     @State private var accessibilityGranted = Permissions.hasAccessibility
     @State private var microphoneStatus = Permissions.microphoneStatus
     @State private var secureInputEnabled = Permissions.isSecureInputEnabled
@@ -205,45 +242,30 @@ private struct AccountSettingsTab: View {
                 }
             }
 
-            Section {
-                SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
-                    .onChange(of: apiKeyField) { _, newValue in
-                        // Typing a new key invalidates the notices. Saving clears
-                        // the field, which must not clear them.
-                        if !newValue.isEmpty {
-                            savedNotice = false
-                            saveFailed = false
-                        }
-                    }
-                HStack {
-                    Button("保存") {
-                        // The keychain can genuinely refuse the write; claiming
-                        // success then would leave the old (or no) key in use.
-                        if KeychainStore.saveAPIKey(apiKeyField) {
-                            apiKeyField = ""
-                            savedNotice = true
-                            controller.reconnect()
-                        } else {
-                            saveFailed = true
-                        }
-                    }
-                    .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                    if saveFailed {
-                        Text("写入钥匙串失败").font(.caption).foregroundStyle(Color.red)
-                    } else if savedNotice {
-                        Text("已存入钥匙串").font(.caption).foregroundStyle(Color.green)
-                    } else if KeychainStore.loadAPIKey() != nil {
-                        Text("钥匙串中已有").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Text("尚未设置").font(.caption).foregroundStyle(Color.orange)
-                    }
-
-                    Spacer()
-                    Text(connectionLabel).font(.caption).foregroundStyle(.secondary)
+            // Only the credential the current mode actually uses. Showing both invites
+            // filling in the wrong one and then wondering why nothing connects.
+            switch settings.connectionMode {
+            case .direct:
+                Section {
+                    directCredentialEditor
+                } header: {
+                    Text("OpenAI API Key")
+                } footer: {
+                    Text("只在直接连接 OpenAI 时使用，保存在本机钥匙串中。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-            } header: {
-                Text("OpenAI")
+            case .relay:
+                Section {
+                    relayCredentialEditor
+                } header: {
+                    Text("设备 Token")
+                } footer: {
+                    Text("在服务器上跑 `npm run generate-token` 生成，粘贴一次即可；"
+                         + "服务器只保存它的 hash，随时可以在服务器上撤销。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("诊断") {
@@ -266,12 +288,85 @@ private struct AccountSettingsTab: View {
         }
     }
 
-    private var connectionLabel: String {
-        switch controller.connectionStatus {
-        case .ready: return "● 已连接"
-        case .connecting: return "○ 连接中"
-        case .disconnected: return "○ 未连接"
-        case .failed(let message): return "✗ \(DictationController.friendlyMessage(message))"
+    @ViewBuilder
+    private var directCredentialEditor: some View {
+        SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
+            .onChange(of: apiKeyField) { _, newValue in
+                // Saving clears the field, which must not clear the success notice.
+                if !newValue.isEmpty {
+                    apiKeySavedNotice = false
+                    apiKeySaveFailed = false
+                }
+            }
+        HStack {
+            Button("保存并连接") {
+                // The keychain can genuinely refuse the write; claiming success then
+                // would leave the old (or no) key in use.
+                if KeychainStore.saveAPIKey(apiKeyField) {
+                    apiKeyField = ""
+                    apiKeySavedNotice = true
+                    controller.reconnect()
+                } else {
+                    apiKeySaveFailed = true
+                }
+            }
+            .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            credentialStatus(
+                saveFailed: apiKeySaveFailed,
+                savedNotice: apiKeySavedNotice,
+                hasStoredValue: KeychainStore.hasAPIKey()
+            )
+        }
+    }
+
+    /// The relay's device token is a credential like any other, so it is entered here
+    /// rather than installed out of band. Writing it from inside the app also gives the
+    /// keychain item an ACL that names this app — an item created by the `security` CLI
+    /// carries an ACL that does not, and reading it back would prompt or fail outright.
+    @ViewBuilder
+    private var relayCredentialEditor: some View {
+        SecureField("设备 Token", text: $relayTokenField, prompt: Text("relay_…"))
+            .onChange(of: relayTokenField) { _, newValue in
+                if !newValue.isEmpty {
+                    relayTokenSavedNotice = false
+                    relayTokenSaveFailed = false
+                }
+            }
+        HStack {
+            Button("保存并连接") {
+                if KeychainStore.saveRelayToken(relayTokenField) {
+                    relayTokenField = ""
+                    relayTokenSavedNotice = true
+                    controller.reconnect()
+                } else {
+                    relayTokenSaveFailed = true
+                }
+            }
+            .disabled(relayTokenField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            credentialStatus(
+                saveFailed: relayTokenSaveFailed,
+                savedNotice: relayTokenSavedNotice,
+                hasStoredValue: KeychainStore.hasRelayToken()
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func credentialStatus(
+        saveFailed: Bool,
+        savedNotice: Bool,
+        hasStoredValue: Bool
+    ) -> some View {
+        if saveFailed {
+            Text("写入钥匙串失败").font(.caption).foregroundStyle(Color.red)
+        } else if savedNotice {
+            Text("已存入钥匙串").font(.caption).foregroundStyle(Color.green)
+        } else if hasStoredValue {
+            Text("钥匙串中已有").font(.caption).foregroundStyle(.secondary)
+        } else {
+            Text("尚未设置").font(.caption).foregroundStyle(Color.orange)
         }
     }
 

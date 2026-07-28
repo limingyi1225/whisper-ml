@@ -17,8 +17,14 @@
 
 菜单栏图标 → 设置（⌘,）
 
-- **通用**：触发键、触发灵敏度、转写模型、出字前先听多久、繁体转简体、松手后整理、常用词汇
-- **账号与权限**：辅助功能 / 麦克风 授权状态、API Key、热键诊断
+- **通用**：连接方式（直连 / 大陆模式）、连接状态、触发键、触发灵敏度、转写模型、
+  出字前先听多久、繁体转简体、松手后整理、常用词汇
+- **账号与权限**：当前连接方式对应的凭据（API Key 或设备 Token）、辅助功能 / 麦克风
+  授权状态、热键诊断
+
+> 触发键里原来有 **Fn**，现在去掉了。之前选了 Fn 的机器升级后会**静默回落到右 Command**
+> ——`UserDefaults` 里存的 `"fn"` 解析不出对应的枚举值，就走了默认值，App 不会提示。
+> 如果你按住 Fn 发现没反应，去设置里重新挑一个键即可。
 
 人名的处理分两层，都在整理这一步，所以要开着「自动去掉口头禅、补标点」才生效：
 
@@ -54,7 +60,73 @@ Whisper/
     ├── RecordingHUD.swift         底部那根低调的小条
     ├── MenuBarView.swift
     └── SettingsView.swift
+server/                          可选的自托管 Relay（WebSocket 转写 + HTTPS 整理）
 ```
+
+## 无 VPN 时使用大陆模式
+
+「通用」里可以手动选择两种连接方式：
+
+- **直连**：保持原来的行为，Mac 用钥匙串中的 OpenAI API Key 直接请求 OpenAI。
+- **大陆模式**：走已经配置好的 `https://limingyi.com/whisper-relay`；Mac 只持有
+  Keychain 中可撤销的设备 Token，OpenAI API Key 只存在服务器环境变量中。
+
+Relay 同时覆盖 Realtime WebSocket 转写和松手后的 HTTPS 整理。不能只代理整理请求，否则
+Realtime 仍然需要从 Mac 直连 OpenAI。连接方式发生变化时，如果当前有一句正在转写，应用会等
+它结束再重连，不会中途换线路或重放音频。
+
+启动 Relay：
+
+```bash
+cd server
+npm install
+npm run generate-token
+cp .env.example .env
+# 编辑 .env：填 OPENAI_API_KEY，并把生成出来的 hash 填入
+# RELAY_DEVICE_TOKEN_HASHES
+npm test
+npm start
+```
+
+`npm run generate-token` 打印一对值：**设备 Token** 粘贴到 App 的「账号与权限 → 设备
+Token」（切到大陆模式后才会出现），服务器只保存它的 **SHA-256 hash**。Token 只在生成时
+显示一次；要吊销就把对应 hash 从 `RELAY_DEVICE_TOKEN_HASHES` 里删掉再重启。凭据由 App 自己
+写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL 里没有本 App，读取时会弹
+授权框甚至直接失败。
+
+### 反向代理
+
+Relay 自己监听 `/v1/realtime`、`/v1/polish` 和 `/healthz`。线上发布在
+`https://limingyi.com/whisper-relay` 这样的子路径下时，把 `RELAY_BASE_PATH=/whisper-relay`
+写进 `.env`：这样带不带前缀的路径它都认，代理是否剥掉前缀都能工作（少了这一条，代理配错
+斜杠的表现是一个干净的 404，日志里什么都没有）。
+
+代理还必须支持 WebSocket upgrade、至少 2 MiB 的消息，并且不能移除客户端的 `Authorization`
+header。`GET /healthz`（或 `<前缀>/healthz`）可用于健康检查。
+
+默认 `HOST=127.0.0.1`，因为没挂代理时不该把一个背后是真 OpenAI Key 的端点暴露到所有网卡上；
+`server/Dockerfile` 里已经显式设成 `0.0.0.0`，由前置负载均衡或反向代理终止 TLS。
+
+### 边界与自查
+
+Relay 只允许本 App 使用的三个转写模型、固定整理模型和有限的请求形状；另外限制每设备并发、
+单轮音频大小和整理频率。上限不是随手取的整数，是按 App 自己那 610 秒音频缓冲推出来的——改
+客户端缓冲时对应改 `CLIENT_MAX_TURN_AUDIO_BYTES`。上行拥塞时 Relay 会暂停读取来施加背压，
+而不是掐断连接，否则丢掉的正是排队补录机制要保住的那句话。Relay 每 25 秒 ping 一次 Mac，
+一整个周期没有 pong 就断开：合盖和换 Wi-Fi 都会留下半开连接，不清掉的话它既占着设备的并发
+名额，也让那条计费的 OpenAI session 一直活着。
+
+不要记录请求体或 Authorization header，并为服务器上的 OpenAI key 单独设置预算。部署完成后
+仍要在无 VPN 的不同网络上实测域名、TLS 和 WebSocket 长连接是否可达。
+
+想指向本地 Relay 调试（生产地址是写死的，设置里不给改）：
+
+```bash
+defaults write com.mingyili.Whisper relayBaseURLOverride http://localhost:8787
+defaults delete com.mingyili.Whisper relayBaseURLOverride
+```
+
+只接受 HTTPS，或指向 loopback 的 HTTP；值不合法就静默回落到生产地址。
 
 ## 几个不那么显然的设计
 
@@ -165,6 +237,11 @@ caret 级检查必然产生假阴性。丢句风险由超时路径兜底：目�
 頭髮→头发、幹活→干活、皇后/後來→皇后/后来、麵條→面条、著名→著名（正确地没动）都对，
 已知的一个坑是乾隆→干隆。词级转换（OpenCC 那类）要多带一份词库，为一个罕见词不值当；
 而且整理模型现在被允许修专有名词，这类错字通常会被它顺手改回来。
+
+**路由配置断了的时候，已排队但还没转写的句子会丢。** 排队里存的是冻结的 PCM，没有转写文本，
+所以在"凭据没配"这种状态下它既送不出去、也没有东西能退到剪贴板——留着也只是等一个永远不会
+到来的重试。现在的做法是**在出队之前**先探一次路由：探失败就一次性清空整个队列、只报一条
+错（并说明丢了几句），而不是逐句出队、逐句销毁音频、逐句弹同一条错误提示。
 
 **整理挂掉时会提示一次，但不影响出字。** 整理失败一律回退到原始转写，文字照常上屏——
 但如果失败原因是**会一直失败**的那种（API Key 无效、额度不足、地区被拒），静默就等于每句

@@ -31,6 +31,10 @@ final class RealtimeClient {
     var onFailure: ((String) -> Void)?
 
     @ObservationIgnored private var socket: URLSessionWebSocketTask?
+    /// Route owned by `socket`. The controller snapshots this per utterance so its
+    /// cleanup request cannot jump to another endpoint after a mid-sentence settings
+    /// change; it also keeps relay failures from being mislabeled as a local key issue.
+    @ObservationIgnored private var activeRoute: ServiceRoute?
     @ObservationIgnored private let urlSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
@@ -134,8 +138,11 @@ final class RealtimeClient {
     func connectIfNeeded(resetRetryBudget: Bool = false) {
         if resetRetryBudget { reconnectAttempt = 0 }
         guard socket == nil else { return }
-        guard let apiKey = KeychainStore.loadAPIKey() else {
-            status = .failed("还没有设置 API Key")
+        let route: ServiceRoute
+        do {
+            route = try ServiceRoute.current()
+        } catch {
+            status = .failed(error.localizedDescription)
             return
         }
 
@@ -154,16 +161,17 @@ final class RealtimeClient {
         // the old socket, so its retired ids are dead weight here.
         retiredItemIDs.removeAll()
 
-        var request = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        var request = URLRequest(url: route.realtimeURL)
+        request.setValue("Bearer \(route.credential)", forHTTPHeaderField: "Authorization")
 
         let task = urlSession.webSocketTask(with: request)
         socket = task
+        activeRoute = route
         task.resume()
         receive(generation: generation)
         sendSessionUpdate()
         startKeepAlive()
-        log.info("connecting (generation \(generation))")
+        log.info("connecting via \(route.mode.rawValue, privacy: .public) (generation \(generation))")
     }
 
     /// Tears down the socket. Pass `retry: true` to schedule a reconnect with backoff.
@@ -171,6 +179,7 @@ final class RealtimeClient {
         generation += 1
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
+        activeRoute = nil
         keepAliveTimer?.invalidate(); keepAliveTimer = nil
         refreshTimer?.invalidate(); refreshTimer = nil
         responseTimeoutTimer?.invalidate(); responseTimeoutTimer = nil
@@ -225,6 +234,15 @@ final class RealtimeClient {
     }
 
     // MARK: - Utterance API
+
+    /// The route a new utterance will actually use. An already-open socket wins over
+    /// live settings: this utterance's audio is going down that socket whatever the
+    /// picker now says, so its cleanup request has to follow the socket. Only the
+    /// reconnect at the next idle boundary moves the route.
+    func routeForNextUtterance() throws -> ServiceRoute {
+        if let activeRoute, socket != nil { return activeRoute }
+        return try ServiceRoute.current()
+    }
 
     func beginUtterance() {
         nextTurnSequence += 1
@@ -642,7 +660,8 @@ final class RealtimeClient {
                     // the user stare at the spinner — fail fast and reconnect.
                     guard let self, generation == self.generation else { return }
                     log.error("send failed: \(error.localizedDescription)")
-                    let message = "连接中断：\(error.localizedDescription)"
+                    let failure = self.transportFailure(error)
+                    let message = failure.message
                     let wasMidUtterance = self.utteranceActive
                     self.utteranceActive = false
                     // Cap the retries like the receive path does. A send failure
@@ -652,7 +671,10 @@ final class RealtimeClient {
                     // time. With an unconditional `retry: true` here, the backoff
                     // ladder's stop condition was unreachable and the app would
                     // reconnect every 30 s forever.
-                    self.disconnect(retry: self.reconnectAttempt < 6, reason: message)
+                    self.disconnect(
+                        retry: failure.retryable && self.reconnectAttempt < 6,
+                        reason: message
+                    )
                     if wasMidUtterance {
                         self.onFailure?(message)
                     }
@@ -687,10 +709,13 @@ final class RealtimeClient {
                         // 连接中/未连接. Always pass the reason so the settings
                         // pane can show *why*. Saving settings, a manual reconnect,
                         // or the next dictation attempt all try again from scratch.
-                        let message = "连接中断：\(error.localizedDescription)"
-                        self.disconnect(retry: self.reconnectAttempt < 6, reason: message)
+                        let failure = self.transportFailure(error)
+                        self.disconnect(
+                            retry: failure.retryable && self.reconnectAttempt < 6,
+                            reason: failure.message
+                        )
                         if wasMidUtterance {
-                            self.onFailure?(message)
+                            self.onFailure?(failure.message)
                         }
                     case .success(let message):
                         if case .string(let text) = message,
@@ -729,13 +754,16 @@ final class RealtimeClient {
                         MainActor.assumeIsolated {
                             guard let self, generation == self.generation else { return }
                             log.error("keep-alive ping failed: \(error.localizedDescription)")
-                            let message = "连接中断：\(error.localizedDescription)"
+                            let failure = self.transportFailure(error)
                             let wasMidUtterance = self.utteranceActive
                             self.utteranceActive = false
                             // Same backoff cap as the receive path — an unreachable
                             // network must not reconnect every 30 s forever.
-                            self.disconnect(retry: self.reconnectAttempt < 6, reason: message)
-                            if wasMidUtterance { self.onFailure?(message) }
+                            self.disconnect(
+                                retry: failure.retryable && self.reconnectAttempt < 6,
+                                reason: failure.message
+                            )
+                            if wasMidUtterance { self.onFailure?(failure.message) }
                         }
                     }
                 }
@@ -754,6 +782,87 @@ final class RealtimeClient {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshWhenIdle() }
         }
+    }
+
+    /// What a transport error means for the user, and whether retrying can fix it.
+    struct TransportFailure {
+        let message: String
+        let retryable: Bool
+    }
+
+    /// How a rejected WebSocket handshake should read, and whether the backoff ladder
+    /// should keep climbing. Split out from `transportFailure` so it is testable
+    /// without a live socket.
+    nonisolated static func handshakeRejection(
+        statusCode: Int,
+        viaRelay: Bool
+    ) -> TransportFailure {
+        let peer = viaRelay ? "转发服务器" : "OpenAI"
+        switch statusCode {
+        case 401, 403:
+            // Retrying a rejected credential only burns the ladder. Not permanent: the
+            // next dictation and any settings change both start a fresh attempt.
+            return TransportFailure(
+                message: viaRelay
+                    ? "转发服务器拒绝了设备 Token（\(statusCode)），请在设置里重新填写"
+                    : "OpenAI 拒绝了 API Key（\(statusCode)），请在设置里重新填写",
+                retryable: false
+            )
+        case 429:
+            // Usually this device's own zombie connections from sleep/wake still
+            // holding their slots; the relay's heartbeat reaps them within a sweep
+            // or two, so this one clears itself.
+            return TransportFailure(
+                message: viaRelay
+                    ? "转发服务器：这台设备的连接数暂时用满了（429），正在重试"
+                    : "OpenAI 请求过于频繁（429），正在重试",
+                retryable: true
+            )
+        case 404:
+            return TransportFailure(
+                message: "\(peer)上没有这个地址（404），App 和服务器的版本可能对不上",
+                retryable: false
+            )
+        default:
+            return TransportFailure(
+                message: "\(peer)拒绝了连接（HTTP \(statusCode)）",
+                retryable: true
+            )
+        }
+    }
+
+    /// Turns a transport error into something the user can act on.
+    ///
+    /// `URLSessionWebSocketTask` reports *every* rejected handshake as the same opaque
+    /// `NSURLErrorBadServerResponse` — "There was a bad response from the server" — so a
+    /// revoked device token was indistinguishable from a dead network, and the app spent
+    /// all six backoff attempts on a credential that was never going to start working.
+    /// The status does survive on the task's `response` though (measured against a relay
+    /// that 401s the upgrade: `task.response.statusCode == 401`), and that is the only
+    /// place it can be read from.
+    private func transportFailure(_ error: Error) -> TransportFailure {
+        let nsError = error as NSError
+        // All three conditions matter: a socket that *did* upgrade keeps its 101 on
+        // `response`, so status alone would relabel every later network drop.
+        if nsError.domain == NSURLErrorDomain,
+           nsError.code == NSURLErrorBadServerResponse,
+           let http = socket?.response as? HTTPURLResponse,
+           http.statusCode >= 400 {
+            return Self.handshakeRejection(
+                statusCode: http.statusCode,
+                viaRelay: activeRoute?.mode == .relay
+            )
+        }
+        if activeRoute?.mode == .relay {
+            return TransportFailure(
+                message: "转发服务器连接中断：\(error.localizedDescription)",
+                retryable: true
+            )
+        }
+        return TransportFailure(
+            message: "连接中断：\(error.localizedDescription)",
+            retryable: true
+        )
     }
 
     /// Re-checks on every retry rather than once. Checking only the first time meant a

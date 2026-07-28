@@ -84,7 +84,7 @@ final class TranscriptPolisher {
     /// Cleans the transcript up, or explains why it could not. Never throws, and
     /// never costs the caller its text: every failure path leaves the raw transcript
     /// standing.
-    func polish(_ raw: String) async -> Outcome {
+    func polish(_ raw: String, route: ServiceRoute) async -> Outcome {
         let started = Date()
         let deadline = started.addingTimeInterval(12)
         guard !Task.isCancelled else { return .unchanged(notice: nil) }
@@ -99,6 +99,7 @@ final class TranscriptPolisher {
         let first = await request(
             raw,
             vocabulary: vocabulary,
+            route: route,
             suppressReasoning: true,
             deadline: deadline
         )
@@ -119,6 +120,7 @@ final class TranscriptPolisher {
             let second = await request(
                 raw,
                 vocabulary: vocabulary,
+                route: route,
                 suppressReasoning: !parameterWasRejected,
                 deadline: deadline
             )
@@ -151,20 +153,18 @@ final class TranscriptPolisher {
     private func request(
         _ raw: String,
         vocabulary: [String],
+        route: ServiceRoute,
         suppressReasoning: Bool,
         deadline: Date
     ) async -> RequestResult {
         guard !Task.isCancelled else { return .cancelled }
-        guard let apiKey = KeychainStore.loadAPIKey() else {
-            return .terminalFailure("还没有设置 API Key")
-        }
         let remaining = deadline.timeIntervalSinceNow
         guard remaining > 0.1 else { return .cancelled }
 
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+        var request = URLRequest(url: route.polishURL)
         request.httpMethod = "POST"
         request.timeoutInterval = remaining
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(route.credential)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         var body: [String: Any] = [

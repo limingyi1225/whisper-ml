@@ -1,8 +1,37 @@
 import Foundation
 
+/// Where OpenAI traffic leaves the app.
+///
+/// Relay mode is deliberately explicit rather than an automatic fallback. Switching a
+/// live Realtime session after audio and partial text have already crossed one route can
+/// replay or duplicate an utterance; the controller therefore reconnects only at an idle
+/// boundary when this setting changes.
+enum ConnectionMode: String, CaseIterable, Identifiable {
+    case direct
+    case relay
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .direct: return "直连"
+        case .relay: return "大陆模式"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .direct:
+            return "Mac 使用钥匙串里的 OpenAI API Key 直接连接。"
+        case .relay:
+            return "Mac 只连接你的服务器；OpenAI API Key 留在服务器上。"
+        }
+    }
+}
+
 /// Which physical key must be held down to dictate.
 enum TriggerKey: String, CaseIterable, Identifiable {
-    case rightCommand, leftCommand, rightOption, leftOption, fn
+    case rightCommand, leftCommand, rightOption, leftOption
 
     var id: String { rawValue }
 
@@ -12,7 +41,6 @@ enum TriggerKey: String, CaseIterable, Identifiable {
         case .leftCommand: return "左 Command ⌘"
         case .rightOption: return "右 Option ⌥"
         case .leftOption: return "左 Option ⌥"
-        case .fn: return "Fn / 🌐 地球键"
         }
     }
 
@@ -23,7 +51,6 @@ enum TriggerKey: String, CaseIterable, Identifiable {
         case .leftCommand: return 55
         case .leftOption: return 58
         case .rightOption: return 61
-        case .fn: return 63
         }
     }
 
@@ -36,7 +63,6 @@ enum TriggerKey: String, CaseIterable, Identifiable {
         case .rightCommand: return 0x0000_0010
         case .leftOption: return 0x0000_0020
         case .rightOption: return 0x0000_0040
-        case .fn: return 0x0080_0000  // NX_SECONDARYFNMASK
         }
     }
 
@@ -48,7 +74,6 @@ enum TriggerKey: String, CaseIterable, Identifiable {
         switch self {
         case .rightCommand, .leftCommand: return all & ~0x0010_0000
         case .rightOption, .leftOption: return all & ~0x0008_0000
-        case .fn: return all
         }
     }
 }
@@ -131,6 +156,9 @@ final class AppSettings {
 
     private let store = UserDefaults.standard
 
+    var connectionMode: ConnectionMode {
+        didSet { store.set(connectionMode.rawValue, forKey: Key.connectionMode) }
+    }
     var triggerKey: TriggerKey { didSet { store.set(triggerKey.rawValue, forKey: Key.triggerKey) } }
     var holdThreshold: HoldThreshold { didSet { store.set(holdThreshold.rawValue, forKey: Key.holdThreshold) } }
     var transcriptionDelay: TranscriptionDelay { didSet { store.set(transcriptionDelay.rawValue, forKey: Key.transcriptionDelay) } }
@@ -186,6 +214,7 @@ final class AppSettings {
     }
 
     private enum Key {
+        static let connectionMode = "connectionMode"
         static let triggerKey = "triggerKey"
         static let holdThreshold = "holdThreshold"
         static let transcriptionDelay = "transcriptionDelay"
@@ -197,6 +226,8 @@ final class AppSettings {
     }
 
     private init() {
+        let mode = store.string(forKey: Key.connectionMode)
+        connectionMode = mode.flatMap(ConnectionMode.init(rawValue:)) ?? .direct
         let trigger = store.string(forKey: Key.triggerKey)
         triggerKey = trigger.flatMap(TriggerKey.init(rawValue:)) ?? .rightCommand
         let hold = store.string(forKey: Key.holdThreshold)
