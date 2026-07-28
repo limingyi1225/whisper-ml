@@ -31,9 +31,15 @@ final class TranscriptPolisher {
         case cancelled
     }
 
-    /// Fixed on purpose — the candidates were latency-tested (medians within noise of
-    /// each other, ~1.4–2s) and the choice turned out not to be worth a settings knob.
-    private static let model = "gpt-5.6-terra"
+    /// Fixed on purpose — not worth a settings knob. luna over terra on a 386-call
+    /// interleaved A/B against these very rules: terra dropped a spoken request
+    /// ("…连不上，你帮我看看" → "…连不上。") in 10 of 14 runs and repaired an ASR
+    /// homophone correctly in only 8 of 14, sometimes substituting a word nobody
+    /// said. luna's one weakness is the opposite — it converted a Chinese name to
+    /// an English one in 4 of 14 runs of one long sentence — and the vocabulary
+    /// list suppresses that (0 of 12 with the name listed). It is also faster:
+    /// median 0.89s vs 1.04s, p90 1.35s vs 1.64s.
+    private static let model = "gpt-5.6-luna"
 
     /// States principles rather than listing example filler words on purpose. An
     /// enumerated list turns a judgement call into a mechanical rule — "你知道吧" is
