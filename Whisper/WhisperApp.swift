@@ -33,6 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("XCTest") }) {
             return
         }
+        // Before `controller.start()`, which opens the socket: a personalised build
+        // should come up already connected rather than showing 「还没有设置设备 Token」
+        // and reconnecting a moment later. No-op in an ordinary build.
+        if KeychainStore.seedBundledRelayTokenIfNeeded() {
+            AppSettings.shared.connectionMode = .relay
+        }
+
         // Menu-bar only; LSUIElement already keeps us out of the Dock, but be explicit
         // so the app never steals focus from whatever the user is typing into.
         NSApp.setActivationPolicy(.accessory)

@@ -163,8 +163,22 @@ final class AppSettings {
     /// the one vocabulary-bias slot the transcription side has.
     var vocabulary: String { didSet { store.set(vocabulary, forKey: Key.vocabulary) } }
 
+    /// Names the people using this app say constantly and the transcriber keeps
+    /// spelling as some other homophone. They ride along on every cleanup request and
+    /// are deliberately absent from Settings: the box is for words the user thinks to
+    /// add, and nobody thinks to add the spelling of their own name until they have
+    /// already seen it come out wrong a dozen times.
+    static let builtInVocabulary = ["李铭一", "赵芸溪"]
+
     /// The vocabulary as the cleanup pass sees it.
-    var vocabularyTerms: [String] { Self.parseVocabulary(vocabulary) }
+    var vocabularyTerms: [String] { Self.vocabularyTerms(userList: vocabulary) }
+
+    /// Built-ins first, then the user's own list minus any line that just repeats one
+    /// of them. The user's cap applies to the user's lines only — a built-in must not
+    /// be able to push out a term someone typed deliberately.
+    static func vocabularyTerms(userList raw: String) -> [String] {
+        builtInVocabulary + parseVocabulary(raw).filter { !builtInVocabulary.contains($0) }
+    }
 
     /// One term per line; blank lines and duplicates dropped, order preserved.
     ///

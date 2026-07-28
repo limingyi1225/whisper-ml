@@ -27,6 +27,14 @@ const DEFAULTS = Object.freeze({
   // than that a real sentence was too long.
   maxPolishCompletionTokens: 8192,
   maxConnectionsPerDevice: 2,
+  // Per-device caps bound one leaked token; they do nothing about ten honest people
+  // all dictating at once. Each bridge can hold `maxForwardBufferBytes` queued in each
+  // direction, so the arithmetic that matters is buffers × bridges against a 1 vCPU /
+  // 2 GB box: 24 × 8 MiB × 2 is ~380 MiB worst case, which fits with room to spare.
+  // Steady state is far below that — an idle warm socket costs almost nothing — so this
+  // is a backstop against everyone flushing a long queued utterance simultaneously,
+  // not a limit anyone should meet in normal use.
+  maxTotalConnections: 24,
   openAIRequestTimeoutMs: 11_000,
   // Two missed sweeps' worth of silence. The app pings every 20 s, so a client that
   // is merely idle always answers well inside this.
@@ -170,6 +178,11 @@ export function loadConfig(env = process.env) {
       env,
       "MAX_CONNECTIONS_PER_DEVICE",
       DEFAULTS.maxConnectionsPerDevice,
+    ),
+    maxTotalConnections: positiveInteger(
+      env,
+      "MAX_TOTAL_CONNECTIONS",
+      DEFAULTS.maxTotalConnections,
     ),
     openAIRequestTimeoutMs: positiveInteger(
       env,

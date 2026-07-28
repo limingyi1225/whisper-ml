@@ -388,6 +388,18 @@ import Testing
             .joined(separator: "\n")
         #expect(AppSettings.parseVocabulary(many).count == AppSettings.vocabularyTermLimit)
     }
+
+    @Test func builtInNamesRideAlongWithAnEmptyBox() {
+        // The names of the people using the app are never typed into Settings, so an
+        // empty box still has to reach the cleanup model with something in it.
+        #expect(AppSettings.vocabularyTerms(userList: "") == AppSettings.builtInVocabulary)
+    }
+
+    @Test func builtInNamesComeFirstAndAreNotDuplicated() {
+        let terms = AppSettings.vocabularyTerms(userList: "Kevin\n李铭一\nAnthropic")
+        #expect(terms == AppSettings.builtInVocabulary + ["Kevin", "Anthropic"])
+        #expect(terms.count { $0 == "李铭一" } == 1)
+    }
 }
 
 // MARK: - Settings tables

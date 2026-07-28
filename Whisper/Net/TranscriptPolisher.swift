@@ -41,14 +41,25 @@ final class TranscriptPolisher {
     /// median 0.89s vs 1.04s, p90 1.35s vs 1.64s.
     private static let model = "gpt-5.6-luna"
 
+    /// The first attempt gets a slice of the deadline, not all of it.
+    ///
+    /// A cleanup call takes ~1.1s in practice and never exceeded 3.4s across 193
+    /// measured calls, so 4s is not a limit a healthy request runs into. A dead pooled
+    /// connection, on the other hand, takes macOS about six seconds to notice — two
+    /// utterances in one logged session cost 7.3s each, of which 6s was the operating
+    /// system waiting on a socket that was never going to answer. Failing at 4s and
+    /// retrying on a fresh pool turns that into roughly 5s, and costs one duplicate
+    /// request on the rare occasion a healthy call really is that slow.
+    private static let firstAttemptTimeout: TimeInterval = 4
+
     /// States principles rather than listing example filler words on purpose. An
     /// enumerated list turns a judgement call into a mechanical rule — "你知道吧" is
     /// filler in one sentence and the actual point in the next — and the model has the
     /// whole utterance in front of it, so it is better placed to decide than a list is.
     ///
-    /// The vocabulary block is strictly additive: with an empty list the model sees
-    /// exactly the base prompt below and nothing else, so users who never open that
-    /// settings box are unaffected by the feature.
+    /// The vocabulary block is strictly additive, and an empty list still produces
+    /// exactly the base prompt below — though in practice the list is never empty,
+    /// since `AppSettings` always contributes its built-in names.
     static func instructions(vocabulary: [String]) -> String {
         let base = """
         你是语音转写结果的「文字整理器」。输入是语音识别的原始文本，你只做整理。
@@ -81,11 +92,32 @@ final class TranscriptPolisher {
         """
     }
 
-    private let session: URLSession = {
+    /// Not a `let`, because a pooled connection can die between utterances and the
+    /// pool is what has to be thrown away — see `renewSession`.
+    private var session = TranscriptPolisher.makeSession()
+
+    private static func makeSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 12
         return URLSession(configuration: config)
-    }()
+    }
+
+    /// Swaps in a fresh connection pool after a transport failure.
+    ///
+    /// URLSession keeps its HTTP/3 connection to the API alive between utterances, and
+    /// QUIC rides on UDP: a NAT or router that drops the idle flow kills the connection
+    /// without either side sending anything. The next request is written into a socket
+    /// that will never answer. Retrying on the same session can hand the retry that same
+    /// dead connection; a new session cannot, because it has its own pool.
+    ///
+    /// `finishTasksAndInvalidate`, not `invalidateAndCancel`: an older utterance may
+    /// still have a request in flight on the outgoing session, and it should be allowed
+    /// to finish rather than be cancelled by a newer one's cleanup.
+    private func renewSession() {
+        session.finishTasksAndInvalidate()
+        session = Self.makeSession()
+        log.info("polish connection renewed after transport failure")
+    }
 
     /// Cleans the transcript up, or explains why it could not. Never throws, and
     /// never costs the caller its text: every failure path leaves the raw transcript
@@ -107,7 +139,8 @@ final class TranscriptPolisher {
             vocabulary: vocabulary,
             route: route,
             suppressReasoning: true,
-            deadline: deadline
+            deadline: deadline,
+            timeout: Self.firstAttemptTimeout
         )
         guard !Task.isCancelled else { return .unchanged(notice: nil) }
 
@@ -123,6 +156,8 @@ final class TranscriptPolisher {
             // left of the shared deadline, defeating the retry entirely.
             let parameterWasRejected =
                 if case .reasoningParameterRejected = first { true } else { false }
+            // No cap on the retry: it has the rest of the deadline, and by here it is
+            // running on a connection that was either proven good or just replaced.
             let second = await request(
                 raw,
                 vocabulary: vocabulary,
@@ -161,7 +196,8 @@ final class TranscriptPolisher {
         vocabulary: [String],
         route: ServiceRoute,
         suppressReasoning: Bool,
-        deadline: Date
+        deadline: Date,
+        timeout: TimeInterval = .infinity
     ) async -> RequestResult {
         guard !Task.isCancelled else { return .cancelled }
         let remaining = deadline.timeIntervalSinceNow
@@ -169,7 +205,7 @@ final class TranscriptPolisher {
 
         var request = URLRequest(url: route.polishURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = remaining
+        request.timeoutInterval = min(timeout, remaining)
         request.setValue("Bearer \(route.credential)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -233,6 +269,11 @@ final class TranscriptPolisher {
             return .cancelled
         } catch {
             log.error("polish request failed: \(error.localizedDescription, privacy: .public)")
+            // The request never got an answer: either the connection was dead or it
+            // stalled long enough to hit the cap. Both mean the retry must not inherit
+            // this pool. HTTP status failures deliberately skip this — a 429 or a 503
+            // arrived over a perfectly good connection.
+            renewSession()
             return .retryableFailure
         }
     }

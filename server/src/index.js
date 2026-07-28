@@ -5,7 +5,7 @@ import { authenticateRequest } from "./auth.js";
 import { loadConfig } from "./config.js";
 import { errorBody, routePath, writeJSON } from "./http.js";
 import { handlePolish } from "./polish.js";
-import { FixedWindowRateLimiter } from "./rate-limit.js";
+import { admitConnection, FixedWindowRateLimiter } from "./rate-limit.js";
 import { bridgeRealtime } from "./realtime.js";
 
 const config = loadConfig();
@@ -85,7 +85,19 @@ server.on("upgrade", (request, socket, head) => {
   }
 
   const active = activeConnections.get(deviceID) || 0;
-  if (active >= config.maxConnectionsPerDevice) {
+  // `downstreamSockets.size`, not a sum over the per-device map: it is the set the
+  // close handlers maintain, so it cannot drift out of step with what is really open.
+  const refusal = admitConnection({
+    openForDevice: active,
+    openTotal: downstreamSockets.size,
+    config,
+  });
+  if (refusal) {
+    if (refusal === "total") {
+      process.stderr.write(
+        `refusing connection: ${downstreamSockets.size} already open\n`,
+      );
+    }
     socket.end("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
     return;
   }

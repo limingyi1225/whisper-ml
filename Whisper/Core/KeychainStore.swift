@@ -15,6 +15,35 @@ enum KeychainStore {
         load(account: relayTokenAccount)
     }
 
+    /// A relay device token baked into this copy of the app when it was packaged.
+    ///
+    /// `script/package_release.sh --for <name>` writes it into `Info.plist` after export
+    /// and re-signs, so a build handed to someone else needs no setup at all. Absent in
+    /// every ordinary build, including the one on the developer's own machine.
+    ///
+    /// This is deliberately *only* a relay token, never an OpenAI key. An embedded
+    /// string is one `strings` away from anyone holding the binary; what makes that
+    /// acceptable here is that the relay confines the token to a fixed model and request
+    /// shape, caps its connections and request rate, and lets one hash be revoked
+    /// without touching anyone else. None of that is true of an OpenAI key.
+    static var bundledRelayToken: String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "WhisperRelayToken")
+                as? String,
+              value.hasPrefix("relay_") else { return nil }
+        return value
+    }
+
+    /// Installs the bundled token the first time this copy runs, if there is one.
+    ///
+    /// Only ever fills a gap: a Mac that already has a token keeps it, so re-running a
+    /// personalised build cannot overwrite a token the user set by hand. Returns true
+    /// when it wrote one, which is the caller's cue to switch to relay mode.
+    @discardableResult
+    static func seedBundledRelayTokenIfNeeded() -> Bool {
+        guard let token = bundledRelayToken, !hasRelayToken() else { return false }
+        return saveRelayToken(token)
+    }
+
     /// Whether a credential is stored, without copying it out.
     ///
     /// The settings pane asks this on every render — which for a pane containing a

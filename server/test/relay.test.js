@@ -5,7 +5,7 @@ import { authenticateRequest, tokenDigest } from "../src/auth.js";
 import { CLIENT_MAX_TURN_AUDIO_BYTES, loadConfig } from "../src/config.js";
 import { routePath } from "../src/http.js";
 import { validatePolishBody } from "../src/polish.js";
-import { FixedWindowRateLimiter } from "../src/rate-limit.js";
+import { admitConnection, FixedWindowRateLimiter } from "../src/rate-limit.js";
 import { clientEventID, safeCloseCode, validateRealtimeEvent } from "../src/realtime.js";
 
 const token = "relay_test-device-token";
@@ -168,6 +168,28 @@ test("the offending event_id is recovered where there is one to recover", () => 
   // Nothing to recover from a frame that was rejected for not being parseable at all.
   assert.equal(clientEventID(Buffer.from("not json"), false), undefined);
   assert.equal(clientEventID(Buffer.from([0, 1, 2]), true), undefined);
+});
+
+test("ten people each hold their own slots, but not the whole box", () => {
+  const config = loadConfig(baseEnv);
+  // One warm socket per person, plus one transient during a reconnect. This is what
+  // makes a token each the right shape: ten people sharing one token would be ten
+  // connections on one device, and the third of them would be refused.
+  assert.equal(config.maxConnectionsPerDevice, 2);
+  assert.equal(admitConnection({ openForDevice: 1, openTotal: 9, config }), null);
+  assert.equal(admitConnection({ openForDevice: 2, openTotal: 9, config }), "device");
+
+  // The per-device cap alone cannot protect a 1 vCPU box: ten distinct devices all
+  // pass it. Headroom for ten people at two slots each, and a wall after that.
+  assert.ok(config.maxTotalConnections >= 10 * config.maxConnectionsPerDevice);
+  assert.equal(
+    admitConnection({ openForDevice: 0, openTotal: config.maxTotalConnections, config }),
+    "total",
+  );
+  assert.equal(
+    admitConnection({ openForDevice: 0, openTotal: config.maxTotalConnections - 1, config }),
+    null,
+  );
 });
 
 test("rate limiter resets at the next window", () => {
