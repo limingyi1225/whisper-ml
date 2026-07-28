@@ -1,4 +1,5 @@
 import http from "node:http";
+import net from "node:net";
 import assert from "node:assert/strict";
 import test from "node:test";
 import WebSocket, { WebSocketServer } from "ws";
@@ -7,7 +8,7 @@ import { tokenDigest } from "../src/auth.js";
 import { loadConfig } from "../src/config.js";
 import { handlePolish } from "../src/polish.js";
 import { FixedWindowRateLimiter } from "../src/rate-limit.js";
-import { bridgeRealtime } from "../src/realtime.js";
+import { bridgeRealtime, revokeDownstream } from "../src/realtime.js";
 
 const token = "relay_integration-device-token";
 const baseConfig = loadConfig({
@@ -171,6 +172,156 @@ test("a cleanup the app abandons stops costing money upstream", async () => {
   }
 });
 
+test("a polish request that outlives its authorisation is refused before OpenAI is paid", async () => {
+  // Bearer auth runs when the headers arrive, but the body arrives at the client's
+  // pace — so a deliberately slow POST can be opened while authorised and finished
+  // after a revocation. The re-check has to land between the body and the upstream
+  // fetch, or "revoked" would only mean "revoked for future requests".
+  let upstreamContacted = false;
+  const upstream = http.createServer((request, response) => {
+    upstreamContacted = true;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  const upstreamPort = await listen(upstream);
+
+  let authorized = true;
+  const config = {
+    ...baseConfig,
+    openAIPolishURL: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+  };
+  const relay = http.createServer((request, response) => {
+    void handlePolish(request, response, {
+      config,
+      deviceID: tokenDigest(token),
+      rateLimiter: new FixedWindowRateLimiter(5),
+      stillAuthorized: () => authorized,
+    });
+  });
+  const relayPort = await listen(relay);
+
+  try {
+    const body = JSON.stringify({
+      model: "gpt-5.6-terra",
+      messages: [
+        { role: "system", content: "tidy only" },
+        { role: "user", content: "<transcript>raw</transcript>" },
+      ],
+      reasoning_effort: "none",
+    });
+    const request = http.request({
+      host: "127.0.0.1",
+      port: relayPort,
+      method: "POST",
+      path: "/v1/polish",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+      },
+    });
+    const answered = new Promise((resolve, reject) => {
+      request.on("response", resolve);
+      request.on("error", reject);
+    });
+
+    // Headers and half the body while still authorised…
+    request.write(body.slice(0, 20));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // …revoked mid-flight…
+    authorized = false;
+    // …and the rest of the body arrives anyway.
+    request.end(body.slice(20));
+
+    const response = await answered;
+    assert.equal(response.statusCode, 401);
+    assert.equal(upstreamContacted, false, "the server key must not be spent post-revocation");
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
+test("revoking a device aborts the cleanup request it already has in flight", async () => {
+  // The pre-fetch re-check only covers requests that have not started paying yet. Once
+  // the upstream request is open, the only things that could end it were the client
+  // hanging up and the 11 s timeout — so a device revoked mid-request still received a
+  // completed answer, generated and billed on the server's key.
+  let upstreamAborted = false;
+  const upstream = http.createServer((request, response) => {
+    // Never answers, like a generation still in progress.
+    response.on("close", () => {
+      if (!response.writableEnded) upstreamAborted = true;
+    });
+  });
+  const upstreamPort = await listen(upstream);
+
+  const deviceID = tokenDigest(token);
+  let allowed = new Set([deviceID]);
+  // The registry index.js keeps, and the loop its SIGHUP handler runs.
+  const inflight = new Set();
+  const revoke = () => {
+    allowed = new Set();
+    for (const entry of inflight) {
+      if (allowed.has(entry.deviceID)) continue;
+      entry.abort();
+    }
+  };
+
+  const config = {
+    ...baseConfig,
+    openAIPolishURL: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+  };
+  const relay = http.createServer((request, response) => {
+    void handlePolish(request, response, {
+      config,
+      deviceID,
+      rateLimiter: new FixedWindowRateLimiter(5),
+      stillAuthorized: () => allowed.has(deviceID),
+      registerAbort: (abort) => {
+        const entry = { deviceID, abort };
+        inflight.add(entry);
+        return () => inflight.delete(entry);
+      },
+    });
+  });
+  const relayPort = await listen(relay);
+
+  try {
+    const answered = fetch(`http://127.0.0.1:${relayPort}/v1/polish`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-terra",
+        messages: [
+          { role: "system", content: "tidy only" },
+          { role: "user", content: "<transcript>raw</transcript>" },
+        ],
+        reasoning_effort: "none",
+      }),
+    });
+
+    assert.ok(await waitUntil(() => inflight.size === 1), "the request never registered");
+    revoke();
+
+    const response = await answered;
+    // 401, not 502: telling a revoked device the relay could not reach OpenAI would send
+    // it into its retry ladder over a request that will never be served again.
+    assert.equal(response.status, 401);
+    assert.ok(
+      await waitUntil(() => upstreamAborted),
+      "the upstream generation must stop, not run to completion and bill",
+    );
+    assert.equal(inflight.size, 0, "the registry must not leak entries");
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
 test("Realtime bridge queues the first session update and injects the server key", async () => {
   let upstreamAuthorization;
   const receivedByUpstream = [];
@@ -247,6 +398,157 @@ test("Realtime bridge queues the first session update and injects the server key
     );
   } finally {
     client.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("an illegal frame from a half-open peer does not free its connection slot", async () => {
+  // The bookkeeping index.js uses. `ws` answers a protocol error with close(), not
+  // destroy(), so the socket sits in CLOSING until the peer's FIN or a ~30 s timer. An
+  // ordinary client sends that FIN automatically; a raw socket with allowHalfOpen just
+  // does not, and releasing the slot on `error` then handed the ceiling away while the
+  // connection was still alive — repeatable, so both caps could be walked past.
+  const counted = new Set();
+  const server = http.createServer();
+  const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
+  wss.on("connection", (socket) => {
+    counted.add(socket);
+    socket.once("close", () => counted.delete(socket));
+    socket.once("error", () => socket.terminate());
+  });
+  const port = await listen(server);
+
+  const raws = [];
+  try {
+    for (let i = 0; i < 5; i += 1) {
+      const raw = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+      raws.push(raw);
+      raw.on("error", () => {});
+      raw.on("data", () => {});
+      raw.on("end", () => {});   // deliberately never finish the close
+      // Exactly 16 bytes before base64: ws validates the key against /^[+/0-9A-Za-z]
+      // {22}==$/ and 400s anything else. A 17-byte key made every handshake fail,
+      // `connection` never fire, and both waits pass vacuously on empty sets — five
+      // rounds of pure timeout that guarded nothing. Hence the assert below, so a
+      // handshake that stops completing fails the test instead of hollowing it out.
+      raw.write(
+        `GET / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\n`
+        + "Connection: Upgrade\r\n"
+        + `Sec-WebSocket-Key: ${Buffer.from(`key-padding-123${i}`).toString("base64")}\r\n`
+        + "Sec-WebSocket-Version: 13\r\n\r\n",
+      );
+      assert.ok(
+        await waitUntil(() => counted.size === 1, 2_000),
+        `round ${i}: the WebSocket handshake never completed`,
+      );
+      raw.write(Buffer.from([0xc1, 0x80, 0, 0, 0, 0]));   // RSV1, no extension
+      // The slot must come back because the socket is really gone, not because the
+      // error handler stopped counting a socket that is still open.
+      assert.ok(
+        await waitUntil(() => counted.size === 0 && wss.clients.size === 0, 5_000),
+        `round ${i}: slot released while ${wss.clients.size} socket(s) were still held`,
+      );
+    }
+  } finally {
+    for (const raw of raws) raw.destroy();
+    wss.close();
+    await close(server);
+  }
+});
+
+test("a revoked connection stops forwarding the instant the revoke lands", async () => {
+  // close() alone does not do this: the socket sits in CLOSING waiting for the peer's
+  // ack, and ws keeps parsing and forwarding frames the whole time — measured, five
+  // frames sent after close() all still reached the upstream handler. pause() alone
+  // does not either: ws's close handler drains data buffered before destruction into
+  // the receiver, so everything the pause held back would be forwarded in one burst
+  // when the reaper fires. And the paid OpenAI session must die *with* the revoke —
+  // graceMs here is far beyond the wait below, so the upstream-closed assertion can
+  // only pass if the revoke killed it directly, not the reap.
+  const receivedByUpstream = [];
+  let upstreamGone = false;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("close", () => { upstreamGone = true; });
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      receivedByUpstream.push(event.type);
+      if (event.type === "session.update") {
+        socket.send(JSON.stringify({ type: "session.updated" }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  let downstream;
+  let bridgeUpstream;
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (socket) => {
+    downstream = socket;
+    bridgeUpstream = bridgeRealtime(socket, {
+      ...baseConfig,
+      openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
+    });
+  });
+  const relayPort = await listen(relayServer);
+
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    assert.deepEqual(await onceMessage(client), { type: "session.updated" });
+
+    const append = JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-1",
+      audio: Buffer.from([1, 2, 3, 4]).toString("base64"),
+    });
+    client.send(append);
+    assert.ok(
+      await waitUntil(() => receivedByUpstream.length === 2),
+      "the pre-revocation append should have been forwarded",
+    );
+
+    // The client never processes the incoming close frame — the model of frames
+    // already in flight, or of a peer that simply declines to stop sending.
+    client.pause();
+    revokeDownstream(downstream, { upstream: bridgeUpstream, graceMs: 2_000 });
+    for (let i = 0; i < 5; i += 1) client.send(append);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    assert.deepEqual(
+      receivedByUpstream,
+      ["session.update", "input_audio_buffer.append"],
+      "nothing sent after the revoke may reach upstream",
+    );
+    assert.ok(
+      upstreamGone,
+      "the paid OpenAI session must be killed by the revoke itself, not the later reap",
+    );
+  } finally {
+    client.terminate();
     for (const socket of relayWSS.clients) socket.terminate();
     for (const socket of upstreamWSS.clients) socket.terminate();
     relayWSS.close();

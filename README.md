@@ -17,7 +17,7 @@
 
 菜单栏图标 → 设置（⌘,）
 
-- **通用**：连接方式（直连 / 代理模式）、连接状态、触发键、转写模型、
+- **通用**：连接方式及状态（直连 / 代理模式）、触发键、转写模型、
   出字前先听多久、繁体转简体、松手后整理、常用词汇
 - **账号与权限**：当前连接方式对应的凭据（API Key 或设备 Token）、辅助功能 / 麦克风
   授权状态、热键诊断
@@ -94,9 +94,36 @@ npm start
 
 `npm run generate-token` 打印一对值：**设备 Token** 粘贴到 App 的「账号与权限 → 设备
 Token」（切到代理模式后才会出现），服务器只保存它的 **SHA-256 hash**。Token 只在生成时
-显示一次；要吊销就把对应 hash 从 `RELAY_DEVICE_TOKEN_HASHES` 里删掉再重启。凭据由 App 自己
-写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL 里没有本 App，读取时会弹
-授权框甚至直接失败。
+显示一次。凭据由 App 自己写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL
+里没有本 App，读取时会弹授权框甚至直接失败。
+
+### 签发与吊销
+
+线上部署由 `script/deploy_relay.sh` 设置了 `RELAY_DEVICE_TOKEN_FILE`，**一旦设了这个变量，
+`RELAY_DEVICE_TOKEN_HASHES` 就完全被忽略**。所以不要去改环境变量里的 hash：服务会正常启动，
+但要吊销的 Token 依然在文件名单里有效。用脚本：
+
+```bash
+./script/package_release.sh --for alice   # 签发：建 Token、打包、公证，最后才注册
+./script/revoke_token.sh                  # 看谁有权限
+./script/revoke_token.sh alice            # 只吊销 alice
+```
+
+注册放在最后一步是故意的：构建、公证途中任何一步失败，Token 都还没上线，重跑一遍
+即可，服务器上没有需要清理的东西。
+
+两者都走 `systemctl reload`（SIGHUP 热重载名单），**不重启**——重启会掐断所有人的
+WebSocket，别人正在说的那句话就没了。吊销会顺带断掉对方**已经建立的**那条连接：鉴权只发生
+在 upgrade 那一刻，只换名单的话对方能一直用到会话自然过期。
+
+手工改 `/opt/whisper-relay/device-tokens` 也可以（一行一个 hash，支持 `hash # 备注`），改完
+`systemctl reload whisper-relay`。名单解析失败时会保留旧名单而不是清空，所以写坏一个文件不会
+把所有人锁在外面。
+
+代价是「reload 看起来成功了」和「真的生效了」不是一回事：被拒绝的 reload 保留旧名单，而旧名单
+的条数完全可能和新文件相同。所以 `/healthz` 除了 `tokens` 还返回 `allowlist`——当前生效名单的
+指纹，两个脚本都拿自己刚写的文件算同一个指纹去比对，对不上就回滚。手工改完想确认，同样看它变了
+没有。
 
 ### 反向代理
 

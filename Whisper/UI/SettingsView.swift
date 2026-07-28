@@ -39,19 +39,17 @@ private struct GeneralSettingsTab: View {
                 .onChange(of: settings.connectionMode) {
                     controller.reconnect()
                 }
-
-                LabeledContent("连接状态") {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(connectionTint)
-                            .frame(width: 6, height: 6)
-                        Text(connectionLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
             } header: {
-                Text("连接")
+                HStack(spacing: 6) {
+                    Text("连接")
+                    Spacer(minLength: 12)
+                    Circle()
+                        .fill(connectionTint)
+                        .frame(width: 6, height: 6)
+                    Text(connectionLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             } footer: {
                 Text(settings.connectionMode.summary)
                     .font(.caption)
@@ -153,7 +151,7 @@ private struct GeneralSettingsTab: View {
         case .ready: return "已连接"
         case .connecting: return "连接中"
         case .disconnected: return "未连接"
-        case .failed(let message): return DictationController.friendlyMessage(message)
+        case .failed: return "连接失败"
         }
     }
 
@@ -195,14 +193,14 @@ private struct AccountSettingsTab: View {
 
     @Bindable private var settings = AppSettings.shared
     @State private var apiKeyField = ""
-    @State private var apiKeySavedNotice = false
-    @State private var apiKeySaveFailed = false
+    @State private var apiKeyStored = KeychainStore.hasAPIKey()
+    @State private var isEditingAPIKey = false
+    @State private var apiKeyError: String?
     @State private var relayTokenField = ""
     @State private var relayTokenSavedNotice = false
     @State private var relayTokenSaveFailed = false
     @State private var accessibilityGranted = Permissions.hasAccessibility
     @State private var microphoneStatus = Permissions.microphoneStatus
-    @State private var secureInputEnabled = Permissions.isSecureInputEnabled
 
     private let refresh = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
@@ -238,9 +236,9 @@ private struct AccountSettingsTab: View {
                 Section {
                     directCredentialEditor
                 } header: {
-                    Text("OpenAI API Key")
+                    Text("OpenAI")
                 } footer: {
-                    Text("只在直接连接 OpenAI 时使用，保存在本机钥匙串中。")
+                    Text("只在“直连”模式下使用。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -261,50 +259,100 @@ private struct AccountSettingsTab: View {
                     Text(controller.isHotKeyActive ? "运行中" : "未启动")
                         .foregroundStyle(controller.isHotKeyActive ? Color.green : Color.orange)
                 }
-                LabeledContent("安全输入") {
-                    Text(secureInputEnabled ? "已启用，听写暂停" : "未启用")
-                        .foregroundStyle(secureInputEnabled ? Color.orange : Color.secondary)
-                }
                 Button("重新启动热键监听") { controller.restartHotKey() }
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            apiKeyStored = KeychainStore.hasAPIKey()
+        }
         .onReceive(refresh) { _ in
             accessibilityGranted = Permissions.hasAccessibility
             microphoneStatus = Permissions.microphoneStatus
-            secureInputEnabled = Permissions.isSecureInputEnabled
         }
     }
 
     @ViewBuilder
     private var directCredentialEditor: some View {
-        SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
-            .onChange(of: apiKeyField) { _, newValue in
-                // Saving clears the field, which must not clear the success notice.
-                if !newValue.isEmpty {
-                    apiKeySavedNotice = false
-                    apiKeySaveFailed = false
-                }
-            }
-        HStack {
-            Button("保存并连接") {
-                // The keychain can genuinely refuse the write; claiming success then
-                // would leave the old (or no) key in use.
-                if KeychainStore.saveAPIKey(apiKeyField) {
-                    apiKeyField = ""
-                    apiKeySavedNotice = true
-                    controller.reconnect()
-                } else {
-                    apiKeySaveFailed = true
-                }
-            }
-            .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        if apiKeyStored && !isEditingAPIKey {
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Color.green)
+                    .font(.title3)
 
-            credentialStatus(
-                saveFailed: apiKeySaveFailed,
-                savedNotice: apiKeySavedNotice,
-                hasStoredValue: KeychainStore.hasAPIKey()
-            )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("API Key 已保存")
+                    Text("保存在此 Mac 的钥匙串中")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("更换…") {
+                    apiKeyField = ""
+                    apiKeyError = nil
+                    isEditingAPIKey = true
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(apiKeyStored ? "更换 API Key" : "添加 API Key")
+                Text(apiKeyStored ? "保存成功前，当前 Key 会继续保留。" : "保存后会立即尝试连接。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            SecureField(apiKeyStored ? "新的 API Key" : "API Key",
+                        text: $apiKeyField,
+                        prompt: Text("sk-proj-…"))
+                .onChange(of: apiKeyField) {
+                    apiKeyError = nil
+                }
+                .onSubmit {
+                    saveAPIKey()
+                }
+
+            HStack(spacing: 8) {
+                if let apiKeyError {
+                    Label(apiKeyError, systemImage: "exclamationmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.red)
+                }
+
+                Spacer()
+
+                if apiKeyStored {
+                    Button("取消") {
+                        apiKeyField = ""
+                        apiKeyError = nil
+                        isEditingAPIKey = false
+                    }
+                }
+
+                Button(apiKeyStored ? "更新并连接" : "保存并连接") {
+                    saveAPIKey()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private func saveAPIKey() {
+        let key = apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+
+        // Never clear the old Key before the replacement has been written. If the
+        // keychain refuses this write, the existing working setup stays intact.
+        if KeychainStore.saveAPIKey(key) {
+            apiKeyField = ""
+            apiKeyStored = true
+            isEditingAPIKey = false
+            apiKeyError = nil
+            controller.reconnect()
+        } else {
+            apiKeyError = "无法写入钥匙串"
         }
     }
 

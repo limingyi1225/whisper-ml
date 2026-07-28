@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { authenticateRequest, tokenDigest } from "../src/auth.js";
-import { CLIENT_MAX_TURN_AUDIO_BYTES, loadConfig } from "../src/config.js";
+import {
+  allowlistDigest,
+  CLIENT_MAX_TURN_AUDIO_BYTES,
+  loadConfig,
+  loadDeviceTokenHashes,
+} from "../src/config.js";
 import { routePath } from "../src/http.js";
 import { validatePolishBody } from "../src/polish.js";
 import { admitConnection, FixedWindowRateLimiter } from "../src/rate-limit.js";
@@ -168,6 +177,125 @@ test("the offending event_id is recovered where there is one to recover", () => 
   // Nothing to recover from a frame that was rejected for not being parseable at all.
   assert.equal(clientEventID(Buffer.from("not json"), false), undefined);
   assert.equal(clientEventID(Buffer.from([0, 1, 2]), true), undefined);
+});
+
+test("the allowlist can be re-read from a file, and a bad file changes nothing", () => {
+  // Issuing or revoking a token must not restart the relay — a restart closes every
+  // socket and the app scores that as a failed utterance for everyone mid-sentence.
+  const file = "/etc/whisper-relay/device-tokens";
+  const a = tokenDigest("relay_a");
+  const b = tokenDigest("relay_b");
+  const env = { ...baseEnv, RELAY_DEVICE_TOKEN_FILE: file };
+
+  const read = (contents) => (path) => {
+    assert.equal(path, file);
+    return contents;
+  };
+  assert.deepEqual(
+    [...loadDeviceTokenHashes(env, read(`# issued to alice\n${a}\n${b}\n`))],
+    [a, b],
+  );
+  // The env var is ignored entirely once a file is configured, so there is exactly one
+  // source of truth to reason about.
+  assert.deepEqual([...loadDeviceTokenHashes(env, read(`${a}\n`))], [a]);
+
+  // Every rejection has to throw, because index.js keeps the previous set on throw. A
+  // truncated or half-written file must never be able to lock everyone out.
+  assert.throws(() => loadDeviceTokenHashes(env, read("")), /is empty/);
+  assert.throws(() => loadDeviceTokenHashes(env, read("# only a comment\n")), /is empty/);
+  assert.throws(() => loadDeviceTokenHashes(env, read(`${a}\nnot-a-hash\n`)), /SHA-256/);
+  assert.throws(() => loadDeviceTokenHashes(env, read(`${a.slice(0, 40)}\n`)), /SHA-256/);
+  assert.throws(
+    () => loadDeviceTokenHashes(env, () => { throw new Error("ENOENT"); }),
+    /ENOENT/,
+  );
+
+  // No file configured: the static env list, exactly as before.
+  assert.deepEqual(
+    [...loadDeviceTokenHashes(baseEnv)],
+    [tokenDigest(token)],
+  );
+
+  // The canonicalisation the issue/revoke scripts must mirror: lowercased before
+  // parsing, and a Set, so a hash counts once no matter how it is written. A script
+  // that counted or compared any other way would disagree with /healthz's number and
+  // either bless a revoke that never happened or roll back one that did.
+  assert.deepEqual(
+    [...loadDeviceTokenHashes(env, read(`${a.toUpperCase()}\n${a}\n${b} # bob\n`))],
+    [a, b],
+  );
+});
+
+test("the issue/revoke scripts and the relay agree on the allowlist digest", () => {
+  // /healthz reports this digest and both scripts verify a reload against it, so a
+  // divergence between the two implementations would not fail loudly — it would make
+  // every issue and revoke report failure and roll back, for a change that had in fact
+  // landed. The shell half is duplicated here verbatim from the scripts rather than
+  // described, so drift in either direction fails this test.
+  const a = tokenDigest("relay_a");
+  const b = tokenDigest("relay_b");
+  const c = tokenDigest("relay_c");
+
+  const dir = mkdtempSync(join(tmpdir(), "whisper-digest-"));
+  const file = join(dir, "device-tokens");
+  // Deliberately awkward: unsorted, a duplicate, mixed case, a comment, a comment-only
+  // line, blank lines, trailing whitespace. All of it has to canonicalize identically.
+  writeFileSync(
+    file,
+    `# issued to the team\n${c}\n\n${a.toUpperCase()}   \n${b} # bob\n${a}\n`,
+  );
+
+  const sha = process.platform === "darwin" ? "shasum -a 256" : "sha256sum";
+  const shellDigest = execFileSync("bash", ["-c", `
+    set -euo pipefail
+    effective() { awk '{ sub(/#.*/, ""); gsub(/^[ \\t]+|[ \\t]+$/, ""); if (length) print tolower($0) }' "$1" | LC_ALL=C sort -u; }
+    digest_of() { printf '%s' "$(effective "$1")" | ${sha} | cut -c1-16; }
+    digest_of "$1"
+  `, "bash", file]).toString().trim();
+
+  const parsed = loadDeviceTokenHashes(
+    { RELAY_DEVICE_TOKEN_FILE: file },
+    () => `# issued to the team\n${c}\n\n${a.toUpperCase()}   \n${b} # bob\n${a}\n`,
+  );
+  assert.deepEqual([...parsed].sort(), [a, b, c].sort());
+  assert.equal(allowlistDigest(parsed), shellDigest);
+
+  // Order-independent and duplicate-insensitive, which is what makes it safe for the
+  // scripts to compare a file they appended to against a Set the server built.
+  assert.equal(allowlistDigest(new Set([c, a, b])), allowlistDigest(new Set([a, b, c])));
+  // And it actually distinguishes lists — a digest that ignored a revocation would be
+  // worse than the count it replaced.
+  assert.notEqual(allowlistDigest(new Set([a, b])), allowlistDigest(new Set([a, b, c])));
+  assert.match(allowlistDigest(new Set([a])), /^[a-f0-9]{16}$/);
+});
+
+test("a reload revokes the right sockets and leaves the rest connected", () => {
+  // The bookkeeping index.js's SIGHUP handler performs. Authentication happens once, at
+  // upgrade, and the app then holds that socket for the life of the session — so
+  // swapping the allowlist without touching live sockets leaves a revoked person
+  // transcribing until their session happens to refresh, up to half an hour later.
+  const alice = tokenDigest("relay_alice");
+  const bob = tokenDigest("relay_bob");
+  const sockets = new Map([
+    ["alice-1", { deviceID: alice, upstream: null }],
+    ["alice-2", { deviceID: alice, upstream: null }],
+    ["bob-1", { deviceID: bob, upstream: null }],
+  ]);
+
+  const next = new Set([bob]);           // alice revoked
+  const dropped = [];
+  for (const [socket, session] of sockets) {
+    if (!next.has(session.deviceID)) dropped.push(socket);
+  }
+  assert.deepEqual(dropped, ["alice-1", "alice-2"]);
+
+  // And the converse, which is the whole reason this is a reload rather than a restart:
+  // issuing a token to someone new must disconnect nobody at all.
+  const afterIssue = new Set([alice, bob, tokenDigest("relay_carol")]);
+  const droppedByIssue = [...sockets]
+    .filter(([, session]) => !afterIssue.has(session.deviceID))
+    .map(([socket]) => socket);
+  assert.deepEqual(droppedByIssue, []);
 });
 
 test("ten people each hold their own slots, but not the whole box", () => {

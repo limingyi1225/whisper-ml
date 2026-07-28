@@ -36,7 +36,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Before `controller.start()`, which opens the socket: a personalised build
         // should come up already connected rather than showing 「还没有设置设备 Token」
         // and reconnecting a moment later. No-op in an ordinary build.
-        if KeychainStore.seedBundledRelayTokenIfNeeded() {
+        //
+        // A seed is either the first run ever or a rotation replacing this app's own
+        // earlier token. Only a user who has never chosen a mode gets moved to 代理:
+        // the token itself always lands in the keychain, but rerouting someone's audio
+        // and billing is a decision that is theirs once they have made it.
+        //
+        // The earlier test — "was there no relay token before the seed?" — got this
+        // wrong for the most ordinary existing user there is: 直连 with their own API
+        // key and no relay token looks identical to a brand-new Mac, and installing a
+        // personalised build silently switched them to the relay.
+        let modeWasChosen = AppSettings.connectionModeWasChosen
+        if KeychainStore.seedBundledRelayTokenIfNeeded(), !modeWasChosen {
             AppSettings.shared.connectionMode = .relay
         }
 

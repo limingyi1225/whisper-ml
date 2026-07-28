@@ -8,10 +8,10 @@ const ALLOWED_EVENT_TYPES = new Set([
 ]);
 const ALLOWED_DELAYS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
-/// Chinese lead, English detail in parentheses. These reach the user: the app puts a
-/// setup-time failure reason straight into the settings pane's 连接状态 label, which is
-/// otherwise all Chinese. The English half stays because it names the offending field
-/// and is the only practical way to debug a client/server version mismatch.
+/// Chinese lead, English detail in parentheses. These reach the user through the app's
+/// connection error status, which is otherwise all Chinese. The English half stays
+/// because it names the offending field and is the only practical way to debug a
+/// client/server version mismatch.
 const REJECT = Object.freeze({
   binary: "转发服务器不接受二进制消息（binary messages are not allowed）",
   tooLarge: "转发服务器：消息超过大小上限（message is too large）",
@@ -133,6 +133,35 @@ function relayError(message, code, eventID) {
   const error = { message, type: "relay_error", code };
   if (eventID) error.event_id = eventID;
   return JSON.stringify({ type: "error", error });
+}
+
+/// Cuts a revoked connection off *now*, not when the close handshake completes.
+///
+/// `close()` alone leaves the socket in CLOSING, and `ws` keeps parsing and emitting
+/// frames the whole time it waits for the peer's ack — measured: five frames sent after
+/// `close()` were all still delivered to the message handler, i.e. still forwarded to
+/// OpenAI on the server's key. `pause()` stops that stream synchronously, but is not
+/// enough by itself: `ws`'s socket-close handler deliberately drains any data that was
+/// buffered before destruction *into the receiver* (websocket.js, `socketOnClose`), so
+/// everything held back by the pause would be parsed and forwarded in one burst the
+/// moment the reaper fired — measured, all five frames arrived upstream exactly then.
+/// Dropping the message listeners is what actually revokes: whatever gets parsed,
+/// now or at the drain, is emitted to nobody. Sending is unaffected throughout, so the
+/// 4001 close frame still reaches the peer to tell it why; a paused socket can never
+/// read the close ack, so the timer reaps it unconditionally, and the bridge's own
+/// `close` handler — untouched by this — then shuts the upstream side down.
+export function revokeDownstream(socket, { upstream = null, graceMs = 5_000 } = {}) {
+  socket.pause();
+  socket.removeAllListeners("message");
+  socket.close(4001, "device token revoked");
+  // The OpenAI side dies with the revoke, not with the reap. Left to the bridge it
+  // only closes when the downstream `close` event finally fires — up to graceMs away —
+  // and until then audio already buffered toward OpenAI keeps transmitting, while an
+  // upstream still in CONNECTING would flush the whole preopen queue the moment it
+  // opened. `terminate()`, not `close()`: a close frame queues *behind* the buffered
+  // audio, which is to say it politely sends every byte first.
+  if (upstream) upstream.terminate();
+  setTimeout(() => socket.terminate(), graceMs).unref();
 }
 
 export function safeCloseCode(code, fallback = 1011) {

@@ -33,15 +33,126 @@ enum KeychainStore {
         return value
     }
 
-    /// Installs the bundled token the first time this copy runs, if there is one.
+    /// When this build's bundled token was issued (epoch seconds), stamped in by
+    /// `package_release.sh` beside the token itself.
     ///
-    /// Only ever fills a gap: a Mac that already has a token keeps it, so re-running a
-    /// personalised build cannot overwrite a token the user set by hand. Returns true
-    /// when it wrote one, which is the caller's cue to switch to relay mode.
+    /// Comparing token *values* was not enough to decide whether to install one. Two
+    /// facts have to be ordered — which of two tokens is newer — and a digest of a
+    /// value cannot answer that. Without it, opening an older personalised copy after a
+    /// newer one had installed its token looked exactly like a rotation and downgraded a
+    /// working token back to a revoked one. An issuance number makes the order explicit.
+    static var bundledTokenIssuance: Int? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "WhisperRelayTokenIssuedAt")
+        else { return nil }
+        if let number = value as? Int { return number }
+        return (value as? String).flatMap(Int.init)
+    }
+
+    /// The highest issuance this app has ever installed. A high-water mark, never
+    /// cleared — including when the user types a token of their own, because "this
+    /// issuance has already been applied here" stays true no matter what replaced it.
+    /// Clearing it would let the same build re-install its token on every launch and
+    /// overwrite the user's choice forever.
+    private static let adoptedIssuanceKey = "adoptedRelayTokenIssuance"
+
+    private static var adoptedIssuance: Int? {
+        UserDefaults.standard.object(forKey: adoptedIssuanceKey) as? Int
+    }
+
+    private static func recordAdopted(_ issuance: Int?) {
+        guard let issuance else { return }
+        UserDefaults.standard.set(
+            max(issuance, adoptedIssuance ?? Int.min),
+            forKey: adoptedIssuanceKey
+        )
+    }
+
+    /// Installs the token baked into this build, if it should replace what is there.
+    ///
+    /// The first version only wrote when the keychain was empty, which broke the one
+    /// flow the packaging script exists for: revoke someone, hand them a rebuilt copy,
+    /// and the revoked token is still sitting in their keychain — so the new one never
+    /// lands and they get 401 forever. Deleting the app does not clear a keychain item,
+    /// so there was no way out of it from their side.
+    ///
+    /// Returns true when something was written.
     @discardableResult
     static func seedBundledRelayTokenIfNeeded() -> Bool {
-        guard let token = bundledRelayToken, !hasRelayToken() else { return false }
-        return saveRelayToken(token)
+        guard let bundled = bundledRelayToken else { return false }
+        let issuance = bundledTokenIssuance
+        guard shouldSeed(
+            hasStoredToken: hasRelayToken(),
+            bundledIssuance: issuance,
+            adoptedIssuance: adoptedIssuance
+        ) else { return false }
+
+        guard saveRelayToken(bundled) else { return false }
+        recordAdopted(issuance)
+        return true
+    }
+
+    /// Installs the bundled token in response to the server rejecting what we had.
+    @discardableResult
+    static func adoptBundledRelayToken(_ token: String) -> Bool {
+        guard saveRelayToken(token) else { return false }
+        recordAdopted(bundledTokenIssuance)
+        return true
+    }
+
+    /// Whether this build's own token is the identity it should be using.
+    ///
+    /// A personalised build is handed to one person and its token is the hash registered
+    /// under their name, so that token — not whatever happens to be in the keychain — is
+    /// what makes revoking them work. Installing it once is therefore right even when
+    /// something else is already stored, which is the case the value-comparison scheme
+    /// got wrong: a recipient who had previously been given someone's shared token kept
+    /// using it, so the ledger said "alice = B" while alice's Mac authenticated as A, and
+    /// `revoke_token.sh alice` cut off a token nobody was using.
+    ///
+    /// Ordered by issuance, and only ever forward, which is what keeps that from
+    /// becoming a licence to overwrite: the same issuance is never applied twice, so a
+    /// token the user types afterwards stays, and an older copy of the app cannot
+    /// downgrade a newer token.
+    static func shouldSeed(
+        hasStoredToken: Bool,
+        bundledIssuance: Int?,
+        adoptedIssuance: Int?
+    ) -> Bool {
+        // A build with a token but no stamp predates issuance tracking; it cannot be
+        // ordered against anything, so it may only fill an empty slot. Recovery from a
+        // rejected token is the 401 path's job, which needs no ordering.
+        guard let bundledIssuance else { return !hasStoredToken }
+        guard hasStoredToken else { return true }
+        // Something is stored but this app has never applied an issuance: a token typed
+        // by hand, or seeded by a build from before this scheme. This build's identity
+        // wins, once.
+        guard let adoptedIssuance else { return true }
+        return bundledIssuance > adoptedIssuance
+    }
+
+    /// The recovery decision against this app's own recorded state. The pure function
+    /// below carries the reasoning and is what the tests drive.
+    static var mayRecoverWithBundledToken: Bool {
+        mayRecoverWithBundled(
+            bundledIssuance: bundledTokenIssuance,
+            adoptedIssuance: adoptedIssuance
+        )
+    }
+
+    /// Whether a rejected credential may be answered with the bundled token.
+    ///
+    /// Guards the same downgrade from the other side. Without it, a recipient running
+    /// the current build (token B) whose token is later revoked could have an *older*
+    /// copy's 401 recovery install A — superseded, already revoked — and then loop.
+    static func mayRecoverWithBundled(
+        bundledIssuance: Int?,
+        adoptedIssuance: Int?
+    ) -> Bool {
+        guard let adoptedIssuance else { return true }   // No history to contradict it.
+        guard let bundledIssuance else { return false }  // Unorderable against history.
+        // `>=`, not `>`: re-installing this build's own token is exactly the repair
+        // wanted when the stored value was hand-typed, or was rotated out from under it.
+        return bundledIssuance >= adoptedIssuance
     }
 
     /// Whether a credential is stored, without copying it out.

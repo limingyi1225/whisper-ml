@@ -447,6 +447,9 @@ final class RealtimeClient {
 
         case "session.updated":
             reconnectAttempt = 0
+            // A working session ends the failure episode the recovery latch guards, so
+            // a rotation months from now starts with a fresh attempt.
+            didTryBundledTokenRecovery = false
             status = .ready
             log.info("session ready")
             flushPendingAudio()
@@ -671,6 +674,13 @@ final class RealtimeClient {
                     // time. With an unconditional `retry: true` here, the backoff
                     // ladder's stop condition was unreachable and the app would
                     // reconnect every 30 s forever.
+                    if failure.rejectedCredential, self.recoverWithBundledToken() {
+                        self.reconnectAttempt = 0
+                        self.disconnect()
+                        self.connectIfNeeded()
+                        if wasMidUtterance { self.onFailure?(message) }
+                        return
+                    }
                     self.disconnect(
                         retry: failure.retryable && self.reconnectAttempt < 6,
                         reason: message
@@ -706,10 +716,19 @@ final class RealtimeClient {
                         // Stop once the backoff ladder tops out: a handshake the
                         // server keeps rejecting (bad key, TLS interception) would
                         // otherwise loop forever with the UI flapping between
-                        // 连接中/未连接. Always pass the reason so the settings
-                        // pane can show *why*. Saving settings, a manual reconnect,
-                        // or the next dictation attempt all try again from scratch.
+                        // 连接中/未连接. Always pass the reason so the menu can show
+                        // *why*. Saving settings, a manual reconnect, or the next
+                        // dictation attempt all try again from scratch.
                         let failure = self.transportFailure(error)
+                        // Before reporting a dead end: a personalised build can replace
+                        // a token the relay has stopped accepting with its own.
+                        if failure.rejectedCredential, self.recoverWithBundledToken() {
+                            self.reconnectAttempt = 0
+                            self.disconnect()
+                            self.connectIfNeeded()
+                            if wasMidUtterance { self.onFailure?(failure.message) }
+                            return
+                        }
                         self.disconnect(
                             retry: failure.retryable && self.reconnectAttempt < 6,
                             reason: failure.message
@@ -788,6 +807,51 @@ final class RealtimeClient {
     struct TransportFailure {
         let message: String
         let retryable: Bool
+        /// The peer rejected the credential itself, rather than failing to talk to us.
+        /// The one failure a personalised build can repair on its own.
+        var rejectedCredential = false
+    }
+
+    /// Set once a rejected credential has been answered by installing the bundled token,
+    /// so a bundled token that is *also* rejected cannot loop. Scoped to the failure
+    /// episode, not the process: a session coming up clears it, because a menu-bar app
+    /// runs for months and one exhausted latch must not disable recovery forever.
+    @ObservationIgnored private var didTryBundledTokenRecovery = false
+
+    /// Repairs a rejected device token from the one this build shipped with, if it can.
+    ///
+    /// A 401 is unambiguous evidence that the stored token is not accepted — revoked,
+    /// rotated, or left behind by an older personalised build. Deleting the app does not
+    /// clear a keychain item, so without this the recipient of a re-issued build is stuck
+    /// on 401 forever with no way out from their side.
+    ///
+    /// This is also the migration path for a copy seeded before provenance was tracked:
+    /// there is no marker to consult, but there does not need to be. A working token is
+    /// never touched, because a working token never produces a 401.
+    private func recoverWithBundledToken() -> Bool {
+        guard !didTryBundledTokenRecovery,
+              activeRoute?.mode == .relay,
+              let bundled = KeychainStore.bundledRelayToken,
+              bundled != activeRoute?.credential else { return false }
+        // The rejection belongs to the credential *this* socket used. If the keychain
+        // has moved on since, the 401 says nothing about what is stored now and
+        // overwriting it would destroy a token the user had just saved — reachable
+        // whenever a save lands while an utterance is still in flight, because the
+        // reconnect is deferred to the settle boundary and the old socket's handshake
+        // can fail after it.
+        guard KeychainStore.loadRelayToken() == activeRoute?.credential else { return false }
+        // Never sideways or backwards: an older copy of the app must not answer a 401 by
+        // installing the token it happens to carry over a newer one already in use.
+        guard KeychainStore.mayRecoverWithBundledToken else { return false }
+        // The latch lands only after the keychain write succeeds. Latching first meant
+        // one transiently locked keychain burned the process's only recovery attempt —
+        // unlocked a minute later, the app still refused to try until it was relaunched.
+        // No loop opens up in exchange: after a successful adopt the stored token *is*
+        // the bundled one, and the `bundled != credential` guard refuses a second pass.
+        guard KeychainStore.adoptBundledRelayToken(bundled) else { return false }
+        didTryBundledTokenRecovery = true
+        log.info("device token was rejected; falling back to the one this build carries")
+        return true
     }
 
     /// How a rejected WebSocket handshake should read, and whether the backoff ladder
@@ -799,6 +863,16 @@ final class RealtimeClient {
     ) -> TransportFailure {
         let peer = viaRelay ? "转发服务器" : "OpenAI"
         switch statusCode {
+        case 403 where viaRelay:
+            // The relay itself never sends 403 — auth.js answers a bad token with 401,
+            // and nothing else in it produces a 403 — so this is Cloudflare or nginx
+            // having a moment in front of it. Treating it as a rejected credential once
+            // let a transient edge 403 overwrite a hand-typed token with the bundled
+            // one, permanently: the keychain write cannot be undone from the app.
+            return TransportFailure(
+                message: "转发服务器前面的网关拒绝了连接（403），稍后会自动重试",
+                retryable: true
+            )
         case 401, 403:
             // Retrying a rejected credential only burns the ladder. Not permanent: the
             // next dictation and any settings change both start a fresh attempt.
@@ -806,7 +880,8 @@ final class RealtimeClient {
                 message: viaRelay
                     ? "转发服务器拒绝了设备 Token（\(statusCode)），请在设置里重新填写"
                     : "OpenAI 拒绝了 API Key（\(statusCode)），请在设置里重新填写",
-                retryable: false
+                retryable: false,
+                rejectedCredential: true
             )
         case 429:
             // Usually this device's own zombie connections from sleep/wake still

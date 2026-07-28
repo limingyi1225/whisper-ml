@@ -441,6 +441,92 @@ import Testing
 
 // MARK: - Keychain input validation
 
+@Suite struct BundledTokenSeedingTests {
+    /// Issuance numbers, standing in for `date +%s` at packaging time.
+    private let older = 1_700_000_000
+    private let newer = 1_800_000_000
+
+    /// The sequence the packaging flow exists for, and the one the first version broke:
+    /// seed a token, revoke it server-side, hand over a rebuilt copy. Deleting the app
+    /// does not clear a keychain item, so if the new token cannot replace the old one
+    /// the recipient is stuck on 401 with no way out from their side.
+    @Test func aRebuiltCopyReplacesTheTokenItInstalledBefore() {
+        // Nothing stored yet.
+        #expect(KeychainStore.shouldSeed(
+            hasStoredToken: false, bundledIssuance: older, adoptedIssuance: nil
+        ))
+        // Already applied this exact issuance — writing again would be pointless churn.
+        #expect(!KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: older, adoptedIssuance: older
+        ))
+        // A newer issuance replaces what this app installed before. The rotation case.
+        #expect(KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: newer, adoptedIssuance: older
+        ))
+    }
+
+    /// The identity a personalised build registers has to be the identity it uses, or
+    /// revocation quietly stops working: the ledger says "alice = B" while alice's Mac
+    /// authenticates with a token she was given earlier, so `revoke_token.sh alice`
+    /// removes a hash nobody is using and she keeps dictating. Applying this build's own
+    /// token once is what makes the two agree.
+    @Test func aPersonalisedBuildAdoptsItsOwnIdentityOverAnUnknownStoredToken() {
+        #expect(KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: older, adoptedIssuance: nil
+        ))
+    }
+
+    /// …but exactly once. The issuance is recorded even though the user later replaces
+    /// the token by hand, so the same build cannot reinstall itself on every launch and
+    /// overwrite their choice forever.
+    @Test func aTokenTheUserTypedAfterwardsSurvivesRelaunching() {
+        #expect(!KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: older, adoptedIssuance: older
+        ))
+    }
+
+    /// Opening an older copy must not undo a newer one. This is the downgrade a
+    /// value-comparison marker could not see: it proved only "this app wrote the current
+    /// value", never which of two tokens came first, so the old copy read a working token
+    /// as its own stale leftover and wrote a revoked one back over it.
+    @Test func anOlderCopyNeverDowngradesANewerToken() {
+        #expect(!KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: older, adoptedIssuance: newer
+        ))
+        // And the 401 path cannot be used as a way around it — otherwise the downgrade
+        // just happens one rejection later, to a token that is already revoked.
+        #expect(!KeychainStore.mayRecoverWithBundled(
+            bundledIssuance: older, adoptedIssuance: newer
+        ))
+    }
+
+    /// A build with a token but no issuance stamp predates the ordering entirely, so it
+    /// cannot be placed against anything: it may fill an empty slot and nothing more.
+    @Test func anUnstampedBuildOnlyFillsAnEmptySlot() {
+        #expect(KeychainStore.shouldSeed(
+            hasStoredToken: false, bundledIssuance: nil, adoptedIssuance: nil
+        ))
+        #expect(!KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: nil, adoptedIssuance: nil
+        ))
+        #expect(!KeychainStore.shouldSeed(
+            hasStoredToken: true, bundledIssuance: nil, adoptedIssuance: older
+        ))
+    }
+
+    /// Recovery from a rejected token is deliberately more permissive than seeding: a
+    /// 401 is evidence the stored value does not work, which seeding never has.
+    @Test func recoveryReinstallsThisBuildsTokenButNeverAnOlderOne() {
+        // No history: the migration case, where there is nothing to contradict it.
+        #expect(KeychainStore.mayRecoverWithBundled(bundledIssuance: older, adoptedIssuance: nil))
+        // Its own issuance, re-applied — the stored value was hand-typed or rotated out.
+        #expect(KeychainStore.mayRecoverWithBundled(bundledIssuance: older, adoptedIssuance: older))
+        #expect(KeychainStore.mayRecoverWithBundled(bundledIssuance: newer, adoptedIssuance: older))
+        // Unorderable against a real history — refuse rather than guess.
+        #expect(!KeychainStore.mayRecoverWithBundled(bundledIssuance: nil, adoptedIssuance: older))
+    }
+}
+
 @Suite struct KeychainInputTests {
     @Test func whitespaceOnlyKeysAreRejectedWithoutTouchingTheKeychain() {
         // A rejected save must return false — SettingsView reports true as
@@ -565,10 +651,22 @@ import Testing
         let unauthorized = RealtimeClient.handshakeRejection(statusCode: 401, viaRelay: true)
         #expect(unauthorized.message.contains("设备 Token"))
         #expect(unauthorized.retryable == false)
+        // The one failure a personalised build may repair by installing its bundled
+        // token: our relay's auth answers a bad token with 401 and nothing else.
+        #expect(unauthorized.rejectedCredential)
 
         let badKey = RealtimeClient.handshakeRejection(statusCode: 403, viaRelay: false)
         #expect(badKey.message.contains("API Key"))
         #expect(badKey.retryable == false)
+
+        // A relay-path 403 is Cloudflare or nginx, never the relay itself — it does
+        // not send 403. Marking it a rejected credential once let one transient edge
+        // hiccup *permanently* overwrite a hand-typed token with the bundled one.
+        let edge = RealtimeClient.handshakeRejection(statusCode: 403, viaRelay: true)
+        #expect(edge.rejectedCredential == false)
+        #expect(edge.retryable)
+        #expect(edge.message.contains("403"))
+        #expect(!edge.message.contains("重新填写"))
 
         // Usually this device's own sleep/wake zombies still holding their slots. The
         // relay's heartbeat reaps them within a sweep or two, so this one must keep

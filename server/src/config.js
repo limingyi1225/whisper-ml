@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { readFileSync as nodeReadFileSync } from "node:fs";
+
 /// The Mac app buffers at most 610 s of 24 kHz PCM16 mono (48 000 B/s) while
 /// disconnected mid-utterance and flushes it in one burst on reconnect. Every relay
 /// ceiling that a single utterance can hit is derived from that number rather than
@@ -90,6 +93,69 @@ function endpointURL(env, name, fallback, allowedProtocols) {
   return raw;
 }
 
+/// Accepts both shapes: the env var's comma-separated list, and the file's one-per-line
+/// form with `#` comments. Comments are stripped per line *before* splitting — stripping
+/// after would turn "# issued to alice" into four tokens and only discard the "#".
+function parseTokenHashes(raw, source) {
+  const hashes = new Set(
+    raw
+      .toLowerCase()
+      .split(/\r?\n/)
+      .map((line) => line.split("#")[0])
+      .flatMap((line) => line.split(/[\s,]+/))
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  for (const hash of hashes) {
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
+      throw new Error(`${source} must contain SHA-256 hex hashes`);
+    }
+  }
+  if (hashes.size === 0) throw new Error(`${source} is empty`);
+  return hashes;
+}
+
+/// The set of device tokens allowed in, and where it came from.
+///
+/// Two sources on purpose. `RELAY_DEVICE_TOKEN_FILE` is the reloadable one: systemd
+/// reads `EnvironmentFile` once as root and the service then runs as a DynamicUser that
+/// cannot read that 0600 file, so a list that has to change without a restart cannot
+/// live there. A separate 0644 file can be re-read on SIGHUP — and these are SHA-256
+/// hashes, not tokens, so nothing readable is replayable. `RELAY_DEVICE_TOKEN_HASHES`
+/// stays as the static fallback for setups (and tests) with no file.
+export function loadDeviceTokenHashes(env = process.env, readFile = null) {
+  const path = env.RELAY_DEVICE_TOKEN_FILE?.trim();
+  if (path) {
+    const read = readFile || ((p) => nodeReadFileSync(p, "utf8"));
+    return parseTokenHashes(read(path), path);
+  }
+  return parseTokenHashes(
+    required(env, "RELAY_DEVICE_TOKEN_HASHES"),
+    "RELAY_DEVICE_TOKEN_HASHES",
+  );
+}
+
+/// A short fingerprint of exactly which allowlist is loaded, for `/healthz`.
+///
+/// The issue/revoke scripts used to confirm a reload by watching the token *count*
+/// change, which is an inference, not a proof: a count can collide (append one hash to
+/// a file whose earlier corruption cost it one) and then a reload the server rejected —
+/// old set retained — is indistinguishable from one it applied. The scripts compute
+/// this same digest from the file they just wrote and compare, so "the server is
+/// serving this exact list" becomes something they can actually observe.
+///
+/// Sorted, so it is order-independent; deduplicated by the Set already; joined with
+/// newlines so `sha256sum` over the canonical file content reproduces it. Truncated
+/// because it only has to be unforgeable-by-accident, and a full digest in a health
+/// response invites reading more into it than it means. Not a secret either way — it is
+/// derived from hashes that are themselves not replayable.
+export function allowlistDigest(hashes) {
+  return createHash("sha256")
+    .update([...hashes].sort().join("\n"))
+    .digest("hex")
+    .slice(0, 16);
+}
+
 function commaSeparatedSet(raw) {
   return new Set(
     raw
@@ -100,16 +166,11 @@ function commaSeparatedSet(raw) {
 }
 
 export function loadConfig(env = process.env) {
-  const deviceTokenHashes = commaSeparatedSet(
-    required(env, "RELAY_DEVICE_TOKEN_HASHES").toLowerCase(),
-  );
-  for (const hash of deviceTokenHashes) {
-    if (!/^[a-f0-9]{64}$/.test(hash)) {
-      throw new Error("RELAY_DEVICE_TOKEN_HASHES must contain SHA-256 hex hashes");
-    }
-  }
+  const deviceTokenHashes = loadDeviceTokenHashes(env);
 
   return Object.freeze({
+    /// Where to re-read the allowlist from on SIGHUP; empty means it is static.
+    deviceTokenFile: env.RELAY_DEVICE_TOKEN_FILE?.trim() || "",
     host: env.HOST?.trim() || DEFAULTS.host,
     port: positiveInteger(env, "PORT", DEFAULTS.port),
     basePath: normalizeBasePath(env.RELAY_BASE_PATH) || DEFAULTS.basePath,

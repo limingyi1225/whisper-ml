@@ -54,7 +54,14 @@ export function validatePolishBody(body, config) {
 export async function handlePolish(
   request,
   response,
-  { config, deviceID, rateLimiter, fetchImpl = fetch },
+  {
+    config,
+    deviceID,
+    rateLimiter,
+    fetchImpl = fetch,
+    stillAuthorized = () => true,
+    registerAbort = null,
+  },
 ) {
   if (!rateLimiter.take(deviceID)) {
     writeJSON(response, 429, errorBody("请求太频繁，请稍后再试", "relay_rate_limit"));
@@ -87,6 +94,20 @@ export async function handlePolish(
     return;
   }
 
+  // The Bearer check ran when the headers arrived, but everything up to here waits on
+  // the client — a deliberately slow body can hold this handler open across a
+  // revocation. Re-checked at the last moment before the server's key is spent, so
+  // "revoked" means revoked for in-flight requests too, not just future ones.
+  if (!stillAuthorized()) {
+    writeJSON(
+      response,
+      401,
+      errorBody("转发服务器设备 Token 无效或没有权限", "relay_unauthorized"),
+      { "www-authenticate": "Bearer" },
+    );
+    return;
+  }
+
   // Re-serialized rather than forwarded verbatim, to force an output ceiling the
   // client cannot raise. Without it the only limit on a generation is the response-size
   // check further down — which runs after the tokens have been generated and billed, so
@@ -108,6 +129,13 @@ export async function handlePolish(
   };
   response.once("close", abandon);
 
+  // Revocation has to reach requests that are already talking to OpenAI, not only the
+  // ones that have yet to start. The authorisation re-check above closes the window up
+  // to the fetch; past it, the only signals were client-disconnect and the 11 s timeout,
+  // so a device revoked mid-request still got its answer — billed to the server's key.
+  const unregister = registerAbort?.(() => abandoned.abort()) ?? null;
+  if (unregister) response.once("close", unregister);
+
   let upstream;
   try {
     upstream = await fetchImpl(config.openAIPolishURL, {
@@ -126,6 +154,18 @@ export async function handlePolish(
   } catch {
     // A client that hung up has nowhere to receive this.
     if (response.writableEnded || response.destroyed) return;
+    // Distinguish the abort we caused ourselves. Telling a revoked device that the relay
+    // could not reach OpenAI would send it into its retry ladder over a request that is
+    // never going to be served again.
+    if (!stillAuthorized()) {
+      writeJSON(
+        response,
+        401,
+        errorBody("转发服务器设备 Token 无效或没有权限", "relay_unauthorized"),
+        { "www-authenticate": "Bearer" },
+      );
+      return;
+    }
     writeJSON(
       response,
       502,

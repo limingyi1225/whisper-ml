@@ -9,6 +9,7 @@ HOST="${RELAY_SSH_HOST:-nyuclass}"
 REMOTE_DIR=/opt/whisper-relay
 ENV_FILE=/etc/whisper-relay.env
 BACKUPS=/opt/whisper-relay-backups
+TOKEN_FILE=/opt/whisper-relay/device-tokens
 BASE_PATH="${RELAY_BASE_PATH:-/whisper-relay}"
 PUBLIC_HEALTH="${RELAY_PUBLIC_HEALTH:-https://limingyi.com/whisper-relay/healthz}"
 
@@ -22,13 +23,30 @@ STAMP=""
 # `set -e` and left new source paired with a half-installed node_modules — a tree that
 # keeps serving from memory and then dies at the next restart.
 REMOTE_DIRTY=0
+# Set when *this* run is the one that creates the allowlist file. Rolling back has to
+# remove it again, because the pre-deploy state had no file and the restored old code
+# does not read one — it reads RELAY_DEVICE_TOKEN_HASHES, which this run deletes from
+# the env file. Leaving the file behind makes the restored pair inconsistent: the env
+# snapshot is a frozen copy of the hashes as they were at migration time, so from then
+# on it would authorise anyone revoked since and reject everyone issued since.
+CREATED_TOKEN_FILE=0
 
 restore_backup() {
+  # The unit file is part of the version too. This deploy adds ExecReload=kill -HUP to
+  # it; roll back the source without rolling that back and the restored server has no
+  # SIGHUP handler — Node's default for SIGHUP is to die — so the next issue/revoke's
+  # `systemctl reload` would kill the relay and drop everyone mid-sentence.
+  # The allowlist file is restored only in the one case where this run created it —
+  # by deleting it, back to not existing. Otherwise it is left strictly alone: it is
+  # live data, and "rolling back" an allowlist means resurrecting revoked tokens.
   ssh "$HOST" "set -e
     rm -rf $REMOTE_DIR/src
     cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src
     cp -a $BACKUPS/env-$STAMP $ENV_FILE
+    cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service
     cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
+    if [ '$CREATED_TOKEN_FILE' = 1 ]; then rm -f $TOKEN_FILE; fi
+    systemctl daemon-reload
     cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
     systemctl restart whisper-relay"
 }
@@ -45,7 +63,7 @@ on_failure() {
     echo "!! rolled back to $STAMP" >&2
   else
     echo "!! ROLLBACK ALSO FAILED — the relay is down; restore by hand:" >&2
-    echo "   ssh $HOST 'cd $REMOTE_DIR && cp -a $BACKUPS/src-$STAMP src && npm ci --omit=dev && systemctl restart whisper-relay'" >&2
+    echo "   ssh $HOST 'cd $REMOTE_DIR && cp -a $BACKUPS/src-$STAMP src && cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service && systemctl daemon-reload && npm ci --omit=dev && systemctl restart whisper-relay'" >&2
   fi
   exit 1
 }
@@ -106,6 +124,11 @@ STAMP=$(ssh "$HOST" "set -e
   mkdir -p $BACKUPS/manifests-\$STAMP
   cp -a $REMOTE_DIR/src $BACKUPS/src-\$STAMP
   cp -a $ENV_FILE $BACKUPS/env-\$STAMP
+  cp -a /etc/systemd/system/whisper-relay.service $BACKUPS/unit-\$STAMP
+  # Disaster copy only — deliberately NOT in restore_backup: the allowlist is live
+  # data, not part of the code version, and 'rolling it back' would resurrect tokens
+  # revoked since the stamp. It exists so a lost file is recoverable by hand.
+  if [ -f $TOKEN_FILE ]; then cp -a $TOKEN_FILE $BACKUPS/device-tokens-\$STAMP; fi
   cp -a $REMOTE_DIR/package.json $REMOTE_DIR/package-lock.json \
      $BACKUPS/manifests-\$STAMP/
   printf '%s' \"\$STAMP\"")
@@ -133,6 +156,55 @@ ssh "$HOST" "set -e
   printf 'CLIENT_HEARTBEAT_INTERVAL_MS=25000\n' >> $ENV_FILE
   printf 'ALLOWED_POLISH_MODELS=%s\n' '$POLISH_MODEL' >> $ENV_FILE
   printf 'ALLOWED_TRANSCRIPTION_MODELS=%s\n' '$TRANSCRIPTION_MODELS' >> $ENV_FILE"
+
+echo "==> provisioning the reloadable allowlist"
+# Asked before the file is touched, so a rollback knows whether removing it restores the
+# previous state or destroys the live allowlist. `if ssh`, not `ssh && …`: a command in
+# an `if` condition is exempt from `set -e`, so a plain "the file is not there" answer
+# cannot trip the ERR trap.
+if ssh "$HOST" "[ -s $TOKEN_FILE ]"; then
+  echo "    allowlist file already present; leaving it as the source of truth"
+else
+  CREATED_TOKEN_FILE=1
+  echo "    no allowlist file yet — this run creates it (and a rollback removes it)"
+fi
+# The allowlist has to live somewhere the *service* can read. systemd parses
+# EnvironmentFile as root before dropping to the DynamicUser, so the 0600
+# /etc/whisper-relay.env is unreadable at runtime and cannot be re-read on SIGHUP —
+# which is what issuing or revoking a token needs, so that neither has to restart the
+# relay and disconnect everyone mid-sentence. These are SHA-256 hashes, not tokens:
+# nothing in this file is replayable, so 0644 costs nothing.
+ssh "$HOST" "set -e
+  if [ ! -s $TOKEN_FILE ]; then
+    # Captured and checked before anything is written: '... | grep . > file' truncates
+    # the file the moment the pipeline starts, so an empty migration source would eat
+    # the very file whose absence it was reacting to, and then fail the deploy anyway.
+    if MIGRATED=\$(sed -n 's/^RELAY_DEVICE_TOKEN_HASHES=//p' $ENV_FILE | tr ',' '\n' | grep .); then
+      printf '%s\n' \"\$MIGRATED\" > $TOKEN_FILE
+      echo '    migrated existing hashes out of the env file'
+    else
+      echo '!! $TOKEN_FILE is missing or empty and the env file has no hashes to' >&2
+      echo '   migrate. Refusing to invent an allowlist: restore the file from' >&2
+      echo '   $BACKUPS/device-tokens-* (cross-check the ledger for hashes revoked' >&2
+      echo '   since), or re-issue tokens, then re-run.' >&2
+      exit 1
+    fi
+  fi
+  chmod 0644 $TOKEN_FILE
+  # The env snapshot dies the moment the file becomes the source of truth. Left in
+  # place it only ever gets staler — issue/revoke touch the file, never the env — and
+  # a later deploy that found the file lost would have 'migrated' that fossil back in,
+  # resurrecting every token revoked since. Better no fallback than a wrong one.
+  sed -i '/^RELAY_DEVICE_TOKEN_HASHES=/d' $ENV_FILE
+  grep -q '^RELAY_DEVICE_TOKEN_FILE=' $ENV_FILE \
+    || printf 'RELAY_DEVICE_TOKEN_FILE=%s\n' '$TOKEN_FILE' >> $ENV_FILE
+  UNIT=/etc/systemd/system/whisper-relay.service
+  if ! grep -q '^ExecReload=' \$UNIT; then
+    sed -i '/^ExecStart=/a ExecReload=/bin/kill -HUP \$MAINPID' \$UNIT
+    systemctl daemon-reload
+    echo '    added ExecReload to the unit'
+  fi
+  printf '    %s hashes in the allowlist\n' \"\$(grep -c . $TOKEN_FILE)\""
 
 echo "==> restarting whisper-relay"
 ssh "$HOST" "systemctl restart whisper-relay && sleep 2 && systemctl is-active whisper-relay"
@@ -221,9 +293,11 @@ ssh "$HOST" "cd $BACKUPS 2>/dev/null || exit 0
   ls -1d src-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d manifests-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1 env-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+  ls -1 unit-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+  ls -1 device-tokens-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   echo \"    \$(ls -1d src-* 2>/dev/null | wc -l) backups kept\"" || \
   echo "!! backup prune failed (harmless, deploy stands)" >&2
 
 trap - ERR
 echo "==> done. rollback if needed:"
-echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'"
+echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'"

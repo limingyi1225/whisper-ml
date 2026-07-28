@@ -204,6 +204,17 @@ final class AppSettings {
         return terms
     }
 
+    /// Whether the user has ever picked a connection mode, as opposed to living with
+    /// the default. The absence of the key is the only honest test for it.
+    ///
+    /// A personalised build wants to come up in 代理模式 on a fresh Mac, but "fresh"
+    /// cannot be inferred from a credential being absent: someone using 直连 with their
+    /// own API key has no relay token either, and flipping *them* to relay would reroute
+    /// their audio and their billing without being asked.
+    static var connectionModeWasChosen: Bool {
+        UserDefaults.standard.string(forKey: Key.connectionMode) != nil
+    }
+
     private enum Key {
         static let connectionMode = "connectionMode"
         static let triggerKey = "triggerKey"
