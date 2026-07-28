@@ -17,7 +17,7 @@
 
 菜单栏图标 → 设置（⌘,）
 
-- **通用**：连接方式（直连 / 大陆模式）、连接状态、触发键、触发灵敏度、转写模型、
+- **通用**：连接方式（直连 / 代理模式）、连接状态、触发键、触发灵敏度、转写模型、
   出字前先听多久、繁体转简体、松手后整理、常用词汇
 - **账号与权限**：当前连接方式对应的凭据（API Key 或设备 Token）、辅助功能 / 麦克风
   授权状态、热键诊断
@@ -63,13 +63,17 @@ Whisper/
 server/                          可选的自托管 Relay（WebSocket 转写 + HTTPS 整理）
 ```
 
-## 无 VPN 时使用大陆模式
+## 代理模式（本机不放 OpenAI Key）
 
 「通用」里可以手动选择两种连接方式：
 
 - **直连**：保持原来的行为，Mac 用钥匙串中的 OpenAI API Key 直接请求 OpenAI。
-- **大陆模式**：走已经配置好的 `https://limingyi.com/whisper-relay`；Mac 只持有
+- **代理模式**：走已经配置好的 `https://limingyi.com/whisper-relay`；Mac 只持有
   Keychain 中可撤销的设备 Token，OpenAI API Key 只存在服务器环境变量中。
+
+  名字里没有「大陆」是有意的：它解决的是**本机不放 OpenAI Key**，无 VPN 可用只是
+  其中一个后果。多给一个人用的时候，给对方一个可单独吊销的设备 Token，比把自己的
+  API Key 复制到别人机器上安全得多——不管对方在哪个国家。
 
 Relay 同时覆盖 Realtime WebSocket 转写和松手后的 HTTPS 整理。不能只代理整理请求，否则
 Realtime 仍然需要从 Mac 直连 OpenAI。连接方式发生变化时，如果当前有一句正在转写，应用会等
@@ -89,7 +93,7 @@ npm start
 ```
 
 `npm run generate-token` 打印一对值：**设备 Token** 粘贴到 App 的「账号与权限 → 设备
-Token」（切到大陆模式后才会出现），服务器只保存它的 **SHA-256 hash**。Token 只在生成时
+Token」（切到代理模式后才会出现），服务器只保存它的 **SHA-256 hash**。Token 只在生成时
 显示一次；要吊销就把对应 hash 从 `RELAY_DEVICE_TOKEN_HASHES` 里删掉再重启。凭据由 App 自己
 写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL 里没有本 App，读取时会弹
 授权框甚至直接失败。

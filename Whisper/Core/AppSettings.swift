@@ -15,7 +15,10 @@ enum ConnectionMode: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .direct: return "直连"
-        case .relay: return "大陆模式"
+        // Not "大陆模式": the point is that the device holds no OpenAI key, which is
+        // useful anywhere. Naming it after one reason to want it made people in the US
+        // assume it did not apply to them.
+        case .relay: return "代理模式"
         }
     }
 
@@ -24,7 +27,7 @@ enum ConnectionMode: String, CaseIterable, Identifiable {
         case .direct:
             return "Mac 使用钥匙串里的 OpenAI API Key 直接连接。"
         case .relay:
-            return "Mac 只连接你的服务器；OpenAI API Key 留在服务器上。"
+            return "Mac 只连接你的服务器，本机不保存 OpenAI API Key；无 VPN 时也能用。"
         }
     }
 }
