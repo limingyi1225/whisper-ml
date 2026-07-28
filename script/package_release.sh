@@ -64,11 +64,25 @@ xcodebuild -exportArchive -archivePath "$ARCHIVE" \
 
 # A Developer ID signature that is not also hardened-runtime will be rejected by the
 # notary service, so confirm both here rather than reading it in a rejection log.
-codesign -dvv "$APP" 2>&1 | grep -q "Developer ID Application" \
-  || { echo "!! not signed with Developer ID" >&2; exit 1; }
-codesign -dvv "$APP" 2>&1 | grep -q "flags=.*runtime" \
-  || { echo "!! hardened runtime is off; the notary service will reject it" >&2; exit 1; }
-echo "    $(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+#
+# Captured into a variable, not piped into `grep -q`: grep exits on its first match and
+# SIGPIPEs codesign, and under `pipefail` the pipeline then reports codesign's 141 — so
+# a correctly signed app fails the check that was supposed to wave it through.
+SIGNATURE=$(codesign -dvv "$APP" 2>&1)
+case "$SIGNATURE" in
+  *"Developer ID Application"*) ;;
+  *) echo "!! not signed with Developer ID:" >&2
+     printf '%s\n' "$SIGNATURE" | sed -n 's/^Authority=/    /p' >&2
+     exit 1 ;;
+esac
+case "$SIGNATURE" in
+  *runtime*) ;;
+  *) echo "!! hardened runtime is off; the notary service will reject it" >&2; exit 1 ;;
+esac
+# Same trap as above, one stage further along: `| head -1` would SIGPIPE sed. Take the
+# first line with parameter expansion instead of with an early-exiting reader.
+AUTHORITIES=$(printf '%s\n' "$SIGNATURE" | sed -n 's/^Authority=//p')
+echo "    ${AUTHORITIES%%$'\n'*}"
 
 echo "==> notarizing (a few minutes)"
 mkdir -p "$DIST"
