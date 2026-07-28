@@ -4,11 +4,16 @@ import Foundation
 ///
 /// Keeping the credential and both endpoints together prevents a settings change between
 /// retries from sending one utterance partly direct and partly through the relay.
+///
+/// The three static constants below are `nonisolated` because the target builds with
+/// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, which would otherwise pin them to the
+/// main actor and put them out of reach of the `nonisolated` helpers that read them.
+/// They are immutable values of `Sendable` types, so there is nothing to isolate.
 struct ServiceRoute: CustomStringConvertible {
     /// This is deployment configuration, not a user preference. Keeping it out of
     /// Settings prevents accidental endpoint changes and leaves one user-facing choice:
     /// connect to OpenAI directly or use the configured relay.
-    static let relayBaseURL = URL(string: "https://limingyi.com/whisper-relay")!
+    nonisolated static let relayBaseURL = URL(string: "https://limingyi.com/whisper-relay")!
 
     /// Development-only escape hatch, deliberately not in Settings — pointing the app
     /// at a relay is not something a user should be able to do by accident:
@@ -18,7 +23,7 @@ struct ServiceRoute: CustomStringConvertible {
     ///
     /// An unparseable or unsafe value falls back to the production URL rather than
     /// failing the connection, so a stale override cannot brick the app.
-    static let relayBaseURLOverrideKey = "relayBaseURLOverride"
+    nonisolated static let relayBaseURLOverrideKey = "relayBaseURLOverride"
 
     /// `nonisolated` like the two helpers below: this only reads `UserDefaults`, which
     /// is thread-safe, so there is no reason to pin URL construction to the main actor.
@@ -44,7 +49,7 @@ struct ServiceRoute: CustomStringConvertible {
     /// One list, used by both the parser (which allows plain HTTP only here) and the
     /// gate below. `URLComponents` keeps IPv6 brackets in `host` on current Foundation,
     /// so both spellings have to be present.
-    private static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
+    nonisolated private static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
 
     nonisolated static func isLoopback(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
