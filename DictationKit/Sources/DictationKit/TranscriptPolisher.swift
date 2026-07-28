@@ -9,14 +9,15 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "polish")
 /// Every failure path returns nil so the caller can fall back to the raw transcript. A
 /// slow or unreachable cleanup service must never cost the user their words.
 @MainActor
-final class TranscriptPolisher {
+public final class TranscriptPolisher {
+    public init() {}
     /// What the caller gets back. Cleanup failing is not an error the user needs
     /// handled — the raw transcript is delivered either way — but a failure that
     /// will keep failing (wrong key, no quota, blocked region) is worth saying out
     /// loud once. Staying silent about those means every sentence quietly loses its
     /// cleanup with nothing on screen to explain it; the only way to find out is to
     /// read Console, which is how this case was actually diagnosed.
-    enum Outcome {
+    public enum Outcome {
         case cleaned(String)
         /// The raw transcript stands. `notice` is non-nil only for reasons that will
         /// recur; transient trouble (timeouts, 5xx, rate limits) stays quiet.
@@ -60,7 +61,7 @@ final class TranscriptPolisher {
     /// The vocabulary block is strictly additive, and an empty list still produces
     /// exactly the base prompt below — though in practice the list is never empty,
     /// since `AppSettings` always contributes its built-in names.
-    static func instructions(vocabulary: [String]) -> String {
+    public static func instructions(vocabulary: [String]) -> String {
         let base = """
         你是语音转写结果的「文字整理器」。输入是语音识别的原始文本，你只做整理。
 
@@ -122,13 +123,13 @@ final class TranscriptPolisher {
     /// Cleans the transcript up, or explains why it could not. Never throws, and
     /// never costs the caller its text: every failure path leaves the raw transcript
     /// standing.
-    func polish(_ raw: String, route: ServiceRoute) async -> Outcome {
+    public func polish(_ raw: String, route: ServiceRoute) async -> Outcome {
         let started = Date()
         let deadline = started.addingTimeInterval(12)
         guard !Task.isCancelled else { return .unchanged(notice: nil) }
         // Snapshotted once so the retry cannot run against a list the user edited
         // in between — the plausibility check below is sized against this same one.
-        let vocabulary = AppSettings.shared.vocabularyTerms
+        let vocabulary = DictationEnvironment.settings.vocabularyTerms
 
         // The gpt-5 family will otherwise spend reasoning tokens on what is a purely
         // mechanical edit, which multiplies the wait. The second attempt drops the
@@ -327,7 +328,7 @@ final class TranscriptPolisher {
     /// the per-term accounting, is what binds once several substitutions land in one
     /// short utterance — counting repeat occurrences of a term instead of the term
     /// once changes no outcome, because the cap swallows the difference.
-    func isPlausible(_ cleaned: String, from raw: String, vocabulary: [String] = []) -> Bool {
+    public func isPlausible(_ cleaned: String, from raw: String, vocabulary: [String] = []) -> Bool {
         guard !cleaned.isEmpty else { return false }
         let ratio = Double(cleaned.count) / Double(max(raw.count, 1))
         let shortEnoughToJudgeByEye = raw.count <= 30

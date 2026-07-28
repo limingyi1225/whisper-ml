@@ -1,3 +1,4 @@
+import DictationKit
 import AVFoundation
 import AppKit
 import SwiftUI
@@ -27,6 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previousApplication: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // DictationKit reads settings through a protocol rather than reaching
+        // back into the app, so it has to be handed the real object. First
+        // thing, and outside the XCTest guard below: the tests exercise
+        // ServiceRoute, which reads it, and its fallback would answer with
+        // different values than AppSettings does.
+        DictationEnvironment.settings = AppSettings.shared
+
         // Unit tests use this app as their host process. Starting the real
         // pipeline there would install an event tap, spin up audio, and pop
         // permission prompts in the middle of a test run.

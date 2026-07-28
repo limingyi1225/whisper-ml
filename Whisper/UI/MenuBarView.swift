@@ -1,3 +1,4 @@
+import DictationKit
 import SwiftUI
 
 struct MenuBarLabel: View {

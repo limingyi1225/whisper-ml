@@ -79,24 +79,61 @@ npm test
 # request. Extracting them here and writing them into the env file below makes the app
 # the single source of truth, so that drift cannot survive a deploy.
 echo "==> reading the model names out of the app sources"
-POLISH_MODEL=$(sed -n 's/^ *private static let model = "\(.*\)"$/\1/p' \
-  "$ROOT_DIR/Whisper/Net/TranscriptPolisher.swift")
+# Located by what they declare, not by where they live. Both of these moved into
+# DictationKit/ when the voice stack was extracted into a local package, which broke the
+# hardcoded paths — safely (the guard below fails the deploy rather than shipping an
+# empty allowlist), but it broke them. A search cannot be invalidated by the next move.
+#
+# `head -1` is deliberately not used to pick a winner: grep would take SIGPIPE and, under
+# `pipefail`, fail the pipeline. Ambiguity is an error here anyway — two files declaring
+# the same thing means this script can no longer know which one the app compiles.
+declaring() {
+  local matches
+  matches=$(grep -rlE "$1" "$ROOT_DIR/Whisper" "$ROOT_DIR/DictationKit" \
+    --include='*.swift' 2>/dev/null || true)
+  if [ -z "$matches" ]; then
+    echo "!! nothing declares /$1/ any more — the extraction patterns in this script" >&2
+    echo "   have drifted from the code. Fix them rather than deploying: an empty" >&2
+    echo "   allowlist would reject every request." >&2
+    exit 1
+  fi
+  if [ "$(printf '%s\n' "$matches" | wc -l | tr -d ' ')" != 1 ]; then
+    echo "!! more than one file declares /$1/, so which one the app compiles is a" >&2
+    echo "   guess. Refusing to guess:" >&2
+    printf '%s\n' "$matches" | sed 's/^/     /' >&2
+    exit 1
+  fi
+  printf '%s' "$matches"
+}
+
+# `(public )?` on both anchors: extraction into a package made these declarations public,
+# and an anchor that only matched the internal form silently found nothing.
+POLISH_SOURCE=$(declaring '^ *(public |private )?static let model = "')
+# `sed -E`, not basic regex: `\(a\|b\)` alternation is a GNU extension that BSD sed —
+# which is the sed on this Mac — treats as literal characters, so the pattern matched
+# nothing and silently returned empty.
+POLISH_MODEL=$(sed -En 's/^ *(public |private )?static let model = "([^"]*)"$/\2/p' \
+  "$POLISH_SOURCE")
 # Scoped to the enum body rather than grepping the whole file for `gpt-…`, so a later
 # unrelated constant cannot quietly widen the server's allowlist.
+MODELS_SOURCE=$(declaring '^(public )?enum TranscriptionModel')
 TRANSCRIPTION_MODELS=$(awk '
-  /^enum TranscriptionModel/ { inside = 1; next }
-  inside && /^}/            { exit }
+  /^(public )?enum TranscriptionModel/ { inside = 1; next }
+  inside && /^}/                       { exit }
   inside && match($0, /case [a-zA-Z]+ = "[^"]+"/) {
     line = substr($0, RSTART, RLENGTH)
     split(line, parts, "\"")
     print parts[2]
-  }' "$ROOT_DIR/Whisper/Core/AppSettings.swift" | paste -sd, -)
+  }' "$MODELS_SOURCE" | paste -sd, -)
 if [ -z "$POLISH_MODEL" ] || [ -z "$TRANSCRIPTION_MODELS" ]; then
   echo "!! could not read the model names from the Swift sources — the extraction" >&2
   echo "   patterns in this script have drifted from the code. Fix them rather than" >&2
   echo "   deploying: an empty allowlist would reject every request." >&2
+  echo "   polish source:        ${POLISH_SOURCE:-none}" >&2
+  echo "   transcription source: ${MODELS_SOURCE:-none}" >&2
   exit 1
 fi
+echo "    from ${POLISH_SOURCE#"$ROOT_DIR/"} and ${MODELS_SOURCE#"$ROOT_DIR/"}"
 echo "    polish:        $POLISH_MODEL"
 echo "    transcription: $TRANSCRIPTION_MODELS"
 

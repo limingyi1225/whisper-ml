@@ -1,3 +1,4 @@
+import DictationKit
 import AVFoundation
 import AppKit
 import OSLog

@@ -45,23 +45,49 @@
 Whisper/
 ├── Core/
 │   ├── AppSettings.swift          UserDefaults 支撑的设置
-│   ├── DictationController.swift  串起热键→录音→转写→整理→上屏的状态机
-│   └── KeychainStore.swift        API Key 存钥匙串
+│   └── DictationController.swift  串起热键→录音→转写→整理→上屏的状态机
 ├── Input/
 │   ├── HotKeyMonitor.swift        CGEventTap 长按检测（靠设备位区分左右修饰键）
 │   ├── TextInjector.swift         合成键盘事件把字打进别的 App
 │   └── Permissions.swift
-├── Audio/
-│   └── AudioCapture.swift         采集 + 重采样到 24kHz PCM16 + 预卷缓冲
-├── Net/
-│   ├── RealtimeClient.swift       常驻预热的转写 WebSocket
-│   └── TranscriptPolisher.swift   松手后的文字整理
 └── UI/
     ├── RecordingHUD.swift         底部那根低调的小条
     ├── MenuBarView.swift
     └── SettingsView.swift
+DictationKit/                    本地 SwiftPM 包，见下
 server/                          可选的自托管 Relay（WebSocket 转写 + HTTPS 整理）
 ```
+
+### DictationKit
+
+录音、转写、整理、凭据这四块搬进了本地 SwiftPM 包，因为 [Wink](../Wink) 也要用。
+复制一份会漂移，所以做成了一个包、两个 App 依赖它：
+
+```
+DictationKit/Sources/DictationKit/
+├── AudioCapture.swift         采集 + 重采样到 24kHz PCM16 + 预卷缓冲
+├── RealtimeClient.swift       常驻预热的转写 WebSocket
+├── TranscriptPolisher.swift   松手后的文字整理
+├── ServiceRoute.swift         直连 / 代理的路由快照
+├── KeychainStore.swift        API Key 与设备 Token 存钥匙串
+└── DictationEnvironment.swift 包向宿主索取设置的协议
+```
+
+**包的编译设置必须和 App target 一致，那不是偏好。** 这些文件是在
+`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`、语言模式 5 和一组 upcoming feature
+下写的，少一个意思就变了——`NonisolatedNonsendingByDefault` 直接决定 nonisolated
+async 函数跑在哪个 executor 上。`DictationKit/Package.swift` 里记了怎么从真实的
+编译命令重新导出这份清单，App target 的设置改了就照着改。
+
+**包不能反过来引用 App 的 `AppSettings`**，所以依赖方向反过来了：包用
+`DictationSettingsProviding` 声明自己要什么，宿主在启动时注入。Whisper 注入
+`AppSettings.shared`（在 `applicationDidFinishLaunching` 的第一行，且在 XCTest
+的提前返回之前——测试会走到读它的 `ServiceRoute`）。忘了注入不会崩，会静默回落到
+一份读同样 UserDefaults 键的兜底实现，所以别忘。
+
+三个枚举（`ConnectionMode`、`TranscriptionModel`、`TranscriptionDelay`）跟着搬进了
+包，因为对它们做事的是 `ServiceRoute` 和 `RealtimeClient`。留在 App 里的是
+`displayName` / `summary` / `Identifiable`——包不该持有会本地化的界面文案。
 
 ## 代理模式（本机不放 OpenAI Key）
 

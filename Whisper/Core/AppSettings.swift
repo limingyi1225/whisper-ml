@@ -1,16 +1,14 @@
+import DictationKit
 import Foundation
 
-/// Where OpenAI traffic leaves the app.
-///
-/// Relay mode is deliberately explicit rather than an automatic fallback. Switching a
-/// live Realtime session after audio and partial text have already crossed one route can
-/// replay or duplicate an utterance; the controller therefore reconnects only at an idle
-/// boundary when this setting changes.
-enum ConnectionMode: String, CaseIterable, Identifiable {
-    case direct
-    case relay
+// ConnectionMode, TranscriptionModel and TranscriptionDelay now live in
+// DictationKit, because ServiceRoute and RealtimeClient are the code that acts
+// on them. What stays here is everything the package has no business holding:
+// the display copy, which is localised, and Identifiable, which exists for
+// SwiftUI.
 
-    var id: String { rawValue }
+extension ConnectionMode: @retroactive Identifiable {
+    public var id: String { rawValue }
 
     var displayName: String {
         switch self {
@@ -81,25 +79,10 @@ enum TriggerKey: String, CaseIterable, Identifiable {
     }
 }
 
-enum TranscriptionModel: String, CaseIterable, Identifiable {
-    case realtimeWhisper = "gpt-realtime-whisper"
-    case transcribe = "gpt-4o-transcribe"
-    case miniTranscribe = "gpt-4o-mini-transcribe"
+extension TranscriptionModel: @retroactive Identifiable {
+    public var id: String { rawValue }
 
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .realtimeWhisper: return "gpt-realtime-whisper"
-        case .transcribe: return "gpt-4o-transcribe"
-        case .miniTranscribe: return "gpt-4o-mini-transcribe"
-        }
-    }
-
-    /// Measured on identical audio: the realtime model emitted 36 deltas before
-    /// `input_audio_buffer.commit`; both gpt-4o-transcribe models emitted zero and
-    /// delivered everything afterwards. Live typing is therefore impossible on them.
-    var supportsLiveTyping: Bool { self == .realtimeWhisper }
+    var displayName: String { rawValue }
 
     var summary: String {
         switch self {
@@ -110,11 +93,8 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     }
 }
 
-/// How much audio the model hears before it commits to words.
-enum TranscriptionDelay: String, CaseIterable, Identifiable {
-    case minimal, low, medium, high, xhigh
-
-    var id: String { rawValue }
+extension TranscriptionDelay: @retroactive Identifiable {
+    public var id: String { rawValue }
 
     /// Measured time from audio start to the first delta on this machine's connection.
     var displayName: String {
@@ -128,8 +108,9 @@ enum TranscriptionDelay: String, CaseIterable, Identifiable {
     }
 }
 
+
 @Observable
-final class AppSettings {
+final class AppSettings: DictationSettingsProviding {
     static let shared = AppSettings()
 
     private let store = UserDefaults.standard

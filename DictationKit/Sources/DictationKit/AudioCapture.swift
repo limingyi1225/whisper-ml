@@ -19,24 +19,24 @@ private nonisolated let log = Logger(subsystem: "com.mingyili.Whisper", category
 /// `@unchecked Sendable` because the cross-thread state (pre-roll buffer, converter,
 /// streaming flag) is guarded by `lock`; engine control (`isRunning`, tap install) is
 /// only ever touched from the main thread.
-nonisolated final class AudioCapture: @unchecked Sendable {
+public nonisolated final class AudioCapture: @unchecked Sendable {
     /// 24 kHz mono PCM16 → 48 000 bytes per second.
-    static let bytesPerSecond = 48_000
+    public static let bytesPerSecond = 48_000
 
     /// Delivered on an internal queue, not the main thread.
-    var onChunk: ((Data) -> Void)?
+    public var onChunk: ((Data) -> Void)?
     /// 0...1 loudness for the HUD, delivered on the main thread.
-    var onLevel: ((Float) -> Void)?
+    public var onLevel: ((Float) -> Void)?
     /// The engine failed to start, or died mid-capture and could not be restarted.
     /// No further audio will arrive; the controller must fail the utterance visibly
     /// rather than let a half-recorded sentence commit as if it were complete.
     /// May fire on any thread.
-    var onCaptureFailure: ((UInt64) -> Void)?
+    public var onCaptureFailure: ((UInt64) -> Void)?
 
-    struct StopResult {
-        let audio: Data
-        let captureFailed: Bool
-        let generation: UInt64?
+    public struct StopResult {
+        public let audio: Data
+        public let captureFailed: Bool
+        public let generation: UInt64?
     }
 
     private let engine = AVAudioEngine()
@@ -59,7 +59,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
     private var activeCaptureGeneration: UInt64?
     private var configChangeObserver: NSObjectProtocol?
 
-    init() {
+    public init() {
         // The engine stops and deinitializes itself when the input device changes
         // (headset plugged in, Bluetooth mic switching). Without this, `isRunning`
         // would stay true while no audio flows, and the rest of the utterance would
@@ -122,7 +122,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
     /// behind an unfinished one so that waiting never costs the user their audio.
     private var prerollCapacityBytes = bytesPerSecond
 
-    func setPrerollCapacity(seconds: Int) {
+    public func setPrerollCapacity(seconds: Int) {
         lock.withLock { prerollCapacityBytes = Self.bytesPerSecond * seconds }
     }
 
@@ -130,7 +130,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
 
     /// Begins capturing into the pre-roll buffer. Nothing is emitted yet.
     @discardableResult
-    func beginPreroll() -> UInt64? {
+    public func beginPreroll() -> UInt64? {
         if isRunning {
             return lock.withLock { activeCaptureGeneration }
         }
@@ -178,7 +178,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
     }
 
     /// Promotes the session to live streaming and returns the buffered pre-roll audio.
-    func startStreaming(includePreroll: Bool) -> Data {
+    public func startStreaming(includePreroll: Bool) -> Data {
         lock.withLock {
             isStreaming = true
             let preroll = includePreroll ? Data(prerollChunks.joined()) : Data()
@@ -197,7 +197,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
     /// cleared by the stop, eating the last syllable. `engine.stop()` blocks until
     /// an in-flight callback returns (measured, see `stop()`), so by the time we
     /// drain, the final chunk is already in the buffer.
-    func stopAndDrainPreroll() -> StopResult {
+    public func stopAndDrainPreroll() -> StopResult {
         if isRunning {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
@@ -224,7 +224,7 @@ nonisolated final class AudioCapture: @unchecked Sendable {
     }
 
     @discardableResult
-    func stop() -> StopResult {
+    public func stop() -> StopResult {
         let wasRunning = isRunning
         if wasRunning {
             engine.inputNode.removeTap(onBus: 0)

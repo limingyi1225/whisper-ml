@@ -9,11 +9,11 @@ import Foundation
 /// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, which would otherwise pin them to the
 /// main actor and put them out of reach of the `nonisolated` helpers that read them.
 /// They are immutable values of `Sendable` types, so there is nothing to isolate.
-struct ServiceRoute: CustomStringConvertible {
+public struct ServiceRoute: CustomStringConvertible {
     /// This is deployment configuration, not a user preference. Keeping it out of
     /// Settings prevents accidental endpoint changes and leaves one user-facing choice:
     /// connect to OpenAI directly or use the configured relay.
-    nonisolated static let relayBaseURL = URL(string: "https://limingyi.com/whisper-relay")!
+    public nonisolated static let relayBaseURL = URL(string: "https://limingyi.com/whisper-relay")!
 
     /// Development-only escape hatch, deliberately not in Settings — pointing the app
     /// at a relay is not something a user should be able to do by accident:
@@ -23,7 +23,7 @@ struct ServiceRoute: CustomStringConvertible {
     ///
     /// An unparseable or unsafe value falls back to the production URL rather than
     /// failing the connection, so a stale override cannot brick the app.
-    nonisolated static let relayBaseURLOverrideKey = "relayBaseURLOverride"
+    public nonisolated static let relayBaseURLOverrideKey = "relayBaseURLOverride"
 
     /// `nonisolated` like the two helpers below: this only reads `UserDefaults`, which
     /// is thread-safe, so there is no reason to pin URL construction to the main actor.
@@ -33,7 +33,7 @@ struct ServiceRoute: CustomStringConvertible {
     /// be a way to make the app hand its Keychain device token to someone else's server
     /// on the next reconnect — the app would be doing the exfiltration itself. Local
     /// development only ever needs loopback, so nothing is lost by refusing the rest.
-    nonisolated static var effectiveRelayBaseURL: URL {
+    public nonisolated static var effectiveRelayBaseURL: URL {
         #if DEBUG
         guard let raw = UserDefaults.standard.string(forKey: relayBaseURLOverrideKey),
               let override = relayBaseURL(from: raw),
@@ -51,28 +51,35 @@ struct ServiceRoute: CustomStringConvertible {
     /// so both spellings have to be present.
     nonisolated private static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "[::1]"]
 
-    nonisolated static func isLoopback(_ url: URL) -> Bool {
+    public nonisolated static func isLoopback(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
         return loopbackHosts.contains(host)
     }
 
-    enum ConfigurationError: LocalizedError {
+    public enum ConfigurationError: LocalizedError {
         case message(String)
 
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .message(let message): return message
             }
         }
     }
 
-    let mode: ConnectionMode
-    let realtimeURL: URL
-    let polishURL: URL
-    let credential: String
+    public let mode: ConnectionMode
+    public let realtimeURL: URL
+    public let polishURL: URL
+    public let credential: String
 
-    static func current() throws -> ServiceRoute {
-        let settings = AppSettings.shared
+    public init(mode: ConnectionMode, realtimeURL: URL, polishURL: URL, credential: String) {
+        self.mode = mode
+        self.realtimeURL = realtimeURL
+        self.polishURL = polishURL
+        self.credential = credential
+    }
+
+    public static func current() throws -> ServiceRoute {
+        let settings = DictationEnvironment.settings
         switch settings.connectionMode {
         case .direct:
             guard let apiKey = KeychainStore.loadAPIKey() else {
@@ -101,7 +108,7 @@ struct ServiceRoute: CustomStringConvertible {
 
     /// Production relay addresses must use TLS. Plain HTTP is accepted only for a
     /// loopback development server, so local testing does not require certificates.
-    nonisolated static func relayBaseURL(from raw: String) -> URL? {
+    public nonisolated static func relayBaseURL(from raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               var components = URLComponents(string: trimmed),
@@ -134,11 +141,11 @@ struct ServiceRoute: CustomStringConvertible {
     /// The synthesized `description` would print the credential verbatim, and one
     /// `log("\(route)")` added later would put it in the unified log for anyone with
     /// Console.app. Overriding it makes that mistake harmless instead of silent.
-    nonisolated var description: String {
+    public nonisolated var description: String {
         "ServiceRoute(mode: \(mode.rawValue), host: \(realtimeURL.host ?? "?"), credential: <redacted>)"
     }
 
-    nonisolated static func relayRealtimeURL(baseURL: URL) -> URL {
+    public nonisolated static func relayRealtimeURL(baseURL: URL) -> URL {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/realtime"),
             resolvingAgainstBaseURL: false

@@ -2,16 +2,16 @@ import Foundation
 import Security
 
 /// Credentials live in the login keychain, not in the binary or in UserDefaults.
-enum KeychainStore {
+public enum KeychainStore {
     private static let service = "com.mingyili.Whisper"
     private static let apiKeyAccount = "openai-api-key"
     private static let relayTokenAccount = "relay-device-token"
 
-    static func loadAPIKey() -> String? {
+    public static func loadAPIKey() -> String? {
         load(account: apiKeyAccount)
     }
 
-    static func loadRelayToken() -> String? {
+    public static func loadRelayToken() -> String? {
         load(account: relayTokenAccount)
     }
 
@@ -26,7 +26,7 @@ enum KeychainStore {
     /// acceptable here is that the relay confines the token to a fixed model and request
     /// shape, caps its connections and request rate, and lets one hash be revoked
     /// without touching anyone else. None of that is true of an OpenAI key.
-    static var bundledRelayToken: String? {
+    public static var bundledRelayToken: String? {
         guard let value = Bundle.main.object(forInfoDictionaryKey: "WhisperRelayToken")
                 as? String,
               value.hasPrefix("relay_") else { return nil }
@@ -77,7 +77,7 @@ enum KeychainStore {
     ///
     /// Returns true when something was written.
     @discardableResult
-    static func seedBundledRelayTokenIfNeeded() -> Bool {
+    public static func seedBundledRelayTokenIfNeeded() -> Bool {
         guard let bundled = bundledRelayToken else { return false }
         let issuance = bundledTokenIssuance
         guard shouldSeed(
@@ -93,7 +93,7 @@ enum KeychainStore {
 
     /// Installs the bundled token in response to the server rejecting what we had.
     @discardableResult
-    static func adoptBundledRelayToken(_ token: String) -> Bool {
+    public static func adoptBundledRelayToken(_ token: String) -> Bool {
         guard saveRelayToken(token) else { return false }
         recordAdopted(bundledTokenIssuance)
         return true
@@ -113,7 +113,7 @@ enum KeychainStore {
     /// becoming a licence to overwrite: the same issuance is never applied twice, so a
     /// token the user types afterwards stays, and an older copy of the app cannot
     /// downgrade a newer token.
-    static func shouldSeed(
+    public static func shouldSeed(
         hasStoredToken: Bool,
         bundledIssuance: Int?,
         adoptedIssuance: Int?
@@ -144,7 +144,7 @@ enum KeychainStore {
     /// Guards the same downgrade from the other side. Without it, a recipient running
     /// the current build (token B) whose token is later revoked could have an *older*
     /// copy's 401 recovery install A — superseded, already revoked — and then loop.
-    static func mayRecoverWithBundled(
+    public static func mayRecoverWithBundled(
         bundledIssuance: Int?,
         adoptedIssuance: Int?
     ) -> Bool {
@@ -162,9 +162,9 @@ enum KeychainStore {
     /// the item and materialised the plaintext secret each time, purely to compare it
     /// against nil. `kSecReturnData: false` answers the same question from the item's
     /// attributes.
-    static func hasAPIKey() -> Bool { exists(account: apiKeyAccount) }
+    public static func hasAPIKey() -> Bool { exists(account: apiKeyAccount) }
 
-    static func hasRelayToken() -> Bool { exists(account: relayTokenAccount) }
+    public static func hasRelayToken() -> Bool { exists(account: relayTokenAccount) }
 
     private static func exists(account: String) -> Bool {
         var query: [String: Any] = baseQuery(account: account)
@@ -192,12 +192,12 @@ enum KeychainStore {
     /// "已存入钥匙串", and silently *removing* the key under that message would
     /// leave the user believing the opposite of what happened.
     @discardableResult
-    static func saveAPIKey(_ key: String) -> Bool {
+    public static func saveAPIKey(_ key: String) -> Bool {
         save(key, account: apiKeyAccount)
     }
 
     @discardableResult
-    static func saveRelayToken(_ token: String) -> Bool {
+    public static func saveRelayToken(_ token: String) -> Bool {
         save(token, account: relayTokenAccount)
     }
 
@@ -222,12 +222,12 @@ enum KeychainStore {
     }
 
     @discardableResult
-    static func deleteAPIKey() -> Bool {
+    public static func deleteAPIKey() -> Bool {
         delete(account: apiKeyAccount)
     }
 
     @discardableResult
-    static func deleteRelayToken() -> Bool {
+    public static func deleteRelayToken() -> Bool {
         delete(account: relayTokenAccount)
     }
 

@@ -1,3 +1,4 @@
+import DictationKit
 import Foundation
 import Testing
 @testable import Whisper

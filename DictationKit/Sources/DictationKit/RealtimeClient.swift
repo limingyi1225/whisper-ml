@@ -11,24 +11,25 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "realtime"
 /// dictation starts while the socket is still coming up, audio is buffered locally and
 /// flushed the moment the session is ready — nothing is lost, it just lands late.
 @Observable
-final class RealtimeClient {
-    enum Status: Equatable {
+public final class RealtimeClient {
+    public init() {}
+    public enum Status: Equatable {
         case disconnected
         case connecting
         case ready
         case failed(String)
 
-        var isReady: Bool { self == .ready }
+        public var isReady: Bool { self == .ready }
     }
 
-    private(set) var status: Status = .disconnected
+    public private(set) var status: Status = .disconnected
 
     /// Incremental transcript text. Append-only in practice.
-    var onDelta: ((String) -> Void)?
+    public var onDelta: ((String) -> Void)?
     /// The authoritative transcript for the utterance.
-    var onCompleted: ((String) -> Void)?
+    public var onCompleted: ((String) -> Void)?
     /// Utterance could not be transcribed. The argument is user-facing.
-    var onFailure: ((String) -> Void)?
+    public var onFailure: ((String) -> Void)?
 
     @ObservationIgnored private var socket: URLSessionWebSocketTask?
     /// Route owned by `socket`. The controller snapshots this per utterance so its
@@ -130,12 +131,12 @@ final class RealtimeClient {
     /// keeps its utterance alive as long as bytes keep moving.
     @ObservationIgnored private var utteranceAcceptedBytes = 0
 
-    private var settings: AppSettings { AppSettings.shared }
+    private var settings: any DictationSettingsProviding { DictationEnvironment.settings }
 
     // MARK: - Connection lifecycle
 
     /// Opens the socket if it is not already up. Safe to call repeatedly.
-    func connectIfNeeded(resetRetryBudget: Bool = false) {
+    public func connectIfNeeded(resetRetryBudget: Bool = false) {
         if resetRetryBudget { reconnectAttempt = 0 }
         guard socket == nil else { return }
         let route: ServiceRoute
@@ -175,7 +176,7 @@ final class RealtimeClient {
     }
 
     /// Tears down the socket. Pass `retry: true` to schedule a reconnect with backoff.
-    func disconnect(retry: Bool = false, reason: String? = nil) {
+    public func disconnect(retry: Bool = false, reason: String? = nil) {
         generation += 1
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
@@ -205,7 +206,7 @@ final class RealtimeClient {
     }
 
     /// Drops and reopens the connection, e.g. after the API key or model changed.
-    func reconnectNow() {
+    public func reconnectNow() {
         guard !utteranceActive else {
             // A dictation is in flight; tearing the socket down now would silently
             // strand it — the commit would go nowhere and no timeout would fire,
@@ -239,12 +240,12 @@ final class RealtimeClient {
     /// live settings: this utterance's audio is going down that socket whatever the
     /// picker now says, so its cleanup request has to follow the socket. Only the
     /// reconnect at the next idle boundary moves the route.
-    func routeForNextUtterance() throws -> ServiceRoute {
+    public func routeForNextUtterance() throws -> ServiceRoute {
         if let activeRoute, socket != nil { return activeRoute }
         return try ServiceRoute.current()
     }
 
-    func beginUtterance() {
+    public func beginUtterance() {
         nextTurnSequence += 1
         currentTurnSequence = nextTurnSequence
         utteranceActive = true
@@ -267,7 +268,7 @@ final class RealtimeClient {
         }
     }
 
-    func appendAudio(_ data: Data) {
+    public func appendAudio(_ data: Data) {
         guard utteranceActive else { return }
         var offset = data.startIndex
         while offset < data.endIndex {
@@ -313,7 +314,7 @@ final class RealtimeClient {
     }
 
     /// Ends the utterance. The transcript arrives later via `onCompleted`.
-    func commitUtterance() {
+    public func commitUtterance() {
         guard utteranceActive else { return }
         guard status.isReady else {
             // Still connecting: remember to commit as soon as the buffer is flushed.
@@ -349,7 +350,7 @@ final class RealtimeClient {
     }
 
     /// Abandons the utterance without transcribing (early key release, cancelled gesture).
-    func cancelUtterance() {
+    public func cancelUtterance() {
         guard utteranceActive else { return }
         utteranceActive = false
         commitPending = false
@@ -693,7 +694,7 @@ final class RealtimeClient {
         }
     }
 
-    func turnSequence(fromClientEventID eventID: String?) -> Int? {
+    public func turnSequence(fromClientEventID eventID: String?) -> Int? {
         guard let eventID else { return nil }
         let components = eventID.split(separator: "-", maxSplits: 3)
         guard components.count == 4,
@@ -804,12 +805,12 @@ final class RealtimeClient {
     }
 
     /// What a transport error means for the user, and whether retrying can fix it.
-    struct TransportFailure {
-        let message: String
-        let retryable: Bool
+    public struct TransportFailure {
+        public let message: String
+        public let retryable: Bool
         /// The peer rejected the credential itself, rather than failing to talk to us.
         /// The one failure a personalised build can repair on its own.
-        var rejectedCredential = false
+        public var rejectedCredential = false
     }
 
     /// Set once a rejected credential has been answered by installing the bundled token,
@@ -857,7 +858,7 @@ final class RealtimeClient {
     /// How a rejected WebSocket handshake should read, and whether the backoff ladder
     /// should keep climbing. Split out from `transportFailure` so it is testable
     /// without a live socket.
-    nonisolated static func handshakeRejection(
+    public nonisolated static func handshakeRejection(
         statusCode: Int,
         viaRelay: Bool
     ) -> TransportFailure {
