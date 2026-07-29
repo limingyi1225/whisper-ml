@@ -389,20 +389,40 @@ public final class RealtimeClient {
         let model = settings.transcriptionModel
         var transcription: [String: Any] = ["model": model.rawValue]
 
-        // `delay` controls how much audio the model hears before committing to words —
-        // measured time-to-first-word: minimal 737ms, low 811ms, medium 1250ms,
-        // high 1937ms. It only exists on the streaming model; the others reject it,
-        // and eating that round trip on every connect just delays the first sentence.
+        // `delay` controls how much audio the model hears before committing to words.
+        // Time-to-first-word measured on gpt-realtime-whisper, the model this
+        // replaced: minimal 737ms, low 811ms, medium 1250ms, high 1937ms — the shape
+        // of the tradeoff carries over, the numbers themselves want re-measuring on
+        // gpt-live-transcribe before the settings pane quotes them. It only exists on
+        // the streaming model; the other rejects it, and eating that round trip on
+        // every connect just delays the first sentence.
         if model.supportsLiveTyping {
             transcription["delay"] = settings.transcriptionDelay.rawValue
         }
-        // Language is deliberately not sent: the speech here is mixed zh/en and
-        // auto-detection handles that better than pinning one language.
+        // The vocabulary, biasing recognition itself rather than repairing it after.
+        // Both current models accept this; gpt-realtime-whisper had no such slot, which
+        // is why the list used to reach only the cleanup pass. Repairing after the fact
+        // works, but it costs a visible flash — measured on "我叫李铭一", the raw
+        // transcript says 李明一, so live typing puts the wrong name on screen and
+        // `reconcile` corrects it ~0.9s later — and it fails outright whenever cleanup
+        // is switched off or times out, since every TranscriptPolisher failure path
+        // returns the raw text unchanged.
         //
-        // `prompt` is not sent either — gpt-realtime-whisper rejects it outright, and
-        // on the models that do accept it, using it as an instruction channel measurably
-        // degraded transcription accuracy (backend→button, Kevin→Kelvin on identical
-        // audio). Cleanup belongs in a separate text pass, see TranscriptPolisher.
+        // Empty lists are not sent at all: an empty array is a different request from
+        // an absent field, and there is nothing to bias towards.
+        let keywords = settings.vocabularyTerms
+        if !keywords.isEmpty {
+            transcription["keywords"] = keywords
+        }
+        // Language is deliberately not sent: the speech here is mixed zh/en and
+        // auto-detection handles that better than pinning one language. `languages`
+        // now takes a list, so ["zh", "en"] is no longer the same bet as pinning one —
+        // an open question, and `script/ab_transcribe.mjs` has an arm for it.
+        //
+        // `prompt` is not sent. Both current models accept it, but using it as an
+        // instruction channel measurably degraded transcription accuracy on the gpt-4o
+        // models (backend→button, Kevin→Kelvin on identical audio). Cleanup belongs in
+        // a separate text pass, see TranscriptPolisher.
         for field in unsupportedFields { transcription.removeValue(forKey: field) }
 
         send([
@@ -413,7 +433,7 @@ public final class RealtimeClient {
                     "input": [
                         "format": ["type": "audio/pcm", "rate": 24_000],
                         "transcription": transcription,
-                        // gpt-realtime-whisper requires VAD off; we drive turns from the hotkey.
+                        // Turns are driven by the hotkey, so server-side VAD stays off.
                         "turn_detection": NSNull(),
                     ]
                 ],

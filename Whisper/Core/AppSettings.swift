@@ -86,9 +86,8 @@ extension TranscriptionModel: @retroactive Identifiable {
 
     var summary: String {
         switch self {
-        case .realtimeWhisper: return "唯一能边说边出字的模型，也最贵"
-        case .transcribe: return "更便宜，但只能松手后一次性出字"
-        case .miniTranscribe: return "最便宜，只能松手后一次性出字"
+        case .liveTranscribe: return "唯一能边说边出字的模型，也最贵"
+        case .transcribe: return "便宜近四倍，但只能松手后一次性出字"
         }
     }
 }
@@ -139,9 +138,11 @@ final class AppSettings: DictationSettingsProviding {
     /// every such sentence in full — the exact flash the whitespace rule exists to avoid.
     var simplifyChinese: Bool { didSet { store.set(simplifyChinese, forKey: Key.simplifyChinese) } }
     /// Proper nouns the transcriber keeps mis-hearing — names, products, jargon — one
-    /// per line, spelled the way the user wants them. Handed to the cleanup model,
-    /// which is the only channel available: `gpt-realtime-whisper` rejects `prompt`,
-    /// the one vocabulary-bias slot the transcription side has.
+    /// per line, spelled the way the user wants them. Goes to both sides: the
+    /// transcription session's `keywords`, which biases recognition itself, and the
+    /// cleanup model, which repairs whatever got through. The second is a fallback
+    /// now rather than the primary — see `RealtimeClient.sendSessionUpdate` — and it
+    /// stays because bias is not a guarantee.
     var vocabulary: String { didSet { store.set(vocabulary, forKey: Key.vocabulary) } }
 
     /// Names the people using this app say constantly and the transcriber keeps
@@ -177,7 +178,20 @@ final class AppSettings: DictationSettingsProviding {
         var terms: [String] = []
         for line in raw.split(whereSeparator: \.isNewline) {
             let term = line.trimmingCharacters(in: .whitespaces)
-            guard !term.isEmpty, term.count <= vocabularyTermLengthLimit else { continue }
+            // Measured in UTF-16 units, not Characters, because the relay enforces the
+            // same cap in JavaScript — where `"𠮷".length` is 2. A name in CJK
+            // extension B counts as one Character here and two there, so a list this
+            // side considers legal could be rejected the other side. That rejection is
+            // not a dropped word: `session.update` fails as a whole, and dictation
+            // stops working until the box is edited.
+            guard !term.isEmpty,
+                  term.utf16.count <= vocabularyTermLengthLimit,
+                  // `<` and `>` are documented as invalid inside a transcription
+                  // keyword, and the cleanup pass wraps the transcript in
+                  // `<transcript>` — a term carrying either would be arguing with
+                  // both consumers of this list at once.
+                  !term.contains(where: { $0 == "<" || $0 == ">" })
+            else { continue }
             guard seen.insert(term).inserted else { continue }
             terms.append(term)
             if terms.count == vocabularyTermLimit { break }
@@ -215,7 +229,7 @@ final class AppSettings: DictationSettingsProviding {
         let delay = store.string(forKey: Key.transcriptionDelay)
         transcriptionDelay = delay.flatMap(TranscriptionDelay.init(rawValue:)) ?? .low
         let model = store.string(forKey: Key.transcriptionModel)
-        transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .realtimeWhisper
+        transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .liveTranscribe
         polishEnabled = store.object(forKey: Key.polishEnabled) as? Bool ?? true
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
         simplifyChinese = store.object(forKey: Key.simplifyChinese) as? Bool ?? true

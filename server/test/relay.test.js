@@ -128,7 +128,7 @@ test("Realtime validation permits transcription but rejects arbitrary sessions",
       audio: {
         input: {
           format: { type: "audio/pcm", rate: 24_000 },
-          transcription: { model: "gpt-realtime-whisper", delay: "low" },
+          transcription: { model: "gpt-live-transcribe", delay: "low" },
           turn_detection: null,
         },
       },
@@ -147,6 +147,46 @@ test("Realtime validation permits transcription but rejects arbitrary sessions",
     ),
     /unsupported field/,
   );
+});
+
+test("Realtime validation bounds the keywords list", () => {
+  const config = loadConfig(baseEnv);
+  const state = { turnAudioBytes: 0 };
+  const withKeywords = (keywords) => Buffer.from(JSON.stringify({
+    type: "session.update",
+    event_id: "whisper-session-1",
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: 24_000 },
+          transcription: { model: "gpt-live-transcribe", delay: "low", keywords },
+          turn_detection: null,
+        },
+      },
+    },
+  }));
+
+  assert.equal(validateRealtimeEvent(withKeywords(["李铭一", "Xcode"]), false, config, state), null);
+  assert.equal(validateRealtimeEvent(withKeywords([]), false, config, state), null);
+
+  // The caps are the point: without them an authenticated device could push arbitrary
+  // text upstream through a field that merely looks like a word list.
+  for (const bad of [
+    Array.from({ length: 101 }, (_, i) => `t${i}`), // too many
+    ["x".repeat(41)], // one term too long
+    [""], // empty term
+    ["has\nnewline"],
+    ["angle <brackets>"],
+    ["fine", 42], // not all strings
+    "not-an-array",
+  ]) {
+    assert.match(
+      validateRealtimeEvent(withKeywords(bad), false, config, state),
+      /keywords list is not allowed/,
+      `expected rejection for ${JSON.stringify(bad)}`,
+    );
+  }
 });
 
 test("Realtime validation enforces cumulative audio per turn", () => {

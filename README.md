@@ -2,7 +2,7 @@
 
 按住右 ⌘ 说话，松手出字。中文、英文、中英混说都行。
 
-菜单栏常驻，没有 Dock 图标。转写走 OpenAI Realtime 的 `gpt-realtime-whisper`，
+菜单栏常驻，没有 Dock 图标。转写走 OpenAI Realtime 的 `gpt-live-transcribe`，
 说话过程中文字就会实时打进你正在输入的那个 App，松手后再自动整理掉口头禅。
 
 ## 怎么用
@@ -36,8 +36,8 @@
   `赵砚辞`，「赵言词老师」会修成「赵砚辞老师」；写了 `Xcode`，「我用 ex code 打开」会
   修成 Xcode。
 
-没有单独的「出字方式」开关：选了 `gpt-realtime-whisper` 就是边说边上屏，选了
-`gpt-4o-transcribe` 系列就是松手后上屏。这不是两个决定，是同一个。
+没有单独的「出字方式」开关：选了 `gpt-live-transcribe` 就是边说边上屏，选了
+`gpt-transcribe` 就是松手后上屏。这不是两个决定，是同一个。
 
 ## 结构
 
@@ -201,9 +201,11 @@ socket 在 App 启动时就建好、用 ping 保活、会话快过期时提前�
 **沙盒必须关。** CGEventTap 和合成键盘事件在 App Sandbox 里都用不了。Hardened runtime
 保持开启，麦克风靠 `com.apple.security.device.audio-input` entitlement。
 
-**换便宜模型就换不来实时上屏。** 实测同一段音频：`gpt-realtime-whisper` 在 commit 前
-发出 36 个 delta，而 `gpt-4o-transcribe` 和 `gpt-4o-mini-transcribe` 都是 **0 个**——
-它们把全部文字堆在 commit 之后才发。所以出字方式不是一个独立选项，而是模型能力的直接结果。
+**换便宜模型就换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
+20 个 delta，`gpt-transcribe` 是 **0 个**。注意不能看 delta 总数——两者总数几乎一样
+（23 vs 24），差别全在时间上：便宜那档把每一个 delta 都堆到 commit 之后才发，那时人已经
+松手了。所以出字方式不是一个独立选项，而是模型能力的直接结果。
+（`script/ab_transcribe.mjs` 可以随时重测这组数。）
 
 **事件要按 `item_id` 认领，不能靠先来后到。** 跨轮次的完成事件顺序没有保证，而
 `input_audio_buffer.committed` 会返回本轮权威的 `item_id`。仅用「第一个转写事件」认领
@@ -216,11 +218,20 @@ socket 在 App 启动时就建好、用 ping 保活、会话快过期时提前�
 （gpt-4o-mini-transcribe 更是完全无视）。`prompt` 在 Whisper 系列里是词汇/风格偏置，
 不是指令通道，拿它当指令用会让模型分心，两件事都做不好。
 
-**常用词汇只能挂在整理这一侧。** `prompt` 本来正是词汇偏置该走的通道，用来喂人名是它的
-正当用法——但 `gpt-realtime-whisper` 直接拒收这个参数，而它是唯一能边说边出字的模型。
-`unsupportedFields` 那套机制虽然能自动摘掉被拒字段重连，代价是每次连接多一个往返，而连接
-的 2 秒本来就在热路径上。所以词表进整理模型的 system prompt，且只在用户真填了词的时候
-才追加那一段，空表时提示词与调优时逐字一致。
+**常用词汇现在两边都挂。** 上一代的 `gpt-realtime-whisper` 直接拒收 `prompt`，而它是唯一
+能边说边出字的模型，词表就只剩整理模型这一条路。新一代多了专门喂术语的 `keywords`，这个
+限制没有了。实测同一段音频、唯一变量是这个字段：不加是「李**明**一」「赵**云熙**」，加了是
+「李**铭**一」「赵**芸溪**」，首字延迟没变化。
+
+注意这**不是把职责搬过去了**，是加了一道。整理那侧的词表留着，因为 keywords 是概率偏置不是
+保证；而且只在用户真填了词的时候才追加那一段，空表时提示词与调优时逐字一致。上面那条「转写
+和整理必须分开」依然成立——它说的是 `prompt` 当指令通道，和 `keywords` 是两套机制。
+
+**词表的校验规则比看起来重要。** 它以前只喂整理模型，一条烂词最多少修一个字；现在它进了
+`session.update`，一条烂词会让整个会话建不起来，口述直接不能用。所以长度按 **UTF-16** 计
+（relay 是 JS，`"𠮷".length` 是 2 而 Swift 的 `count` 是 1，两边尺子必须一样），并且拒收
+`<` `>`（API 不收，而且整理那侧正好用 `<transcript>` 包正文）。App 过滤一遍，relay 再独立
+校验一遍——relay 不能信客户端的自觉，否则 `keywords` 就是一条通往 OpenAI 的自由文本通道。
 
 **词表必须放宽 `isPlausible` 的长度上界。** 整理通常只会让文本变短，所以有个 1.6 倍的
 上界防止模型"回答"而不是"整理"。但词汇替换是唯一会变长的整理：「凯文和艾米」(5 字) →

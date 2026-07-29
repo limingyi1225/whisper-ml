@@ -401,6 +401,25 @@ import Testing
         #expect(terms == AppSettings.builtInVocabulary + ["Kevin", "Anthropic"])
         #expect(terms.count { $0 == "李铭一" } == 1)
     }
+
+    @Test func termsThatWouldBeRejectedUpstreamNeverLeave() {
+        // This list is now part of the Realtime session config, so an unacceptable term
+        // does not cost one word — it fails `session.update` and takes dictation down
+        // with it. Both rules are enforced again by the relay; this is the half that
+        // keeps a legal-looking box from producing an illegal session.
+        #expect(AppSettings.parseVocabulary("a<b") == [])
+        #expect(AppSettings.parseVocabulary("a>b") == [])
+        #expect(AppSettings.parseVocabulary("<transcript>") == [])
+
+        // The cap is UTF-16 units, matching the relay's JavaScript check. 𠮷 is one
+        // Character and two UTF-16 units, so 20 of them sit exactly on the limit and
+        // 21 are over it — a distinction `count` alone cannot make.
+        let atLimit = String(repeating: "𠮷", count: 20)
+        let overLimit = String(repeating: "𠮷", count: 21)
+        #expect(atLimit.count == 20 && atLimit.utf16.count == 40)
+        #expect(AppSettings.parseVocabulary(atLimit) == [atLimit])
+        #expect(AppSettings.parseVocabulary(overLimit) == [])
+    }
 }
 
 // MARK: - Settings tables
@@ -431,12 +450,11 @@ import Testing
 }
 
 @Suite struct SettingsTableTests {
-    @Test func onlyTheRealtimeModelTypesLive() {
-        // Measured behavior the whole output-mode design hangs on: the
-        // gpt-4o-transcribe models emit zero deltas before the commit.
-        #expect(TranscriptionModel.realtimeWhisper.supportsLiveTyping)
+    @Test func onlyTheLiveModelTypesLive() {
+        // The behavior the whole output-mode design hangs on: only the streaming
+        // model returns anything before `input_audio_buffer.commit`.
+        #expect(TranscriptionModel.liveTranscribe.supportsLiveTyping)
         #expect(!TranscriptionModel.transcribe.supportsLiveTyping)
-        #expect(!TranscriptionModel.miniTranscribe.supportsLiveTyping)
     }
 }
 

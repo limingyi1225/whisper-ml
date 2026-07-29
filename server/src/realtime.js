@@ -8,6 +8,13 @@ const ALLOWED_EVENT_TYPES = new Set([
 ]);
 const ALLOWED_DELAYS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
+// Mirrors AppSettings.vocabularyTermLimit / vocabularyTermLengthLimit. Re-checked here
+// rather than trusted from the app, because this is the boundary that decides what an
+// authenticated device may spend the upstream session on: without a cap, `keywords`
+// is a free-text channel to OpenAI that happens to be shaped like a word list.
+const MAX_KEYWORDS = 100;
+const MAX_KEYWORD_LENGTH = 40;
+
 /// Chinese lead, English detail in parentheses. These reach the user through the app's
 /// connection error status, which is otherwise all Chinese. The English half stays
 /// because it names the offending field and is the only practical way to debug a
@@ -34,7 +41,22 @@ const REJECT = Object.freeze({
   audioTooLong: "转发服务器：这一句的音频超过上限（turn audio exceeds the relay limit）",
   audioUnexpected:
     "转发服务器：该事件不应携带 audio 字段（audio is not allowed on this event）",
+  keywords:
+    "转发服务器：常用词汇表不合法，可能太长或含有非法字符"
+    + "（keywords list is not allowed）",
 });
+
+/// A vocabulary list the upstream will accept: bounded, non-empty strings. `<`, `>` and
+/// line breaks are documented as invalid inside a keyword, and rejecting them here turns
+/// one malformed term into a clear local error instead of a failed session upstream.
+function validKeywords(value) {
+  return Array.isArray(value)
+    && value.length <= MAX_KEYWORDS
+    && value.every((term) => typeof term === "string"
+      && term.length > 0
+      && term.length <= MAX_KEYWORD_LENGTH
+      && !/[<>\r\n]/.test(term));
+}
 
 function onlyKeys(object, allowed) {
   return object
@@ -72,8 +94,13 @@ export function validateRealtimeEvent(data, isBinary, config, state) {
         || !onlyKeys(audio, new Set(["input"]))
         || !onlyKeys(input, new Set(["format", "transcription", "turn_detection"]))
         || !onlyKeys(format, new Set(["type", "rate"]))
-        || !onlyKeys(transcription, new Set(["model", "delay"]))) {
+        || !onlyKeys(transcription, new Set(["model", "delay", "keywords"]))) {
       return REJECT.sessionConfigField;
+    }
+    if (transcription.keywords !== undefined && !validKeywords(transcription.keywords)) {
+      // Its own message rather than the generic one: a word list has many more ways to
+      // be wrong than a model name, and "配置不对" would not narrow any of them down.
+      return REJECT.keywords;
     }
     if (session.type !== "transcription"
         || format.type !== "audio/pcm"

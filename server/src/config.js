@@ -190,7 +190,7 @@ export function loadConfig(env = process.env) {
     deviceTokenHashes,
     allowedTranscriptionModels: commaSeparatedSet(
       env.ALLOWED_TRANSCRIPTION_MODELS
-      || "gpt-realtime-whisper,gpt-4o-transcribe,gpt-4o-mini-transcribe",
+      || "gpt-live-transcribe,gpt-transcribe",
     ),
     allowedPolishModels: commaSeparatedSet(
       env.ALLOWED_POLISH_MODELS || "gpt-5.6-terra",

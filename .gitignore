@@ -22,6 +22,11 @@ Packages/
 server/node_modules/
 server/.env
 
+# A/B harness input and output. The audio is whatever was said into a microphone and
+# the results carry it back as text — personal by nature, and regenerable besides.
+script/ab-audio/
+script/ab-out/
+
 # Personal Claude Code permissions (names the deploy host; not team config)
 .claude/settings.local.json
 

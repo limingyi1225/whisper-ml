@@ -366,7 +366,7 @@ test("Realtime bridge queues the first session update and injects the server key
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
             turn_detection: null,
           },
         },
@@ -512,7 +512,7 @@ test("a revoked connection stops forwarding the instant the revoke lands", async
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
             turn_detection: null,
           },
         },
@@ -597,7 +597,7 @@ test("a rejected event names the client event that caused it", async () => {
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
             turn_detection: null,
           },
         },
@@ -736,7 +736,7 @@ test("backpressure does not let the heartbeat mistake a healthy client for a dea
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
             turn_detection: null,
           },
         },
@@ -881,7 +881,7 @@ test("a slow upstream throttles the client instead of dropping the utterance", a
         audio: {
           input: {
             format: { type: "audio/pcm", rate: 24_000 },
-            transcription: { model: "gpt-realtime-whisper", delay: "low" },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
             turn_detection: null,
           },
         },

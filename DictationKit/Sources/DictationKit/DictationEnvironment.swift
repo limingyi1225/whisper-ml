@@ -24,15 +24,16 @@ public enum ConnectionMode: String, CaseIterable, Sendable {
 }
 
 public enum TranscriptionModel: String, CaseIterable, Sendable {
-    case realtimeWhisper = "gpt-realtime-whisper"
-    case transcribe = "gpt-4o-transcribe"
-    case miniTranscribe = "gpt-4o-mini-transcribe"
+    case liveTranscribe = "gpt-live-transcribe"
+    case transcribe = "gpt-transcribe"
 
-    /// Measured on identical audio: the realtime model emitted 36 deltas before
-    /// `input_audio_buffer.commit`; both gpt-4o-transcribe models emitted zero
-    /// and delivered everything afterwards. Live typing is therefore impossible
-    /// on them.
-    public var supportsLiveTyping: Bool { self == .realtimeWhisper }
+    /// Measured on identical audio: the live model emitted 20 deltas before
+    /// `input_audio_buffer.commit`, the other zero. Delta *count* is not the
+    /// discriminator — both emitted about the same number overall (23 and 24) —
+    /// only their timing is. gpt-transcribe holds every one of them until the turn
+    /// is committed, by which point the key is already up and there is nothing left
+    /// to type into. Retake with `script/ab_transcribe.mjs`.
+    public var supportsLiveTyping: Bool { self == .liveTranscribe }
 }
 
 /// How much audio the model hears before it commits to words.
@@ -71,7 +72,7 @@ public final class FallbackSettings: DictationSettingsProviding {
     }
     public var transcriptionModel: TranscriptionModel {
         store.string(forKey: "transcriptionModel")
-            .flatMap(TranscriptionModel.init) ?? .realtimeWhisper
+            .flatMap(TranscriptionModel.init) ?? .liveTranscribe
     }
     public var transcriptionDelay: TranscriptionDelay {
         store.string(forKey: "transcriptionDelay").flatMap(TranscriptionDelay.init) ?? .low
