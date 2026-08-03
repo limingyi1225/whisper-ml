@@ -74,28 +74,12 @@ struct MenuBarLabel: View {
 
 struct MenuBarView: View {
     let controller: DictationController
-    let settings = AppSettings.shared
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Text(statusLine)
-
-        Divider()
-
-        Text("长按 \(settings.triggerKey.displayName) 开始说话")
-
-        if !controller.history.isEmpty {
-            Divider()
-            Section("最近转写") {
-                ForEach(controller.history.prefix(5)) { entry in
-                    Button(truncate(entry.text)) {
-                        TextInjector.copyToClipboard(entry.text)
-                    }
-                }
-            }
+        if let contextualStatus {
+            Text(contextualStatus)
         }
-
-        Divider()
 
         if !Permissions.hasAccessibility {
             Button("授予辅助功能权限…") {
@@ -103,9 +87,23 @@ struct MenuBarView: View {
                 Permissions.openAccessibilitySettings()
             }
         } else if !controller.isHotKeyActive {
-            // Accessibility is fine; the hotkey is paused for another reason —
-            // in practice Secure Event Input (a focused password field).
-            Text("安全输入启用中，听写暂停")
+            Text(Permissions.isSecureInputEnabled
+                ? "安全输入启用中，听写暂停"
+                : "热键监听未启动")
+        }
+
+        if showsContext {
+            Divider()
+        }
+
+        if !controller.history.isEmpty {
+            Menu("最近转写") {
+                ForEach(controller.history.prefix(5)) { entry in
+                    Button(truncate(entry.text)) {
+                        TextInjector.copyToClipboard(entry.text)
+                    }
+                }
+            }
         }
 
         Button("设置…") {
@@ -132,20 +130,22 @@ struct MenuBarView: View {
         }
         .keyboardShortcut(",", modifiers: .command)
 
+        Divider()
+
         Button("退出 Whisper") {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: .command)
     }
 
-    private var statusLine: String {
+    private var contextualStatus: String? {
         switch controller.phase {
         case .recording: return "● 正在录音"
         case .finalizing: return "正在转写…"
         case .error(let message): return "出错：\(message)"
         case .idle, .arming:
             switch controller.connectionStatus {
-            case .ready: return "就绪"
+            case .ready: return nil
             case .connecting: return "正在连接…"
             case .disconnected: return "未连接"
             case .failed(let message): return "连接失败：\(DictationController.friendlyMessage(message))"
@@ -153,7 +153,14 @@ struct MenuBarView: View {
         }
     }
 
+    private var showsContext: Bool {
+        contextualStatus != nil || !Permissions.hasAccessibility || !controller.isHotKeyActive
+    }
+
     private func truncate(_ text: String) -> String {
-        text.count > 32 ? String(text.prefix(32)) + "…" : text
+        let singleLine = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return singleLine.count > 36 ? String(singleLine.prefix(36)) + "…" : singleLine
     }
 }

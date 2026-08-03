@@ -19,15 +19,6 @@ extension ConnectionMode: @retroactive Identifiable {
         case .relay: return "代理模式"
         }
     }
-
-    var summary: String {
-        switch self {
-        case .direct:
-            return "Mac 使用钥匙串里的 OpenAI API Key 直接连接。"
-        case .relay:
-            return "Mac 只连接你的服务器，本机不保存 OpenAI API Key；无 VPN 时也能用。"
-        }
-    }
 }
 
 /// Which physical key must be held down to dictate.
@@ -83,13 +74,6 @@ extension TranscriptionModel: @retroactive Identifiable {
     public var id: String { rawValue }
 
     var displayName: String { rawValue }
-
-    var summary: String {
-        switch self {
-        case .liveTranscribe: return "唯一能边说边出字的模型，也最贵"
-        case .transcribe: return "便宜近四倍，但只能松手后一次性出字"
-        }
-    }
 }
 
 extension TranscriptionDelay: @retroactive Identifiable {
@@ -168,8 +152,8 @@ final class AppSettings: DictationSettingsProviding {
     /// pasting an essay into the box would slow down every sentence the user speaks.
     /// Over-long lines are dropped rather than truncated — a 40+ character "term" is
     /// prose someone typed into the wrong box, and half of it is not a spelling
-    /// anybody wants enforced. The settings pane shows the accepted count so a
-    /// dropped line is visible rather than silent.
+    /// anybody wants enforced. The settings editor mirrors these checks before
+    /// saving; the parser remains the final guard for older persisted values.
     static let vocabularyTermLimit = 100
     static let vocabularyTermLengthLimit = 40
 
