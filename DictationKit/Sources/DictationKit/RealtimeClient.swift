@@ -87,6 +87,13 @@ public final class RealtimeClient {
     @ObservationIgnored private var sessionConfigRetries = 0
 
     @ObservationIgnored private var keepAliveTimer: Timer?
+    /// `URLSessionWebSocketTask` can wait forever without completing either `send`,
+    /// `receive`, or `sendPing` after sleep/wake or a network-path change. These two
+    /// watchdogs make "no callback" a failure too; transport callbacks alone cannot.
+    @ObservationIgnored private var connectionTimeoutTimer: Timer?
+    @ObservationIgnored private var keepAliveTimeoutTimer: Timer?
+    @ObservationIgnored private var keepAlivePingSequence = 0
+    @ObservationIgnored private var keepAlivePingInFlight: Int?
     @ObservationIgnored private var refreshTimer: Timer?
     @ObservationIgnored private var responseTimeoutTimer: Timer?
     @ObservationIgnored private var reconnectWorkItem: DispatchWorkItem?
@@ -114,6 +121,14 @@ public final class RealtimeClient {
     /// prolonged by this: they fail the utterance immediately through the
     /// send/receive/ping error paths.
     private static let connectionGrace: TimeInterval = 35
+    /// Normal setup takes ~2 s. `timeoutIntervalForRequest` is not a reliable bound for
+    /// a WebSocket waiting for connectivity, so own the deadline at the state-machine
+    /// level and replace a generation that never reaches `session.updated`.
+    private static let connectionSetupTimeout: TimeInterval = 30
+    /// A ping whose completion never arrives is indistinguishable from a live ping to
+    /// URLSession, but not to us. Ten seconds is comfortably above ordinary RTT while
+    /// still replacing a dead idle socket well before the next utterance begins.
+    private static let keepAliveResponseTimeout: TimeInterval = 10
     /// Assumed worst-case sustained upload throughput, in raw PCM bytes per
     /// second. Base64 inflates the wire size by ~4/3, so 75 KB/s of PCM is about
     /// 100 KB/s (~0.8 Mbit/s) on the wire — slow enough to cover weak Wi-Fi
@@ -172,6 +187,7 @@ public final class RealtimeClient {
         receive(generation: generation)
         sendSessionUpdate()
         startKeepAlive()
+        startConnectionTimeout(generation: generation)
         log.info("connecting via \(route.mode.rawValue, privacy: .public) (generation \(generation))")
     }
 
@@ -182,6 +198,9 @@ public final class RealtimeClient {
         socket = nil
         activeRoute = nil
         keepAliveTimer?.invalidate(); keepAliveTimer = nil
+        connectionTimeoutTimer?.invalidate(); connectionTimeoutTimer = nil
+        keepAliveTimeoutTimer?.invalidate(); keepAliveTimeoutTimer = nil
+        keepAlivePingInFlight = nil
         refreshTimer?.invalidate(); refreshTimer = nil
         responseTimeoutTimer?.invalidate(); responseTimeoutTimer = nil
         sessionExpiry = nil
@@ -246,6 +265,11 @@ public final class RealtimeClient {
     }
 
     public func beginUtterance() {
+        // Keep-alive is an idle-only probe. A ping started just before this call may
+        // legitimately wait behind relay backpressure once the audio burst begins;
+        // its old 10 s deadline must not tear down the utterance that now owns the
+        // socket. Clearing the sequence also makes its eventual callback a no-op.
+        clearKeepAliveProbe()
         nextTurnSequence += 1
         currentTurnSequence = nextTurnSequence
         utteranceActive = true
@@ -468,6 +492,8 @@ public final class RealtimeClient {
 
         case "session.updated":
             reconnectAttempt = 0
+            connectionTimeoutTimer?.invalidate()
+            connectionTimeoutTimer = nil
             // A working session ends the failure episode the recovery latch guards, so
             // a rotation months from now starts with a fresh attempt.
             didTryBundledTokenRecovery = false
@@ -758,6 +784,10 @@ public final class RealtimeClient {
                             self.onFailure?(failure.message)
                         }
                     case .success(let message):
+                        // Any server frame proves the transport is responsive; do not
+                        // sacrifice an active transcript just because Foundation lost
+                        // the completion callback for an overlapping idle ping.
+                        self.clearKeepAliveProbe()
                         if case .string(let text) = message,
                            let data = text.data(using: .utf8),
                            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -780,7 +810,11 @@ public final class RealtimeClient {
         keepAliveTimer?.invalidate()
         keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, let socket = self.socket else { return }
+                guard let self,
+                      let socket = self.socket,
+                      self.status.isReady,
+                      !self.utteranceActive,
+                      self.keepAlivePingInFlight == nil else { return }
                 // A failed ping is the only way to notice a socket that died
                 // *silently* (sleep/wake, Wi-Fi switch) while idle — the receive
                 // loop only errors if the peer sends something back. Ignoring it
@@ -788,11 +822,18 @@ public final class RealtimeClient {
                 // failed, which cost the user that whole sentence. Reconnect now,
                 // so the socket is warm again long before they speak.
                 let generation = self.generation
+                self.keepAlivePingSequence += 1
+                let pingSequence = self.keepAlivePingSequence
+                self.keepAlivePingInFlight = pingSequence
+                self.startKeepAliveTimeout(generation: generation, pingSequence: pingSequence)
                 socket.sendPing { [weak self] error in
-                    guard let error else { return }
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            guard let self, generation == self.generation else { return }
+                            guard let self,
+                                  generation == self.generation,
+                                  self.keepAlivePingInFlight == pingSequence else { return }
+                            self.clearKeepAliveProbe()
+                            guard let error else { return }
                             log.error("keep-alive ping failed: \(error.localizedDescription)")
                             let failure = self.transportFailure(error)
                             let wasMidUtterance = self.utteranceActive
@@ -809,6 +850,64 @@ public final class RealtimeClient {
                 }
             }
         }
+    }
+
+    /// Bounds the whole handshake + session configuration phase. Foundation's request
+    /// timeout does not consistently fire for a WebSocket parked in connectivity wait,
+    /// which otherwise leaves `socket != nil` and `.connecting` blocking every future
+    /// `connectIfNeeded` until the process is relaunched.
+    private func startConnectionTimeout(generation: Int) {
+        connectionTimeoutTimer?.invalidate()
+        let timer = Timer(timeInterval: Self.connectionSetupTimeout, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self,
+                      generation == self.generation,
+                      self.status == .connecting else { return }
+                log.error("connection setup timed out")
+                self.recoverFromUnresponsiveTransport(reason: "连接超时")
+            }
+        }
+        connectionTimeoutTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// Detects the half-open case where `sendPing` itself never calls back. Only one
+    /// ping may be in flight, so a wedged task cannot accumulate callbacks every 20 s.
+    private func startKeepAliveTimeout(generation: Int, pingSequence: Int) {
+        keepAliveTimeoutTimer?.invalidate()
+        let timer = Timer(timeInterval: Self.keepAliveResponseTimeout, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self,
+                      generation == self.generation,
+                      self.keepAlivePingInFlight == pingSequence else { return }
+                // `beginUtterance` normally clears this probe synchronously. Keep the
+                // ownership check here too so a future entry point cannot turn an idle
+                // liveness deadline into an active-utterance data-loss deadline.
+                guard !self.utteranceActive else {
+                    self.clearKeepAliveProbe()
+                    return
+                }
+                log.error("keep-alive ping timed out")
+                self.recoverFromUnresponsiveTransport(reason: "连接失去响应")
+            }
+        }
+        keepAliveTimeoutTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func clearKeepAliveProbe() {
+        keepAlivePingInFlight = nil
+        keepAliveTimeoutTimer?.invalidate()
+        keepAliveTimeoutTimer = nil
+    }
+
+    private func recoverFromUnresponsiveTransport(reason: String) {
+        let wasMidUtterance = utteranceActive
+        utteranceActive = false
+        let shouldRetry = reconnectAttempt < 6
+        let message = shouldRetry ? "\(reason)，正在重试" : reason
+        disconnect(retry: shouldRetry, reason: message)
+        if wasMidUtterance { onFailure?(message) }
     }
 
     /// Sessions expire server-side; renew ahead of time, but never mid-sentence.

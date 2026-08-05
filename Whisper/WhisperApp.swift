@@ -26,7 +26,11 @@ struct WhisperApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCloseObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
+    private var workspaceWakeObserver: NSObjectProtocol?
     private var previousApplication: NSRunningApplication?
+    var systemWakeHandler: () -> Void = {
+        DictationController.shared.systemDidWake()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // DictationKit reads settings through a protocol rather than reaching
@@ -65,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         rememberCurrentFrontmostApplication()
         observeApplicationActivation()
+        observeSystemWake()
         observeWindowClosing()
 
         let controller = DictationController.shared
@@ -122,6 +127,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func observeSystemWake() {
+        workspaceWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.systemWakeHandler()
+            }
+        }
+    }
+
     private func restorePreviousApplicationIfNeeded() {
         let previous = previousApplication
         previousApplication = nil
@@ -171,6 +188,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let workspaceActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+        }
+        if let workspaceWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceWakeObserver)
         }
     }
 

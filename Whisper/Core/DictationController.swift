@@ -222,6 +222,14 @@ final class DictationController {
         client.reconnectNow()
     }
 
+    /// A WebSocket that crossed system sleep is not trusted even if Foundation still
+    /// reports it as open. Replacing it on wake prevents the first later dictation from
+    /// being the liveness probe. `reconnectNow` already defers safely at an utterance
+    /// boundary if the machine somehow wakes while one is active.
+    func systemDidWake() {
+        client.reconnectNow()
+    }
+
     // MARK: - Hotkey
 
     private func handleHotKey(_ event: HotKeyMonitor.Event) {

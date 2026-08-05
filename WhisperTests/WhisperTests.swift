@@ -1,4 +1,5 @@
 import DictationKit
+import AppKit
 import Foundation
 import Testing
 @testable import Whisper
@@ -252,6 +253,24 @@ import Testing
         #expect(client.turnSequence(fromClientEventID: "whisper-turn-x-9") == nil)
         #expect(client.turnSequence(fromClientEventID: "evt_abc123") == nil)
         #expect(client.turnSequence(fromClientEventID: nil) == nil)
+    }
+}
+
+@Suite struct ConnectionLifecycleTests {
+    @Test func systemWakeDispatchesRecoveryOnlyWhileObserved() {
+        let delegate = AppDelegate()
+        var wakeCount = 0
+        delegate.systemWakeHandler = { wakeCount += 1 }
+        delegate.observeSystemWake()
+
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        #expect(wakeCount == 1)
+
+        // Observer teardown matters for the app lifetime and also proves an old
+        // delegate cannot reconnect after a replacement has taken ownership.
+        delegate.applicationWillTerminate(Notification(name: .init("test-termination")))
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        #expect(wakeCount == 1)
     }
 }
 
