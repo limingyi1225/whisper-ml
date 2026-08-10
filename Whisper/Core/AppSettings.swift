@@ -134,7 +134,7 @@ final class AppSettings: DictationSettingsProviding {
     /// are deliberately absent from Settings: the box is for words the user thinks to
     /// add, and nobody thinks to add the spelling of their own name until they have
     /// already seen it come out wrong a dozen times.
-    static let builtInVocabulary = ["李铭一", "赵芸溪"]
+    static let builtInVocabulary = ["李铭一"]
 
     /// The vocabulary as the cleanup pass sees it.
     var vocabularyTerms: [String] { Self.vocabularyTerms(userList: vocabulary) }

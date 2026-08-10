@@ -175,7 +175,7 @@ function loadAPIKey() {
 
 // The list the app would actually send, so a keywords arm tests the real thing rather
 // than a sample of it. Falls back to the built-ins that `AppSettings` always contributes.
-const BUILT_IN_VOCABULARY = ["李铭一", "赵芸溪"];
+const BUILT_IN_VOCABULARY = ["李铭一"];
 
 function loadVocabulary(audioDir) {
   const override = join(audioDir, "keywords.txt");
