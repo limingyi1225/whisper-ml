@@ -58,6 +58,16 @@ public final class TranscriptPolisher {
     /// filler in one sentence and the actual point in the next — and the model has the
     /// whole utterance in front of it, so it is better placed to decide than a list is.
     ///
+    /// The laughter line is the one exception, and it names examples because it is the
+    /// mirror image of that rule: it protects a category rather than condemning one, so
+    /// being mechanical about it costs at most a 哈哈 nobody minds, while leaving it to
+    /// judgement was measurably destructive. Rule 1 was reading laughter as filler and
+    /// deleting it 3 of 3 runs on "那个我觉得这个方案挺好的哈哈哈哈你说呢" (→ "我觉得这个
+    /// 方案挺好的，你说呢？") and on 嘿嘿 in "对啊 嘿嘿 就是这个意思" — the laughter only
+    /// survived when the following words happened to refer to it ("我笑死"). With this
+    /// line all four measured cases keep it 3 of 3, and "嗯嗯嗯那个那个我觉得就是嗯可以"
+    /// still collapses to "我觉得可以。", so ordinary filler removal is untouched.
+    ///
     /// The vocabulary block is strictly additive, and an empty list still produces
     /// exactly the base prompt below — though in practice the list is never empty,
     /// since `AppSettings` always contributes its built-in names.
@@ -77,6 +87,8 @@ public final class TranscriptPolisher {
         4. 补上合理的标点与断句。
 
         要保持不变：原有的语言（中文保持中文，英文术语保持英文，除第 3 条的人名外不做翻译）、语气、信息量、已有的空格。
+        笑声和语气词（哈哈、呵呵、嘿嘿、唉、哇）是说话人表达情绪的内容，不是废话，一律保留原样。
+
         原文本来就通顺的话，原样返回。
         """
         guard !vocabulary.isEmpty else { return base }

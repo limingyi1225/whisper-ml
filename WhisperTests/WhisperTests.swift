@@ -370,6 +370,15 @@ import Testing
             .contains("人名、产品名、专业术语、代码标识符即使看起来奇怪也不要动"))
     }
 
+    @Test func laughterIsProtectedFromTheFillerRule() {
+        // Measured: without this line the cleanup model reads 哈哈/嘿嘿 as 口头禅 and
+        // deletes it, 3 of 3 runs. The loss is silent — the sentence still reads fine,
+        // it just stops sounding like the person who spoke it.
+        let base = TranscriptPolisher.instructions(vocabulary: [])
+        #expect(base.contains("笑声和语气词"))
+        #expect(base.contains("一律保留原样"))
+    }
+
     @Test func transliteratedNameRuleAppliesWithoutAVocabulary() {
         // The name rule is part of the base prompt, not the vocabulary block —
         // an empty list must still turn 艾米 into Amy.
