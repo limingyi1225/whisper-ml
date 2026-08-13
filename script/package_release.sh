@@ -58,6 +58,7 @@ case "${1:-}" in
 esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/script/update_common.sh"
 BUILD_DIR="$ROOT_DIR/build"
 # Per recipient, not shared. With one `Whisper.xcarchive` and one `developer-id/`, two
 # runs overlapping would have one process deleting and replacing the very app bundle the
@@ -380,6 +381,40 @@ case " $ARCHS " in *" x86_64 "*) ;; *)
   echo "!! app is missing x86_64: $ARCHS" >&2; exit 1
 esac
 echo "    Universal: $ARCHS"
+
+# The app can be perfectly signed and notarized while still being unable to discover
+# or verify an update. Gate the four invariants that make the in-app updater operational
+# before spending time notarizing a release that would strand itself on this version.
+UPDATE_FEED=$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' \
+  "$APP/Contents/Info.plist" 2>/dev/null || true)
+UPDATE_KEY=$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' \
+  "$APP/Contents/Info.plist" 2>/dev/null || true)
+SIGNED_FEED=$(/usr/libexec/PlistBuddy -c 'Print :SURequireSignedFeed' \
+  "$APP/Contents/Info.plist" 2>/dev/null || true)
+VERIFY_BEFORE_EXTRACTION=$(/usr/libexec/PlistBuddy -c 'Print :SUVerifyUpdateBeforeExtraction' \
+  "$APP/Contents/Info.plist" 2>/dev/null || true)
+EXPECTED_UPDATE_FEED="https://raw.githubusercontent.com/limingyi1225/whisper-ml/main/updates/appcast.xml"
+if [ "$UPDATE_FEED" != "$EXPECTED_UPDATE_FEED" ]; then
+  echo "!! the exported app has the wrong Sparkle feed URL" >&2
+  echo "   expected: $EXPECTED_UPDATE_FEED" >&2
+  echo "   actual:   ${UPDATE_FEED:-missing}" >&2
+  exit 1
+fi
+if [ -z "$UPDATE_KEY" ]; then
+  echo "!! the exported app has no Sparkle EdDSA public key" >&2
+  exit 1
+fi
+if [ "$SIGNED_FEED" != true ] || [ "$VERIFY_BEFORE_EXTRACTION" != true ]; then
+  echo "!! signed-feed or verify-before-extraction protection is disabled" >&2
+  exit 1
+fi
+if [ ! -d "$APP/Contents/Frameworks/Sparkle.framework" ]; then
+  echo "!! the exported app is missing Sparkle.framework" >&2
+  exit 1
+fi
+resolve_sparkle_tools "$ROOT_DIR/Whisper.xcodeproj" Whisper
+verify_sparkle_signing_key "$UPDATE_KEY"
+echo "    signed updater feed, verified public key and embedded framework present"
 
 echo "==> notarizing (a few minutes)"
 # Everything below stages through $STAGED and only becomes $ZIP once every check has

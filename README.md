@@ -17,6 +17,9 @@
 
 菜单栏图标 → 设置（⌘,）
 
+设置 → **软件更新** 里的 **检查更新** 可以立即查找新版，结果会显示在当前版本旁边。
+“自动更新”开启后会定期检查，并自动下载和安装新版本；默认关闭。
+
 - **听写**：连接方式、触发键、转写模型、延迟、文字整理和常用词汇
 - **设置**：登录启动、辅助功能 / 麦克风，以及当前连接方式使用的凭据
 
@@ -136,6 +139,18 @@ npm start
 ./script/invite_access.sh --list           # 看待激活、有效和已吊销的身份
 ./script/invite_access.sh --revoke alice   # 立即吊销 alice
 ```
+
+通用版从 1.1 开始内置 Sparkle 2 更新。完整发布统一使用：
+
+```bash
+./script/publish_update.sh path/to/release-notes.md   # release notes 可省略
+```
+
+脚本要求改动已审查、测试、提交且工作树干净；它会 push 源码，生成已签名公证的通用 DMG，
+创建 GitHub Release，验证下载地址，最后才提交并 push EdDSA 签名的 appcast。脚本用 GitHub
+Contents API 校验刚推送的精确 commit，并等待 raw feed 在 5 分钟 CDN TTL 内刷新；若 CDN 仍旧
+缓存旧内容，脚本会在权威校验成功后给出警告，而不会误报发布失败。详细的代理行为、版本要求与
+恢复见 `RELEASING.md`。Sparkle 私钥只保存在发行 Mac 的 Keychain；仓库和 App 内只有公钥。
 
 DMG 可以原样发给所有人，包内没有设备 Token。邀请码只显示一次；同一个邀请码只允许第一台
 设备认领，但第一台设备在服务器已提交、响应却丢失时可以用本机尚未提交的 Keychain Token

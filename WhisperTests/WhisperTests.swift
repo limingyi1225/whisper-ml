@@ -1,8 +1,85 @@
 import DictationKit
 import AppKit
 import Foundation
+import Sparkle
 import Testing
 @testable import Whisper
+
+// MARK: - Software updates
+
+@Suite struct UpdateConfigurationTests {
+    @Test func updateFeedIsSecureAndArchivesRequireTheExpectedSigningKey() {
+        let info = Bundle.main.infoDictionary
+        let feedURL = (info?["SUFeedURL"] as? String).flatMap(URL.init(string:))
+
+        #expect(feedURL?.scheme == "https")
+        #expect(feedURL?.host == "raw.githubusercontent.com")
+        #expect(feedURL?.path == "/limingyi1225/whisper-ml/main/updates/appcast.xml")
+        #expect((info?["SUPublicEDKey"] as? String)?.isEmpty == false)
+        #expect(info?["SURequireSignedFeed"] as? Bool == true)
+        #expect(info?["SUVerifyUpdateBeforeExtraction"] as? Bool == true)
+        #expect(info?["SUEnableAutomaticChecks"] as? Bool == false)
+        #expect(info?["SUAutomaticallyUpdate"] as? Bool == false)
+    }
+
+    @Test func updateVersionsAreMachineComparable() {
+        let info = Bundle.main.infoDictionary
+        let shortVersion = info?["CFBundleShortVersionString"] as? String
+        let buildVersion = info?["CFBundleVersion"] as? String
+
+        #expect(shortVersion?.isEmpty == false)
+        #expect(buildVersion?.allSatisfy(\.isNumber) == true)
+    }
+
+    @Test func unavailableFeedErrorsAreActionableAndLocalized() {
+        #expect(AppUpdater.feedErrorMessage(statusCode: 404) == "更新源尚未发布")
+        #expect(AppUpdater.feedErrorMessage(statusCode: 503) == "暂时无法连接更新服务器")
+        #expect(AppUpdater.feedErrorMessage(statusCode: nil) == "暂时无法连接更新服务器")
+        #expect(AppUpdater.updateErrorMessage(
+            NSError(domain: "SUSparkleErrorDomain", code: 1001)
+        ) == "已是最新版本")
+    }
+
+    @Test func noUpdateReasonsDistinguishCurrentFromIncompatible() {
+        #expect(AppUpdater.noUpdateState(noUpdateError(.onLatestVersion)) == .upToDate)
+        #expect(AppUpdater.noUpdateState(noUpdateError(.onNewerThanLatestVersion)) == .upToDate)
+        #expect(AppUpdater.noUpdateState(noUpdateError(.systemIsTooOld)) ==
+            .failure("有新版本，但需要更高版本的 macOS"))
+        #expect(AppUpdater.noUpdateState(noUpdateError(.systemIsTooNew)) ==
+            .failure("新版本暂不支持当前 macOS"))
+        #expect(AppUpdater.noUpdateState(noUpdateError(.hardwareDoesNotSupportARM64)) ==
+            .failure("新版本不支持这台 Mac"))
+        #expect(AppUpdater.noUpdateState(NSError(domain: "unexpected", code: 1)) ==
+            .failure("检查更新失败，请稍后重试"))
+    }
+
+    @Test func onlyTheExplicitSettingsProbeMayDriveInlineStateAndPresentation() {
+        #expect(AppUpdater.shouldFinishManualProbe(
+            .updateInformation,
+            manualProbeInProgress: true
+        ))
+        #expect(!AppUpdater.shouldFinishManualProbe(
+            .updatesInBackground,
+            manualProbeInProgress: true
+        ))
+        #expect(!AppUpdater.shouldFinishManualProbe(
+            .updates,
+            manualProbeInProgress: true
+        ))
+        #expect(!AppUpdater.shouldFinishManualProbe(
+            .updateInformation,
+            manualProbeInProgress: false
+        ))
+    }
+
+    private func noUpdateError(_ reason: SPUNoUpdateFoundReason) -> NSError {
+        NSError(
+            domain: SUSparkleErrorDomain,
+            code: Int(SUError.noUpdateError.rawValue),
+            userInfo: [SPUNoUpdateFoundReasonKey: NSNumber(value: reason.rawValue)]
+        )
+    }
+}
 
 // MARK: - Focus-aware HUD visibility
 

@@ -17,7 +17,7 @@ struct WhisperApp: App {
         }
 
         Settings {
-            SettingsView(controller: controller)
+            SettingsView(controller: controller, updater: appDelegate.updater)
         }
         .windowResizability(.contentSize)
     }
@@ -57,6 +57,7 @@ enum InviteEnrollmentOnboarding {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let updater = AppUpdater()
     private let focusedInputMonitor = FocusedInputMonitor()
     private var windowCloseObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
@@ -80,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("XCTest") }) {
             return
         }
+        updater.start()
         // Before `controller.start()`, which opens the socket: a personalised build
         // should come up already connected rather than showing 「还没有设置设备 Token」
         // and reconnecting a moment later. No-op in an ordinary build.

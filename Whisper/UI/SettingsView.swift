@@ -6,6 +6,7 @@ import SwiftUI
 
 struct SettingsView: View {
     let controller: DictationController
+    let updater: AppUpdater
     @State private var selectedTab = InviteEnrollmentOnboarding.shouldPresentInvite(
         inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
         hasRelayToken: KeychainStore.hasRelayToken(),
@@ -24,12 +25,11 @@ struct SettingsView: View {
             DictationSettingsTab(controller: controller)
                 .tabItem { Label("听写", systemImage: "waveform") }
                 .tag(SettingsTab.dictation)
-            SetupSettingsTab(controller: controller)
+            SetupSettingsTab(controller: controller, updater: updater)
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(SettingsTab.setup)
         }
-        .frame(width: 500, height: selectedTab == .dictation ? 600 : 280)
-        .animation(.snappy(duration: 0.2), value: selectedTab)
+        .frame(width: 500, height: 600)
     }
 }
 
@@ -271,6 +271,7 @@ private struct WrappingFlowLayout: Layout {
 
 private struct SetupSettingsTab: View {
     let controller: DictationController
+    let updater: AppUpdater
 
     @Bindable private var settings = AppSettings.shared
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -332,6 +333,8 @@ private struct SetupSettingsTab: View {
             case .relay:
                 Section("代理") { relayCredentialEditor }
             }
+
+            UpdateSettingsSection(updater: updater)
         }
         .formStyle(.grouped)
         .defaultScrollAnchor(.top)
@@ -592,6 +595,67 @@ private struct SetupSettingsTab: View {
         } catch {
             launchAtLogin = SMAppService.mainApp.status == .enabled
             launchAtLoginError = "设置失败：\(error.localizedDescription)"
+        }
+    }
+}
+
+private struct UpdateSettingsSection: View {
+    @ObservedObject var updater: AppUpdater
+
+    var body: some View {
+        Section("软件更新") {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Whisper \(AppUpdater.displayVersion)")
+
+                    statusView
+                        .frame(height: 16, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button("检查更新", action: updater.checkForUpdates)
+                    .controlSize(.small)
+                    .disabled(!updater.canCheckForUpdates || updater.isCheckingForUpdates)
+            }
+
+            Toggle(
+                isOn: Binding(
+                    get: { updater.automaticUpdatesEnabled },
+                    set: updater.setAutomaticUpdatesEnabled
+                )
+            ) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动更新")
+                    Text("定期检查，并自动下载和安装新版本")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusView: some View {
+        switch updater.checkState {
+        case .idle:
+            Text("当前版本")
+                .foregroundStyle(.secondary)
+        case .checking:
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("正在检查…")
+            }
+            .foregroundStyle(.secondary)
+        case .upToDate:
+            Label("已是最新版本", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Color.green)
+        case .updateAvailable:
+            Label("发现新版本", systemImage: "arrow.down.circle.fill")
+                .foregroundStyle(Color.accentColor)
+        case let .failure(message):
+            Label(message, systemImage: "exclamationmark.circle.fill")
+                .foregroundStyle(Color.red)
         }
     }
 }
