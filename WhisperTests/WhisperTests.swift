@@ -72,6 +72,23 @@ import Testing
         ))
     }
 
+    @Test @MainActor func preparedUpdateCanDriveTheSharedRestartAction() {
+        let updater = AppUpdater()
+        var installationWasRequested = false
+
+        updater.prepareUpdateForTesting(version: "2.0") {
+            installationWasRequested = true
+        }
+
+        #expect(updater.preparedUpdateVersion == "2.0")
+        #expect(!updater.isInstallingPreparedUpdate)
+
+        updater.installPreparedUpdate()
+
+        #expect(installationWasRequested)
+        #expect(updater.isInstallingPreparedUpdate)
+    }
+
     private func noUpdateError(_ reason: SPUNoUpdateFoundReason) -> NSError {
         NSError(
             domain: SUSparkleErrorDomain,

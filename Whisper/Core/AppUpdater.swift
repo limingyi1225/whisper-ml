@@ -19,6 +19,8 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     @Published private(set) var automaticallyDownloadsUpdates = false
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var checkState: CheckState = .idle
+    @Published private(set) var preparedUpdateVersion: String?
+    @Published private(set) var isInstallingPreparedUpdate = false
 
     private lazy var controller = SPUStandardUpdaterController(
         startingUpdater: false,
@@ -28,6 +30,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     private var observations: Set<AnyCancellable> = []
     private var manualProbeInProgress = false
     private var manualProbeFoundUpdate = false
+    private var immediateInstallationHandler: (() -> Void)?
 
     override init() {
         super.init()
@@ -69,6 +72,12 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
 
     func start() {
         controller.startUpdater()
+
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--preview-update-ready") {
+            prepareUpdateForTesting(version: "1.3") {}
+        }
+#endif
     }
 
     func checkForUpdates() {
@@ -146,6 +155,16 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         }
     }
 
+    /// Installs the update Sparkle has already downloaded and verified. Keeping the
+    /// handler owned here lets the menu and Settings share one explicit action without
+    /// opening Sparkle's modal update window.
+    func installPreparedUpdate() {
+        guard !isInstallingPreparedUpdate,
+              let immediateInstallationHandler else { return }
+        isInstallingPreparedUpdate = true
+        immediateInstallationHandler()
+    }
+
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         guard manualProbeInProgress else { return }
         checkState = .updateAvailable
@@ -176,6 +195,28 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
             checkState = .failure(Self.updateErrorMessage(error))
         }
     }
+
+    func updater(
+        _ updater: SPUUpdater,
+        willInstallUpdateOnQuit item: SUAppcastItem,
+        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
+    ) -> Bool {
+        preparedUpdateVersion = item.displayVersionString
+        immediateInstallationHandler = immediateInstallHandler
+
+        // We now own the immediate-install opportunity. Sparkle still installs on a
+        // normal quit, while our persistent menu/Settings affordance can invoke this
+        // handler to install and relaunch without presenting its modal update window.
+        return true
+    }
+
+#if DEBUG
+    func prepareUpdateForTesting(version: String, handler: @escaping () -> Void) {
+        preparedUpdateVersion = version
+        immediateInstallationHandler = handler
+        isInstallingPreparedUpdate = false
+    }
+#endif
 
     static var displayVersion: String {
         let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")

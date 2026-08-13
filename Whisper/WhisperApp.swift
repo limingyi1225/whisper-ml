@@ -11,9 +11,9 @@ struct WhisperApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(controller: controller)
+            MenuBarView(controller: controller, updater: appDelegate.updater)
         } label: {
-            MenuBarLabel(controller: controller)
+            MenuBarLabel(controller: controller, updater: appDelegate.updater)
         }
 
         Settings {

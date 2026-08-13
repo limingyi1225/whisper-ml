@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuBarLabel: View {
     let controller: DictationController
+    @ObservedObject var updater: AppUpdater
     @Environment(\.openSettings) private var openSettings
     @AppStorage("didPresentInviteEnrollment") private var didPresentInviteEnrollment = false
 
@@ -32,6 +33,14 @@ struct MenuBarLabel: View {
             if case .error = controller.phase {
                 Circle()
                     .fill(Color.red)
+                    .frame(width: 5, height: 5)
+                    .overlay {
+                        Circle().stroke(.background, lineWidth: 1)
+                    }
+                    .offset(x: 1, y: 1)
+            } else if updater.preparedUpdateVersion != nil {
+                Circle()
+                    .fill(Color.accentColor)
                     .frame(width: 5, height: 5)
                     .overlay {
                         Circle().stroke(.background, lineWidth: 1)
@@ -98,6 +107,9 @@ struct MenuBarLabel: View {
     }
 
     private var accessibilityLabel: String {
+        if let version = updater.preparedUpdateVersion {
+            return "Whisper \(version) 已下载，可以重启更新"
+        }
         switch controller.phase {
         case .recording: return "Whisper 正在录音"
         case .finalizing: return controller.isPolishing ? "Whisper 正在整理" : "Whisper 正在转写"
@@ -111,9 +123,26 @@ struct MenuBarLabel: View {
 
 struct MenuBarView: View {
     let controller: DictationController
+    @ObservedObject var updater: AppUpdater
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
+        if let version = updater.preparedUpdateVersion {
+            Button {
+                updater.installPreparedUpdate()
+            } label: {
+                Label(
+                    updater.isInstallingPreparedUpdate
+                        ? "正在重启…"
+                        : "重启并更新到 \(version)",
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+            }
+            .disabled(!canRestartForUpdate || updater.isInstallingPreparedUpdate)
+
+            Divider()
+        }
+
         if let contextualStatus {
             Text(contextualStatus)
         }
@@ -187,6 +216,15 @@ struct MenuBarView: View {
             case .disconnected: return "未连接"
             case .failed(let message): return "连接失败：\(DictationController.friendlyMessage(message))"
             }
+        }
+    }
+
+    private var canRestartForUpdate: Bool {
+        switch controller.phase {
+        case .recording, .finalizing, .arming:
+            return false
+        case .idle, .error:
+            return true
         }
     }
 

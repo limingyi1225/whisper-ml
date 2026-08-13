@@ -334,7 +334,7 @@ private struct SetupSettingsTab: View {
                 Section("代理") { relayCredentialEditor }
             }
 
-            UpdateSettingsSection(updater: updater)
+            UpdateSettingsSection(controller: controller, updater: updater)
         }
         .formStyle(.grouped)
         .defaultScrollAnchor(.top)
@@ -600,6 +600,7 @@ private struct SetupSettingsTab: View {
 }
 
 private struct UpdateSettingsSection: View {
+    let controller: DictationController
     @ObservedObject var updater: AppUpdater
 
     var body: some View {
@@ -613,9 +614,18 @@ private struct UpdateSettingsSection: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                Button("检查更新", action: updater.checkForUpdates)
+                if updater.preparedUpdateVersion != nil {
+                    Button(
+                        updater.isInstallingPreparedUpdate ? "正在重启…" : "重启并更新",
+                        action: updater.installPreparedUpdate
+                    )
                     .controlSize(.small)
-                    .disabled(!updater.canCheckForUpdates || updater.isCheckingForUpdates)
+                    .disabled(!canRestartForUpdate || updater.isInstallingPreparedUpdate)
+                } else {
+                    Button("检查更新", action: updater.checkForUpdates)
+                        .controlSize(.small)
+                        .disabled(!updater.canCheckForUpdates || updater.isCheckingForUpdates)
+                }
             }
 
             Toggle(
@@ -626,7 +636,7 @@ private struct UpdateSettingsSection: View {
             ) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("自动更新")
-                    Text("定期检查，并自动下载和安装新版本")
+                    Text("每天静默检查；下载后退出时自动安装")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -636,6 +646,16 @@ private struct UpdateSettingsSection: View {
 
     @ViewBuilder
     private var statusView: some View {
+        if let version = updater.preparedUpdateVersion {
+            Label("版本 \(version) 已下载，等待安装", systemImage: "arrow.down.circle.fill")
+                .foregroundStyle(Color.accentColor)
+        } else {
+            checkStatusView
+        }
+    }
+
+    @ViewBuilder
+    private var checkStatusView: some View {
         switch updater.checkState {
         case .idle:
             Text("当前版本")
@@ -656,6 +676,15 @@ private struct UpdateSettingsSection: View {
         case let .failure(message):
             Label(message, systemImage: "exclamationmark.circle.fill")
                 .foregroundStyle(Color.red)
+        }
+    }
+
+    private var canRestartForUpdate: Bool {
+        switch controller.phase {
+        case .recording, .finalizing, .arming:
+            return false
+        case .idle, .error:
+            return true
         }
     }
 }
