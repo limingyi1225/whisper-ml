@@ -301,9 +301,9 @@ private struct PolishPill: View {
     private static let light: CGFloat = 22
     private static let point: CGFloat = 8
     private static let period: Double = 1.05
-    private static let gather: Double = 0.25
-    private static let holdUntil: Double = 0.75
-    private static let release: Double = 0.45
+    private static let gather: Double = 0.20
+    private static let holdUntil: Double = 0.45
+    private static let release: Double = 0.35
 
     @State private var start = Date()
 

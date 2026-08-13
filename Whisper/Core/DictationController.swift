@@ -975,9 +975,9 @@ final class DictationController {
         settleEpoch += 1
         let epoch = settleEpoch
         settledAt = Date()
-        // 0.25 s gather + 0.5 s hold + 0.45 s release.
+        // 0.2 s gather + 0.25 s hold + 0.35 s release.
         log.info("cleanup settled; holding the mark")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.settleEpoch == epoch else { return }
                 self.settledAt = nil
