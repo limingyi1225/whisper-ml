@@ -143,6 +143,7 @@ npm start
 通用版从 1.1 开始内置 Sparkle 2 更新。完整发布统一使用：
 
 ```bash
+./script/bump_update_version.sh                       # 自动准备下一个版本号 / build
 ./script/publish_update.sh path/to/release-notes.md   # release notes 可省略
 ```
 

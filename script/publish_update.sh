@@ -13,6 +13,7 @@ BRANCH="main"
 LIVE_APPCAST="$ROOT_DIR/updates/appcast.xml"
 LIVE_APPCAST_RELATIVE="updates/appcast.xml"
 NOTES_FILE="${1:-}"
+SKIP_LOCAL_INSTALL="${WHISPER_SKIP_LOCAL_INSTALL:-0}"
 
 if [ "$#" -gt 1 ] || { [ -n "$NOTES_FILE" ] && [ ! -f "$NOTES_FILE" ]; }; then
   echo "usage: $0 [release-notes.md]" >&2
@@ -21,6 +22,10 @@ fi
 if [ -n "$NOTES_FILE" ]; then
   NOTES_FILE="$(cd "$(dirname "$NOTES_FILE")" && pwd)/$(basename "$NOTES_FILE")"
 fi
+case "$SKIP_LOCAL_INSTALL" in
+  0|1) ;;
+  *) echo "!! WHISPER_SKIP_LOCAL_INSTALL must be 0 or 1" >&2; exit 2 ;;
+esac
 
 for command in git gh curl xmllint; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -369,8 +374,12 @@ assert_release_checkout_unchanged
 echo "==> verifying public download"
 curl -fsSL --max-time 60 --range 0-0 --output /dev/null "$EXPECTED_URL"
 
-echo "==> installing the released source locally"
-"$SOURCE_WORKTREE/script/install_local.sh"
+if [ "$SKIP_LOCAL_INSTALL" -eq 1 ]; then
+  echo "==> preserving the installed app for automatic-update testing"
+else
+  echo "==> installing the released source locally"
+  "$SOURCE_WORKTREE/script/install_local.sh"
+fi
 
 echo "==> publishing signed appcast last"
 assert_release_checkout_unchanged

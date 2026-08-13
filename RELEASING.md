@@ -12,9 +12,9 @@ authorize including unrelated local changes.
 1. Inspect `git status`, staged/unstaged/untracked changes, and the diff. Separate unrelated
    user work rather than sweeping it into the release.
 2. Run the relevant tests and release checks.
-3. Check `updates/appcast.xml`. If the current `MARKETING_VERSION` or
-   `CURRENT_PROJECT_VERSION` was already published, increment both in the Whisper target.
-   Version choice is a product decision; do not silently reuse a published version.
+3. Run `./script/bump_update_version.sh`. It increments both version fields when the current
+   pair is already published, and safely does nothing when an unpublished pair was already
+   prepared. Check `updates/appcast.xml`; never reuse a published version/build.
 4. Commit only the intended release changes on `main`. The publishing script deliberately
    refuses a dirty worktree.
 5. Run:
@@ -24,6 +24,10 @@ authorize including unrelated local changes.
    ```
 
    The notes argument is optional. Without it, GitHub generates release notes.
+   When the user explicitly wants to keep the currently installed older version to test
+   Sparkle's real automatic-update path, use
+   `WHISPER_SKIP_LOCAL_INSTALL=1 ./script/publish_update.sh`. This is the only exception
+   to local replacement; verify and report that the old installed version remains.
 6. Report the version/build, GitHub Release URL, appcast URL, test results, installed
    `/Applications/Whisper.app` status, and raw CDN propagation result. Do not claim success
    unless the release asset, authoritative appcast commit, and local process were verified;

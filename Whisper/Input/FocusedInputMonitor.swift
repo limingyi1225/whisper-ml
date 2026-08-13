@@ -432,6 +432,7 @@ final class FocusedInputMonitor {
         bundleIdentifier == "com.tencent.xinWeChat"
             || bundleIdentifier == "com.microsoft.Powerpoint"
             || bundleIdentifier == "com.anthropic.claudefordesktop"
+            || bundleIdentifier == "com.openai.codex"
             || bundleIdentifier == "com.apple.Safari"
     }
 

@@ -204,6 +204,9 @@ import Testing
             bundleIdentifier: "com.anthropic.claudefordesktop"
         ))
         #expect(FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.openai.codex"
+        ))
+        #expect(FocusedInputMonitor.usesAppWideInputFallback(
             bundleIdentifier: "com.apple.Safari"
         ))
         #expect(!FocusedInputMonitor.usesAppWideInputFallback(
