@@ -126,6 +126,9 @@ import Testing
         #expect(FocusedInputMonitor.usesAppWideInputFallback(
             bundleIdentifier: "com.anthropic.claudefordesktop"
         ))
+        #expect(FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.apple.Safari"
+        ))
         #expect(!FocusedInputMonitor.usesAppWideInputFallback(
             bundleIdentifier: "com.microsoft.Word"
         ))
