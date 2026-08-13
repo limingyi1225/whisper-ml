@@ -4,6 +4,178 @@ import Foundation
 import Testing
 @testable import Whisper
 
+// MARK: - Focus-aware HUD visibility
+
+@Suite struct FocusedInputTests {
+    @Test func recognizesEditableTextControls() {
+        #expect(FocusedInputMonitor.isEditableText(
+            role: kAXTextFieldRole as String,
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: false
+        ))
+        #expect(FocusedInputMonitor.isEditableText(
+            role: kAXTextAreaRole as String,
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: false,
+            selectionIsSettable: true
+        ))
+        #expect(FocusedInputMonitor.isEditableText(
+            role: "AXWebArea",
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: false
+        ))
+    }
+
+    @Test func rejectsReadOnlyDisabledAndSecureText() {
+        #expect(!FocusedInputMonitor.isEditableText(
+            role: kAXStaticTextRole as String,
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: false,
+            selectionIsSettable: true
+        ))
+        #expect(!FocusedInputMonitor.isEditableText(
+            role: kAXTextFieldRole as String,
+            subrole: nil,
+            enabled: false,
+            valueIsSettable: false,
+            selectionIsSettable: false
+        ))
+        #expect(!FocusedInputMonitor.isEditableText(
+            role: kAXTextFieldRole as String,
+            subrole: kAXSecureTextFieldSubrole as String,
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: true
+        ))
+        #expect(!FocusedInputMonitor.isEditableText(
+            role: kAXSliderRole as String,
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: false
+        ))
+        #expect(!FocusedInputMonitor.isEditableText(
+            role: kAXGroupRole as String,
+            subrole: nil,
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: true
+        ))
+    }
+
+    @Test func recognizesWritableTextWhenWordMisreportsDisabled() {
+        #expect(FocusedInputMonitor.isEditableText(
+            role: kAXTextAreaRole as String,
+            subrole: nil,
+            enabled: false,
+            valueIsSettable: true,
+            selectionIsSettable: true
+        ))
+    }
+
+    @Test func onlyContainersCanSearchForNestedEditors() {
+        #expect(FocusedInputMonitor.shouldSearchEditableDescendants(
+            of: kAXSplitGroupRole as String
+        ))
+        #expect(FocusedInputMonitor.shouldSearchEditableDescendants(
+            of: kAXScrollAreaRole as String
+        ))
+        #expect(FocusedInputMonitor.shouldSearchEditableDescendants(
+            of: "AXLayoutItem"
+        ))
+        #expect(!FocusedInputMonitor.shouldSearchEditableDescendants(
+            of: kAXButtonRole as String
+        ))
+        #expect(!FocusedInputMonitor.shouldSearchEditableDescendants(
+            of: kAXStaticTextRole as String
+        ))
+    }
+
+    @Test func officeEditModeKeysTriggerFocusRechecksWithoutPollingOrdinaryTyping() {
+        #expect(FocusedInputMonitor.shouldRefreshAfterKeyDown(
+            keyCode: 0,
+            hasFocusedEditableInput: false
+        ))
+        #expect(FocusedInputMonitor.shouldRefreshAfterKeyDown(
+            keyCode: 53,
+            hasFocusedEditableInput: true
+        ))
+        #expect(FocusedInputMonitor.shouldRefreshAfterKeyDown(
+            keyCode: 120,
+            hasFocusedEditableInput: true
+        ))
+        #expect(!FocusedInputMonitor.shouldRefreshAfterKeyDown(
+            keyCode: 0,
+            hasFocusedEditableInput: true
+        ))
+    }
+
+    @Test func opaqueEditorsUseAnExplicitAppWideFallback() {
+        #expect(FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.microsoft.Powerpoint"
+        ))
+        #expect(FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.tencent.xinWeChat"
+        ))
+        #expect(FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.anthropic.claudefordesktop"
+        ))
+        #expect(!FocusedInputMonitor.usesAppWideInputFallback(
+            bundleIdentifier: "com.microsoft.Word"
+        ))
+        #expect(!FocusedInputMonitor.usesAppWideInputFallback(bundleIdentifier: nil))
+    }
+
+    @Test func notificationObserversStillReceivePeriodicHealthProbes() {
+        #expect(FocusedInputMonitor.shouldRunHealthProbe(
+            receivesFocusNotifications: false,
+            healthTick: 1
+        ))
+        #expect(!FocusedInputMonitor.shouldRunHealthProbe(
+            receivesFocusNotifications: true,
+            healthTick: 1
+        ))
+        #expect(FocusedInputMonitor.shouldRunHealthProbe(
+            receivesFocusNotifications: true,
+            healthTick: 2
+        ))
+    }
+
+    @Test func idleFollowsFocusWhileActiveStatesStayVisible() {
+        #expect(!RecordingHUDController.shouldShow(
+            phase: .idle,
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: false
+        ))
+        #expect(RecordingHUDController.shouldShow(
+            phase: .idle,
+            hasFocusedEditableInput: true,
+            isShowingSettledMark: false
+        ))
+        #expect(RecordingHUDController.shouldShow(
+            phase: .recording,
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: false
+        ))
+        #expect(RecordingHUDController.shouldShow(
+            phase: .idle,
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: true
+        ))
+        #expect(RecordingHUDController.shouldShow(
+            phase: .error("test"),
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: false
+        ))
+    }
+}
+
 // MARK: - Transcript normalization
 
 @Suite struct NormalizeLeadingSpaceTests {

@@ -24,6 +24,7 @@ struct WhisperApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let focusedInputMonitor = FocusedInputMonitor()
     private var windowCloseObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
     private var workspaceWakeObserver: NSObjectProtocol?
@@ -85,6 +86,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Permissions.promptForAccessibility()
         }
 
+        focusedInputMonitor.onChange = { [weak self, weak controller] _ in
+            guard let self, let controller else { return }
+            self.updateHUD(controller)
+        }
+        focusedInputMonitor.start()
         observeHUD(controller)
     }
 
@@ -155,16 +161,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The pill sits at the bottom of the screen permanently; re-fronting it on every
-    /// phase change keeps it above whatever appeared since. Which screen it lives on
-    /// is driven by the hotkey's `.armed` event in `DictationController` — queued
-    /// gestures never pass through `.arming`, so a phase observer cannot see them.
+    /// Idle visibility follows editable keyboard focus. Once a dictation starts, the
+    /// pill remains visible until its final result/error/settled mark has completed,
+    /// even if focus moves during the asynchronous tail of the utterance.
     private func observeHUD(_ controller: DictationController) {
         updateHUD(controller)
 
         func track() {
             withObservationTracking {
                 _ = controller.phase
+                _ = controller.settledAt
             } onChange: { [weak self] in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
@@ -179,10 +185,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateHUD(_ controller: DictationController) {
-        RecordingHUDController.shared.show()
+        let shouldShow = RecordingHUDController.shouldShow(
+            phase: controller.phase,
+            hasFocusedEditableInput: focusedInputMonitor.hasFocusedEditableInput,
+            isShowingSettledMark: controller.settledAt != nil
+        )
+        if shouldShow {
+            RecordingHUDController.shared.show()
+        } else {
+            RecordingHUDController.shared.hide()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        focusedInputMonitor.stop()
         if let windowCloseObserver {
             NotificationCenter.default.removeObserver(windowCloseObserver)
         }
