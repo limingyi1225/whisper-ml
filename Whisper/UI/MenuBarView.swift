@@ -38,7 +38,7 @@ struct MenuBarLabel: View {
                         Circle().stroke(.background, lineWidth: 1)
                     }
                     .offset(x: 1, y: 1)
-            } else if updater.preparedUpdateVersion != nil {
+            } else if updater.availableUpdateVersion != nil {
                 Circle()
                     .fill(Color.accentColor)
                     .frame(width: 5, height: 5)
@@ -110,6 +110,11 @@ struct MenuBarLabel: View {
         if let version = updater.preparedUpdateVersion {
             return "Whisper \(version) 已下载，可以重启更新"
         }
+        if let version = updater.availableUpdateVersion {
+            return updater.isDownloadingUpdate
+                ? "Whisper \(version) 正在下载"
+                : "Whisper \(version) 可以更新"
+        }
         switch controller.phase {
         case .recording: return "Whisper 正在录音"
         case .finalizing: return controller.isPolishing ? "Whisper 正在整理" : "Whisper 正在转写"
@@ -139,6 +144,20 @@ struct MenuBarView: View {
                 )
             }
             .disabled(!canRestartForUpdate || updater.isInstallingPreparedUpdate)
+
+            Divider()
+        } else if let version = updater.availableUpdateVersion {
+            Button {
+                updater.installAvailableUpdate()
+            } label: {
+                Label(
+                    updater.isDownloadingUpdate
+                        ? "正在下载更新…"
+                        : "立即更新到 \(version)",
+                    systemImage: "arrow.down.circle"
+                )
+            }
+            .disabled(!canRestartForUpdate || updater.isDownloadingUpdate)
 
             Divider()
         }

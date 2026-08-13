@@ -619,6 +619,13 @@ private struct UpdateSettingsSection: View {
                     )
                     .controlSize(.small)
                     .disabled(!canRestartForUpdate || updater.isInstallingPreparedUpdate)
+                } else if updater.availableUpdateVersion != nil {
+                    Button(
+                        updater.isDownloadingUpdate ? "正在下载…" : "立即更新",
+                        action: updater.installAvailableUpdate
+                    )
+                    .controlSize(.small)
+                    .disabled(!canRestartForUpdate || updater.isDownloadingUpdate)
                 } else {
                     Button("检查更新", action: updater.checkForUpdates)
                         .controlSize(.small)
@@ -633,8 +640,8 @@ private struct UpdateSettingsSection: View {
                 )
             ) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("自动更新")
-                    Text("每天静默检查；下载后退出时自动安装")
+                    Text("自动检查更新")
+                    Text("每天自动检查；发现更新时弹窗提醒")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -647,6 +654,19 @@ private struct UpdateSettingsSection: View {
         if let version = updater.preparedUpdateVersion {
             Label("版本 \(version) 已下载，等待安装", systemImage: "arrow.down.circle.fill")
                 .foregroundStyle(Color.accentColor)
+        } else if let version = updater.availableUpdateVersion, updater.isDownloadingUpdate {
+            HStack(spacing: 5) {
+                if let progress = updater.downloadProgress {
+                    ProgressView(value: progress)
+                        .frame(width: 54)
+                    Text("正在下载版本 \(version)…")
+                } else {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("正在准备版本 \(version)…")
+                }
+            }
+            .foregroundStyle(Color.accentColor)
         } else {
             checkStatusView
         }

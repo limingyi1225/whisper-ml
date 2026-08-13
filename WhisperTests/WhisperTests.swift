@@ -89,6 +89,39 @@ import Testing
         #expect(updater.isInstallingPreparedUpdate)
     }
 
+    @Test @MainActor func availableUpdateStartsWithoutASecondUpdateWindow() {
+        let updater = AppUpdater()
+        var downloadWasRequested = false
+
+        updater.makeUpdateAvailableForTesting(version: "2.0") {
+            downloadWasRequested = true
+        }
+
+        #expect(updater.availableUpdateVersion == "2.0")
+        #expect(updater.preparedUpdateVersion == nil)
+        #expect(!updater.isDownloadingUpdate)
+
+        updater.installAvailableUpdate()
+
+        #expect(downloadWasRequested)
+        #expect(updater.isDownloadingUpdate)
+    }
+
+    @Test @MainActor func downloadProgressIsBounded() {
+        let updater = AppUpdater()
+        updater.makeUpdateAvailableForTesting(version: "2.0") {}
+
+        updater.updateDownloadProgressForTesting(expected: 100, received: [30, 90])
+
+        #expect(updater.isDownloadingUpdate)
+        #expect(updater.downloadProgress == 1)
+    }
+
+    @Test @MainActor func onlyAutomaticUpdatesUseSparklesNativeWindow() {
+        #expect(!AppUpdater.shouldUseStandardUI(userInitiated: true))
+        #expect(AppUpdater.shouldUseStandardUI(userInitiated: false))
+    }
+
     private func noUpdateError(_ reason: SPUNoUpdateFoundReason) -> NSError {
         NSError(
             domain: SUSparkleErrorDomain,

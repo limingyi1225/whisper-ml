@@ -16,36 +16,42 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
 
     @Published private(set) var canCheckForUpdates = false
     @Published private(set) var automaticallyChecksForUpdates = false
-    @Published private(set) var automaticallyDownloadsUpdates = false
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var checkState: CheckState = .idle
+    @Published private(set) var availableUpdateVersion: String?
+    @Published private(set) var isDownloadingUpdate = false
+    @Published private(set) var downloadProgress: Double?
     @Published private(set) var preparedUpdateVersion: String?
     @Published private(set) var isInstallingPreparedUpdate = false
 
-    private lazy var controller = SPUStandardUpdaterController(
-        startingUpdater: false,
-        updaterDelegate: self,
-        userDriverDelegate: nil
+    private lazy var userDriver = InlineUpdateUserDriver(owner: self)
+    private lazy var updater = SPUUpdater(
+        hostBundle: Bundle.main,
+        applicationBundle: Bundle.main,
+        userDriver: userDriver,
+        delegate: self
     )
     private var observations: Set<AnyCancellable> = []
     private var manualProbeInProgress = false
     private var manualProbeFoundUpdate = false
+    private var beginAvailableUpdateHandler: (() -> Void)?
+    private var installWhenUserDriverFindsUpdate = false
     private var immediateInstallationHandler: (() -> Void)?
+    private var expectedDownloadLength: UInt64?
+    private var receivedDownloadLength: UInt64 = 0
 
     override init() {
         super.init()
-        automaticallyChecksForUpdates = controller.updater.automaticallyChecksForUpdates
-        automaticallyDownloadsUpdates = controller.updater.automaticallyDownloadsUpdates
-
-        // Older builds exposed these as two separate switches. The merged control
-        // follows the user's automatic-install choice and quietly brings checking
-        // into the same state, so an existing preference cannot appear half-on.
-        if automaticallyChecksForUpdates != automaticallyDownloadsUpdates {
-            controller.updater.automaticallyChecksForUpdates = automaticallyDownloadsUpdates
-            automaticallyChecksForUpdates = automaticallyDownloadsUpdates
+        automaticallyChecksForUpdates = updater.automaticallyChecksForUpdates
+        // Automatic checks must reach the standard user driver so they can alert a
+        // user who is not looking at Settings. Sparkle's automatic-download mode is
+        // deliberately disabled because it silently stages an install-on-quit update
+        // instead of reliably presenting that window.
+        if updater.automaticallyDownloadsUpdates {
+            updater.automaticallyDownloadsUpdates = false
         }
 
-        controller.updater
+        updater
             .publisher(for: \.canCheckForUpdates)
             .receive(on: RunLoop.main)
             .sink { [weak self] canCheck in
@@ -53,25 +59,21 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
             }
             .store(in: &observations)
 
-        controller.updater
+        updater
             .publisher(for: \.automaticallyChecksForUpdates)
             .receive(on: RunLoop.main)
             .sink { [weak self] enabled in
                 self?.automaticallyChecksForUpdates = enabled
             }
             .store(in: &observations)
-
-        controller.updater
-            .publisher(for: \.automaticallyDownloadsUpdates)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] enabled in
-                self?.automaticallyDownloadsUpdates = enabled
-            }
-            .store(in: &observations)
     }
 
     func start() {
-        controller.startUpdater()
+        do {
+            try updater.start()
+        } catch {
+            checkState = .failure("更新服务启动失败")
+        }
 
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--preview-update-ready") {
@@ -83,16 +85,11 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     func checkForUpdates() {
         guard !isCheckingForUpdates else { return }
 
-        // Sparkle intentionally reports that a user check is possible while its update
-        // window is visible: invoking the normal action focuses that existing window.
-        // An informational probe, on the other hand, is ignored during any active
-        // session and provides no completion callback, so never put our inline UI into
-        // a checking state in that case.
-        if controller.updater.sessionInProgress {
-            controller.checkForUpdates(nil)
-            return
-        }
-        guard controller.updater.canCheckForUpdates else { return }
+        // An informational probe is ignored during any active update session and
+        // provides no completion callback, so never put the inline UI into a checking
+        // state in that case. Active downloads have their own persistent state/action.
+        guard !updater.sessionInProgress else { return }
+        guard updater.canCheckForUpdates else { return }
         guard let feedURL = Self.feedURL else {
             checkState = .failure("更新源配置不正确")
             return
@@ -121,19 +118,19 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
                 // A scheduled check may have started while the network preflight was
                 // awaiting. Re-read Sparkle directly instead of trusting the KVO mirror,
                 // whose main-run-loop delivery can lag behind the real session state.
-                guard !controller.updater.sessionInProgress,
-                      controller.updater.canCheckForUpdates else {
+                guard !updater.sessionInProgress,
+                      updater.canCheckForUpdates else {
                     checkState = .idle
                     isCheckingForUpdates = false
                     return
                 }
 
                 // Probe first so the Settings row owns the "already up to date" and
-                // error states. Sparkle's standard UI is shown only when there is an
-                // update worth presenting.
+                // error states. Finding an update leaves one explicit action in our
+                // Settings and menu instead of opening a second Sparkle window.
                 manualProbeInProgress = true
                 manualProbeFoundUpdate = false
-                controller.updater.checkForUpdateInformation()
+                updater.checkForUpdateInformation()
             } catch {
                 checkState = .failure(Self.feedErrorMessage(statusCode: nil))
                 isCheckingForUpdates = false
@@ -142,16 +139,29 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     var automaticUpdatesEnabled: Bool {
-        automaticallyChecksForUpdates && automaticallyDownloadsUpdates
+        automaticallyChecksForUpdates
     }
 
     func setAutomaticUpdatesEnabled(_ enabled: Bool) {
-        if enabled {
-            controller.updater.automaticallyChecksForUpdates = true
-            controller.updater.automaticallyDownloadsUpdates = true
+        updater.automaticallyDownloadsUpdates = false
+        updater.automaticallyChecksForUpdates = enabled
+    }
+
+    /// Starts downloading the update already found by the informational probe.
+    /// The custom user driver answers Sparkle's ensuing install choice directly, so
+    /// one click begins the update without opening Sparkle's separate modal window.
+    func installAvailableUpdate() {
+        guard !isDownloadingUpdate, preparedUpdateVersion == nil,
+              availableUpdateVersion != nil else { return }
+
+        isDownloadingUpdate = true
+        downloadProgress = nil
+        if let beginAvailableUpdateHandler {
+            self.beginAvailableUpdateHandler = nil
+            beginAvailableUpdateHandler()
         } else {
-            controller.updater.automaticallyDownloadsUpdates = false
-            controller.updater.automaticallyChecksForUpdates = false
+            installWhenUserDriverFindsUpdate = true
+            updater.checkForUpdates()
         }
     }
 
@@ -166,9 +176,11 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        guard manualProbeInProgress else { return }
-        checkState = .updateAvailable
-        manualProbeFoundUpdate = true
+        if manualProbeInProgress {
+            availableUpdateVersion = item.displayVersionString
+            checkState = .updateAvailable
+            manualProbeFoundUpdate = true
+        }
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
@@ -190,33 +202,137 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         isCheckingForUpdates = false
         if manualProbeFoundUpdate {
             manualProbeFoundUpdate = false
-            controller.checkForUpdates(nil)
         } else if let error, checkState == .checking {
             checkState = .failure(Self.updateErrorMessage(error))
         }
     }
 
-    func updater(
-        _ updater: SPUUpdater,
-        willInstallUpdateOnQuit item: SUAppcastItem,
-        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
-    ) -> Bool {
-        preparedUpdateVersion = item.displayVersionString
-        immediateInstallationHandler = immediateInstallHandler
-
-        // We now own the immediate-install opportunity. Sparkle still installs on a
-        // normal quit, while our persistent menu/Settings affordance can invoke this
-        // handler to install and relaunch without presenting its modal update window.
-        return true
+#if DEBUG
+    func makeUpdateAvailableForTesting(version: String, handler: @escaping () -> Void) {
+        availableUpdateVersion = version
+        beginAvailableUpdateHandler = handler
+        isDownloadingUpdate = false
+        downloadProgress = nil
+        preparedUpdateVersion = nil
     }
 
-#if DEBUG
+    func updateDownloadProgressForTesting(expected: UInt64, received: [UInt64]) {
+        downloadDidStart()
+        downloadExpectedLength(expected)
+        for length in received { downloadReceived(length) }
+    }
+
     func prepareUpdateForTesting(version: String, handler: @escaping () -> Void) {
+        availableUpdateVersion = version
+        isDownloadingUpdate = false
+        downloadProgress = nil
         preparedUpdateVersion = version
         immediateInstallationHandler = handler
         isInstallingPreparedUpdate = false
     }
 #endif
+
+    // MARK: - Inline Sparkle user driver
+
+    fileprivate func userDriverFoundUpdate(
+        _ item: SUAppcastItem,
+        state: SPUUserUpdateState,
+        reply: @escaping (SPUUserUpdateChoice) -> Void
+    ) {
+        availableUpdateVersion = item.displayVersionString
+        checkState = .updateAvailable
+
+        if installWhenUserDriverFindsUpdate {
+            installWhenUserDriverFindsUpdate = false
+            beginAvailableUpdateHandler = nil
+            isDownloadingUpdate = true
+            reply(.install)
+        } else {
+            beginAvailableUpdateHandler = { reply(.install) }
+            isDownloadingUpdate = false
+        }
+    }
+
+    fileprivate func userDriverCheckStarted() {
+        if installWhenUserDriverFindsUpdate {
+            isDownloadingUpdate = true
+            downloadProgress = nil
+        }
+    }
+
+    fileprivate func userDriverDidNotFindUpdate(_ error: Error) {
+        clearAvailableUpdate()
+        checkState = Self.noUpdateState(error)
+    }
+
+    fileprivate func userDriverFailed(_ error: Error) {
+        installWhenUserDriverFindsUpdate = false
+        isDownloadingUpdate = false
+        downloadProgress = nil
+        checkState = .failure(Self.updateErrorMessage(error))
+    }
+
+    fileprivate func downloadDidStart() {
+        isDownloadingUpdate = true
+        expectedDownloadLength = nil
+        receivedDownloadLength = 0
+        downloadProgress = nil
+    }
+
+    fileprivate func downloadExpectedLength(_ length: UInt64) {
+        expectedDownloadLength = length > 0 ? length : nil
+        updateDownloadProgress()
+    }
+
+    fileprivate func downloadReceived(_ length: UInt64) {
+        receivedDownloadLength &+= length
+        updateDownloadProgress()
+    }
+
+    fileprivate func extractionDidStart() {
+        isDownloadingUpdate = true
+        downloadProgress = nil
+    }
+
+    fileprivate func readyToInstall(
+        _ reply: @escaping (SPUUserUpdateChoice) -> Void
+    ) {
+        isDownloadingUpdate = false
+        downloadProgress = nil
+        preparedUpdateVersion = availableUpdateVersion
+        immediateInstallationHandler = { reply(.install) }
+    }
+
+    fileprivate func installationDidStart() {
+        isInstallingPreparedUpdate = true
+    }
+
+    fileprivate func dismissUpdateSession() {
+        installWhenUserDriverFindsUpdate = false
+        beginAvailableUpdateHandler = nil
+        if preparedUpdateVersion == nil {
+            isDownloadingUpdate = false
+            downloadProgress = nil
+        }
+    }
+
+    private func clearAvailableUpdate() {
+        availableUpdateVersion = nil
+        beginAvailableUpdateHandler = nil
+        installWhenUserDriverFindsUpdate = false
+        isDownloadingUpdate = false
+        downloadProgress = nil
+        expectedDownloadLength = nil
+        receivedDownloadLength = 0
+    }
+
+    private func updateDownloadProgress() {
+        guard let expectedDownloadLength, expectedDownloadLength > 0 else {
+            downloadProgress = nil
+            return
+        }
+        downloadProgress = min(Double(receivedDownloadLength) / Double(expectedDownloadLength), 1)
+    }
 
     static var displayVersion: String {
         let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
@@ -275,8 +391,174 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         manualProbeInProgress && updateCheck == .updateInformation
     }
 
+    static func shouldUseStandardUI(userInitiated: Bool) -> Bool {
+        !userInitiated
+    }
+
     private static var feedURL: URL? {
         (Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String)
             .flatMap(URL.init(string:))
+    }
+}
+
+/// Routes explicit user checks into Settings and the menu, while scheduled background
+/// checks retain Sparkle's standard window so updates are visible outside those surfaces.
+@MainActor
+private final class InlineUpdateUserDriver: NSObject, SPUUserDriver {
+    private weak var owner: AppUpdater?
+    private let standardDriver = SPUStandardUserDriver(hostBundle: .main, delegate: nil)
+    private var usesStandardDriver = false
+
+    init(owner: AppUpdater) {
+        self.owner = owner
+    }
+
+    func show(
+        _ request: SPUUpdatePermissionRequest,
+        reply: @escaping (SUUpdatePermissionResponse) -> Void
+    ) {
+        standardDriver.show(request, reply: reply)
+    }
+
+    func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
+        usesStandardDriver = false
+        owner?.userDriverCheckStarted()
+    }
+
+    func showUpdateFound(
+        with appcastItem: SUAppcastItem,
+        state: SPUUserUpdateState,
+        reply: @escaping (SPUUserUpdateChoice) -> Void
+    ) {
+        usesStandardDriver = AppUpdater.shouldUseStandardUI(userInitiated: state.userInitiated)
+        if usesStandardDriver {
+            standardDriver.showUpdateFound(with: appcastItem, state: state, reply: reply)
+        } else {
+            owner?.userDriverFoundUpdate(appcastItem, state: state, reply: reply)
+        }
+    }
+
+    func showUpdateReleaseNotes(with downloadData: SPUDownloadData) {
+        if usesStandardDriver {
+            standardDriver.showUpdateReleaseNotes(with: downloadData)
+        }
+    }
+
+    func showUpdateReleaseNotesFailedToDownloadWithError(_ error: Error) {
+        if usesStandardDriver {
+            standardDriver.showUpdateReleaseNotesFailedToDownloadWithError(error)
+        }
+    }
+
+    func showUpdateNotFoundWithError(
+        _ error: Error,
+        acknowledgement: @escaping () -> Void
+    ) {
+        if usesStandardDriver {
+            standardDriver.showUpdateNotFoundWithError(error, acknowledgement: acknowledgement)
+        } else {
+            owner?.userDriverDidNotFindUpdate(error)
+            acknowledgement()
+        }
+    }
+
+    func showUpdaterError(_ error: Error, acknowledgement: @escaping () -> Void) {
+        if usesStandardDriver {
+            standardDriver.showUpdaterError(error, acknowledgement: acknowledgement)
+        } else {
+            owner?.userDriverFailed(error)
+            acknowledgement()
+        }
+    }
+
+    func showDownloadInitiated(cancellation: @escaping () -> Void) {
+        if usesStandardDriver {
+            standardDriver.showDownloadInitiated(cancellation: cancellation)
+        } else {
+            owner?.downloadDidStart()
+        }
+    }
+
+    func showDownloadDidReceiveExpectedContentLength(_ expectedContentLength: UInt64) {
+        if usesStandardDriver {
+            standardDriver.showDownloadDidReceiveExpectedContentLength(expectedContentLength)
+        } else {
+            owner?.downloadExpectedLength(expectedContentLength)
+        }
+    }
+
+    func showDownloadDidReceiveData(ofLength length: UInt64) {
+        if usesStandardDriver {
+            standardDriver.showDownloadDidReceiveData(ofLength: length)
+        } else {
+            owner?.downloadReceived(length)
+        }
+    }
+
+    func showDownloadDidStartExtractingUpdate() {
+        if usesStandardDriver {
+            standardDriver.showDownloadDidStartExtractingUpdate()
+        } else {
+            owner?.extractionDidStart()
+        }
+    }
+
+    func showExtractionReceivedProgress(_ progress: Double) {
+        if usesStandardDriver {
+            standardDriver.showExtractionReceivedProgress(progress)
+        }
+    }
+
+    func showReady(
+        toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void
+    ) {
+        if usesStandardDriver {
+            standardDriver.showReady(toInstallAndRelaunch: reply)
+        } else {
+            owner?.readyToInstall(reply)
+        }
+    }
+
+    func showInstallingUpdate(
+        withApplicationTerminated applicationTerminated: Bool,
+        retryTerminatingApplication: @escaping () -> Void
+    ) {
+        if usesStandardDriver {
+            standardDriver.showInstallingUpdate(
+                withApplicationTerminated: applicationTerminated,
+                retryTerminatingApplication: retryTerminatingApplication
+            )
+        } else {
+            owner?.installationDidStart()
+        }
+    }
+
+    func showUpdateInstalledAndRelaunched(
+        _ relaunched: Bool,
+        acknowledgement: @escaping () -> Void
+    ) {
+        if usesStandardDriver {
+            standardDriver.showUpdateInstalledAndRelaunched(
+                relaunched,
+                acknowledgement: acknowledgement
+            )
+        } else {
+            acknowledgement()
+        }
+    }
+
+    func dismissUpdateInstallation() {
+        if usesStandardDriver {
+            standardDriver.dismissUpdateInstallation()
+        } else {
+            owner?.dismissUpdateSession()
+        }
+        usesStandardDriver = false
+    }
+
+    func showUpdateInFocus() {
+        if usesStandardDriver {
+            standardDriver.showUpdateInFocus()
+        }
     }
 }
