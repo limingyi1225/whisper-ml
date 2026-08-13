@@ -323,13 +323,13 @@ private struct SetupSettingsTab: View {
                         Permissions.openMicrophoneSettings()
                     }
                 }
-            }
 
-            switch settings.connectionMode {
-            case .direct:
-                Section("OpenAI") { directCredentialEditor }
-            case .relay:
-                Section("代理") { relayCredentialEditor }
+                switch settings.connectionMode {
+                case .direct:
+                    directCredentialEditor
+                case .relay:
+                    relayCredentialEditor
+                }
             }
 
             UpdateSettingsSection(controller: controller, updater: updater)
@@ -485,11 +485,11 @@ private struct SetupSettingsTab: View {
     ) -> some View {
         LabeledContent(title) {
             HStack(spacing: 10) {
+                Button("更换…", action: replace)
+                    .controlSize(.small)
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(Color.green)
                     .accessibilityLabel("已保存")
-                Button("更换…", action: replace)
-                    .controlSize(.small)
             }
         }
     }
