@@ -47,6 +47,17 @@ final class RecordingHUDController {
         panel?.orderOut(nil)
     }
 
+    static func shouldShow(
+        phase: DictationController.Phase,
+        hasFocusedEditableInput: Bool,
+        isShowingSettledMark: Bool
+    ) -> Bool {
+        if phase != .idle || isShowingSettledMark {
+            return true
+        }
+        return hasFocusedEditableInput
+    }
+
     /// Moves the pill to whichever screen the pointer is on. Called when dictation
     /// starts so it shows up where the user is actually working.
     func reposition() {
