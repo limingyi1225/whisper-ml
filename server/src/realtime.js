@@ -39,6 +39,8 @@ const REJECT = Object.freeze({
     + "（audio event contains an unsupported field）",
   audioBase64: "转发服务器：音频不是有效 base64（audio is not valid base64）",
   audioTooLong: "转发服务器：这一句的音频超过上限（turn audio exceeds the relay limit）",
+  audioDailyDevice: "今天的转写额度已用完，请明天再试（daily transcription limit reached）",
+  audioDailyTotal: "转发服务器今天的总额度已用完，请稍后再试（relay daily limit reached）",
   audioUnexpected:
     "转发服务器：该事件不应携带 audio 字段（audio is not allowed on this event）",
   keywords:
@@ -66,6 +68,8 @@ function onlyKeys(object, allowed) {
 }
 
 export function validateRealtimeEvent(data, isBinary, config, state) {
+  state.acceptedAudioBytes = 0;
+  state.acceptedAudioEventID = undefined;
   if (isBinary) return REJECT.binary;
   if (data.length > config.maxWebSocketPayloadBytes) return REJECT.tooLarge;
 
@@ -128,6 +132,8 @@ export function validateRealtimeEvent(data, isBinary, config, state) {
       return REJECT.audioTooLong;
     }
     state.turnAudioBytes += audioBytes;
+    state.acceptedAudioBytes = audioBytes;
+    state.acceptedAudioEventID = event.event_id;
   } else {
     if (event.audio !== undefined) return REJECT.audioUnexpected;
     state.turnAudioBytes = 0;
@@ -177,10 +183,15 @@ function relayError(message, code, eventID) {
 /// 4001 close frame still reaches the peer to tell it why; a paused socket can never
 /// read the close ack, so the timer reaps it unconditionally, and the bridge's own
 /// `close` handler — untouched by this — then shuts the upstream side down.
-export function revokeDownstream(socket, { upstream = null, graceMs = 5_000 } = {}) {
+export function revokeDownstream(socket, {
+  upstream = null,
+  graceMs = 5_000,
+  closeCode = 4001,
+  closeReason = "device token revoked",
+} = {}) {
   socket.pause();
   socket.removeAllListeners("message");
-  socket.close(4001, "device token revoked");
+  socket.close(closeCode, closeReason);
   // The OpenAI side dies with the revoke, not with the reap. Left to the bridge it
   // only closes when the downstream `close` event finally fires — up to graceMs away —
   // and until then audio already buffered toward OpenAI keeps transmitting, while an
@@ -237,7 +248,7 @@ function pauseUntilDrained(source, target, config, isSettled, onResume) {
   timer.unref();
 }
 
-export function bridgeRealtime(downstream, config) {
+export function bridgeRealtime(downstream, config, { consumeAudio = null } = {}) {
   const upstream = new WebSocket(config.openAIRealtimeURL, {
     headers: { authorization: `Bearer ${config.openAIAPIKey}` },
     handshakeTimeout: 10_000,
@@ -265,6 +276,22 @@ export function bridgeRealtime(downstream, config) {
     }
   };
 
+  const rejectConsumedAudio = () => {
+    if (state.acceptedAudioBytes <= 0 || !consumeAudio) return false;
+    const quota = consumeAudio(state.acceptedAudioBytes);
+    if (!quota) return false;
+    downstream.send(relayError(
+      quota === "total" ? REJECT.audioDailyTotal : REJECT.audioDailyDevice,
+      "relay_daily_quota",
+      // The caller has already parsed and validated this event. It supplies the id
+      // below because keeping the raw frame outside the message callback would retain
+      // multi-megabyte audio buffers for the lifetime of the bridge.
+      state.acceptedAudioEventID,
+    ));
+    closeBoth(1008, "daily relay quota reached");
+    return true;
+  };
+
   downstream.on("message", (data, isBinary) => {
     const validationError = validateRealtimeEvent(data, isBinary, config, state);
     if (validationError) {
@@ -278,6 +305,10 @@ export function bridgeRealtime(downstream, config) {
     }
 
     if (upstream.readyState === WebSocket.OPEN) {
+      // The quota is a cost backstop, so charge only after this frame has a viable
+      // destination. Charging before the state/queue checks below made a frame the
+      // relay discarded while OpenAI was still connecting consume the user's day.
+      if (rejectConsumedAudio()) return;
       const result = forward(upstream, data, isBinary, config);
       if (result === "closed") closeBoth(1011, "upstream closed");
       else if (result === "over") {
@@ -290,6 +321,7 @@ export function bridgeRealtime(downstream, config) {
       closeBoth(1013, "relay upstream not ready");
       return;
     }
+    if (rejectConsumedAudio()) return;
     preopenQueue.push({ data: Buffer.from(data), isBinary });
     preopenBytes += data.length;
   });

@@ -588,6 +588,115 @@ import Testing
         #expect(!KeychainStore.saveRelayToken("   "))
         #expect(!KeychainStore.saveRelayToken(" \n\t"))
     }
+
+    @Test func enrollmentTokenUsesURLSafeHighEntropyBytes() {
+        let bytes = Data((0..<32).map(UInt8.init))
+        let token = KeychainStore.relayToken(randomBytes: bytes)
+        #expect(token == "relay_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+        #expect(token?.contains("+") == false)
+        #expect(token?.contains("/") == false)
+        #expect(token.map(KeychainStore.isGeneratedRelayToken) == true)
+        #expect(!KeychainStore.isGeneratedRelayToken("relay_short"))
+        #expect(!KeychainStore.isGeneratedRelayToken("relay_\(String(repeating: "!", count: 43))"))
+        #expect(KeychainStore.relayToken(randomBytes: Data(repeating: 0, count: 31)) == nil)
+    }
+
+    @Test func aRepeatedEnrollmentResponseRecognizesAnAlreadyPromotedToken() {
+        let expected = "relay_\(String(repeating: "a", count: 43))"
+        let other = "relay_\(String(repeating: "b", count: 43))"
+        #expect(KeychainStore.relayEnrollmentCommitDecision(
+            liveToken: expected,
+            pendingToken: nil,
+            expectedToken: expected
+        ) == .alreadyCommitted)
+        #expect(KeychainStore.relayEnrollmentCommitDecision(
+            liveToken: expected,
+            pendingToken: other,
+            expectedToken: expected
+        ) == .alreadyCommitted)
+        #expect(KeychainStore.relayEnrollmentCommitDecision(
+            liveToken: nil,
+            pendingToken: expected,
+            expectedToken: expected
+        ) == .promotePending)
+        #expect(KeychainStore.relayEnrollmentCommitDecision(
+            liveToken: other,
+            pendingToken: other,
+            expectedToken: expected
+        ) == .reject)
+    }
+
+    @Test func inviteValidationMatchesTheRelayFormat() {
+        let code = "WHISPER-00112233-44556677-8899AABB-CCDDEEFF"
+        #expect(RelayEnrollmentClient.isPlausibleInviteCode(code))
+        #expect(RelayEnrollmentClient.isPlausibleInviteCode(code.lowercased()))
+        #expect(!RelayEnrollmentClient.isPlausibleInviteCode("WHISPER-short"))
+        #expect(!RelayEnrollmentClient.isPlausibleInviteCode(
+            "WHISPER-00112233-44556677-8899AABB-CCDDEEFG"
+        ))
+        #expect(!RelayEnrollmentClient.isPlausibleInviteCode(
+            "WHISPER-00112233-44556677-8899AABB-CCDDEEFＦ"
+        ))
+    }
+
+    @Test func inviteOnboardingPreservesAnExplicitRoute() {
+        #expect(InviteEnrollmentOnboarding.shouldDefaultToRelay(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: false,
+            connectionModeWasChosen: false
+        ))
+        #expect(!InviteEnrollmentOnboarding.shouldDefaultToRelay(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: false,
+            connectionModeWasChosen: true
+        ))
+        #expect(!InviteEnrollmentOnboarding.shouldDefaultToRelay(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: true,
+            connectionModeWasChosen: false
+        ))
+    }
+
+    @Test func invitePromptFollowsRelayModeRatherThanAPIKeyPresence() {
+        #expect(InviteEnrollmentOnboarding.shouldPresentInvite(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: true,
+            connectionModeWasChosen: true,
+            connectionMode: .relay
+        ))
+        #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: false,
+            connectionModeWasChosen: true,
+            connectionMode: .direct
+        ))
+        #expect(InviteEnrollmentOnboarding.shouldPresentInvite(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: false,
+            connectionModeWasChosen: false,
+            connectionMode: .direct
+        ))
+        #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: false,
+            hasAPIKey: true,
+            connectionModeWasChosen: false,
+            connectionMode: .direct
+        ))
+        #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
+            inviteEnrollmentEnabled: true,
+            hasRelayToken: true,
+            hasAPIKey: false,
+            connectionModeWasChosen: false,
+            connectionMode: .relay
+        ))
+    }
 }
 
 // MARK: - Relay routing
@@ -696,7 +805,7 @@ import Testing
     /// attempts on a credential that will never start working.
     @Test func aRejectedHandshakeSaysWhichPeerRefusedItAndWhetherRetryingHelps() {
         let unauthorized = RealtimeClient.handshakeRejection(statusCode: 401, viaRelay: true)
-        #expect(unauthorized.message.contains("设备 Token"))
+        #expect(unauthorized.message.contains("设备凭证"))
         #expect(unauthorized.retryable == false)
         // The one failure a personalised build may repair by installing its bundled
         // token: our relay's auth answers a bad token with 401 and nothing else.

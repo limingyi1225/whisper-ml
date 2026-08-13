@@ -96,8 +96,9 @@ async 函数跑在哪个 executor 上。`DictationKit/Package.swift` 里记了�
   Keychain 中可撤销的设备 Token，OpenAI API Key 只存在服务器环境变量中。
 
   名字里没有「大陆」是有意的：它解决的是**本机不放 OpenAI Key**，无 VPN 可用只是
-  其中一个后果。多给一个人用的时候，给对方一个可单独吊销的设备 Token，比把自己的
-  API Key 复制到别人机器上安全得多——不管对方在哪个国家。
+  其中一个后果。公开发行版第一次打开时用一次性邀请码激活，由 App 在本机生成独立的
+  设备 Token 并存进 Keychain；服务端只保存 hash。这样每台 Mac 都能单独吊销，不需要
+  把自己的 API Key 或某个大家共用的 Token 复制给别人——不管对方在哪个国家。
 
 Relay 同时覆盖 Realtime WebSocket 转写和松手后的 HTTPS 整理。不能只代理整理请求，否则
 Realtime 仍然需要从 Mac 直连 OpenAI。连接方式发生变化时，如果当前有一句正在转写，应用会等
@@ -121,24 +122,36 @@ npm start
 显示一次。凭据由 App 自己写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL
 里没有本 App，读取时会弹授权框甚至直接失败。
 
-### 签发与吊销
+### 发行、邀请与吊销
 
 线上部署由 `script/deploy_relay.sh` 设置了 `RELAY_DEVICE_TOKEN_FILE`，**一旦设了这个变量，
 `RELAY_DEVICE_TOKEN_HASHES` 就完全被忽略**。所以不要去改环境变量里的 hash：服务会正常启动，
-但要吊销的 Token 依然在文件名单里有效。用脚本：
+但旧版个性化包的 Token 依然在文件名单里有效。
+
+新的主流程是一份通用 DMG，加每人一个一次性邀请码：
 
 ```bash
-./script/package_release.sh --for alice   # 签发：建 Token、打包、公证，最后才注册
-./script/revoke_token.sh                  # 看谁有权限
-./script/revoke_token.sh alice            # 只吊销 alice
+./script/package_release.sh --public      # 生成、公证并验证 dist/Whisper-public.dmg
+./script/invite_access.sh alice            # 单独生成 alice 的一次性邀请码
+./script/invite_access.sh --list           # 看待激活、有效和已吊销的身份
+./script/invite_access.sh --revoke alice   # 立即吊销 alice
 ```
 
-注册放在最后一步是故意的：构建、公证途中任何一步失败，Token 都还没上线，重跑一遍
-即可，服务器上没有需要清理的东西。
+DMG 可以原样发给所有人，包内没有设备 Token。邀请码只显示一次；同一个邀请码只允许第一台
+设备认领，但第一台设备在服务器已提交、响应却丢失时可以用本机尚未提交的 Keychain Token
+安全重试。签发、查询和吊销只经过 mode 0600 的本机 Unix admin socket，公网不暴露管理接口。
 
-两者都走 `systemctl reload`（SIGHUP 热重载名单），**不重启**——重启会掐断所有人的
-WebSocket，别人正在说的那句话就没了。吊销会顺带断掉对方**已经建立的**那条连接：鉴权只发生
-在 upgrade 那一刻，只换名单的话对方能一直用到会话自然过期。
+`--for alice` 的旧个性化 ZIP 流程仍保留作兼容路径；它把独立 Token 烘进该收件人的包，且只在
+构建、公证和检查全部通过后注册：
+
+```bash
+./script/package_release.sh --for alice
+./script/revoke_token.sh                  # 查看旧个性化 Token
+./script/revoke_token.sh alice            # 吊销旧个性化 Token
+```
+
+旧名单变更走 `systemctl reload`（SIGHUP），邀请身份由正在运行的 Relay 原子写入 registry；两条
+路径都**不重启**服务。吊销还会顺带断掉对方已经建立的连接，而其他人的 WebSocket 保持不动。
 
 手工改 `/opt/whisper-relay/device-tokens` 也可以（一行一个 hash，支持 `hash # 备注`），改完
 `systemctl reload whisper-relay`。名单解析失败时会保留旧名单而不是清空，所以写坏一个文件不会
@@ -151,13 +164,16 @@ WebSocket，别人正在说的那句话就没了。吊销会顺带断掉对方**
 
 ### 反向代理
 
-Relay 自己监听 `/v1/realtime`、`/v1/polish` 和 `/healthz`。线上发布在
+Relay 自己监听 `/v1/realtime`、`/v1/polish`、`/v1/enroll` 和 `/healthz`。线上发布在
 `https://limingyi.com/whisper-relay` 这样的子路径下时，把 `RELAY_BASE_PATH=/whisper-relay`
 写进 `.env`：这样带不带前缀的路径它都认，代理是否剥掉前缀都能工作（少了这一条，代理配错
 斜杠的表现是一个干净的 404，日志里什么都没有）。
 
 代理还必须支持 WebSocket upgrade、至少 2 MiB 的消息，并且不能移除客户端的 `Authorization`
-header。`GET /healthz`（或 `<前缀>/healthz`）可用于健康检查。
+header。`GET /healthz`（或 `<前缀>/healthz`）可用于健康检查；发行脚本还会向公网
+`/v1/enroll` 发送一个故意无效的 JSON，并断言收到 Relay 的 400 错误，避免只通 health、实际
+激活路径却被 nginx 或 edge 漏配。管理 socket `/run/whisper-relay/admin.sock` 只能留在服务器
+本机，不能代理到公网。
 
 默认 `HOST=127.0.0.1`，因为没挂代理时不该把一个背后是真 OpenAI Key 的端点暴露到所有网卡上；
 `server/Dockerfile` 里已经显式设成 `0.0.0.0`，由前置负载均衡或反向代理终止 TLS。

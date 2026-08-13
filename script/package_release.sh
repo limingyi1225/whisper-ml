@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Builds a Developer ID–signed, notarized, stapled Whisper.app and zips it for hand-off.
+# Builds a Developer ID–signed, notarized, stapled Whisper distribution.
 # The result opens on any Mac with no Gatekeeper prompt at all.
 #
 #   ./script/package_release.sh                 → a plain build (for you)
+#   ./script/package_release.sh --public        → one invite-enabled DMG for everyone
 #   ./script/package_release.sh --for alice     → a build for one other person:
 #       mints a device token, bakes it into the bundle, and — only after the build has
 #       passed every check — registers its hash on the relay. They unzip, open, grant
@@ -35,8 +36,14 @@ TOKEN_FILE=/opt/whisper-relay/device-tokens
 LEDGER=/opt/whisper-relay-backups/issued-tokens.tsv
 
 RECIPIENT=""
+PUBLIC_BUILD=0
 case "${1:-}" in
+  --public)
+    [ "$#" -eq 1 ] || { echo "usage: $0 --public" >&2; exit 2; }
+    PUBLIC_BUILD=1
+    ;;
   --for)
+    [ "$#" -eq 2 ] || { echo "usage: $0 --for <name>" >&2; exit 2; }
     RECIPIENT="${2:-}"
     [ -n "$RECIPIENT" ] || { echo "usage: $0 --for <name>" >&2; exit 2; }
     # Kept to characters that are safe in a filename and readable in a token comment.
@@ -44,8 +51,10 @@ case "${1:-}" in
       *[!A-Za-z0-9_-]*) echo "!! name must be letters, digits, - or _" >&2; exit 2 ;;
     esac
     ;;
-  "") ;;
-  *) echo "usage: $0 [--for <name>]" >&2; exit 2 ;;
+  "")
+    [ "$#" -eq 0 ] || { echo "usage: $0 [--public | --for <name>]" >&2; exit 2; }
+    ;;
+  *) echo "usage: $0 [--public | --for <name>]" >&2; exit 2 ;;
 esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,15 +66,29 @@ BUILD_DIR="$ROOT_DIR/build"
 #
 # `for-<name>` rather than the bare name, so `--for plain` cannot land in the plain
 # build's slot — two different deliverables, one set of mutable intermediates.
-SLOT="${RECIPIENT:+for-$RECIPIENT}"
-SLOT="${SLOT:-plain}"
+if [ "$PUBLIC_BUILD" -eq 1 ]; then
+  SLOT=public
+  PACKAGE_NAME=Whisper-public
+elif [ -n "$RECIPIENT" ]; then
+  SLOT="for-$RECIPIENT"
+  PACKAGE_NAME="Whisper-$RECIPIENT"
+else
+  SLOT=plain
+  PACKAGE_NAME=Whisper
+fi
 ARCHIVE="$BUILD_DIR/$SLOT/Whisper.xcarchive"
 EXPORT_DIR="$BUILD_DIR/$SLOT/developer-id"
 EXPORT_OPTIONS="$BUILD_DIR/$SLOT/ExportOptions.plist"
 APP="$EXPORT_DIR/Whisper.app"
 DIST="$ROOT_DIR/dist"
-ZIP="$DIST/Whisper${RECIPIENT:+-$RECIPIENT}.zip"
-STAGED="$BUILD_DIR/$SLOT/Whisper${RECIPIENT:+-$RECIPIENT}.staging.zip"
+ZIP="$DIST/$PACKAGE_NAME.zip"
+DMG="$DIST/$PACKAGE_NAME.dmg"
+STAGED="$BUILD_DIR/$SLOT/$PACKAGE_NAME.staging.zip"
+STAGED_DMG="$BUILD_DIR/$SLOT/$PACKAGE_NAME.staging.dmg"
+DMG_ROOT="$BUILD_DIR/$SLOT/dmg-root"
+DMG_MOUNT="$BUILD_DIR/$SLOT/dmg-mount"
+QUARANTINE_ROOT="$BUILD_DIR/$SLOT/quarantine-check"
+DMG_ATTACHED=0
 
 # The deliverable for this recipient is removed up front, so a run that dies anywhere
 # can never leave the previous one behind looking like its result. A *failed*
@@ -122,7 +145,7 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
 
-rm -f "$ZIP" "$STAGED"
+rm -f "$ZIP" "$DMG" "$STAGED" "$STAGED_DMG"
 # Flipped immediately *before* the registration attempt, not after it returns. Registering
 # is a remote commit acknowledged over ssh: a connection dropped after the relay committed
 # but before the exit status came back is indistinguishable, locally, from never having
@@ -133,7 +156,32 @@ rm -f "$ZIP" "$STAGED"
 REGISTRATION_ATTEMPTED=0
 cleanup() {
   local status=$?
-  if [ "$status" -eq 0 ]; then rm -f "$STAGED"; rm -rf "$LOCK_DIR"; return; fi
+  local detach_failed=0
+  # A mount-point-shaped directory is not evidence that an image is attached there.
+  # Calling `diskutil eject` on every exit was both noisy and capable of targeting an
+  # unrelated volume if a stale path had been reused. The flag is armed only after a
+  # successful attach and cleared only after a successful detach.
+  if [ "$DMG_ATTACHED" -eq 1 ]; then
+    if hdiutil detach "$DMG_MOUNT" >/dev/null 2>&1; then
+      DMG_ATTACHED=0
+    else
+      detach_failed=1
+      echo "!! could not detach the validation image; staging and lock were kept:" >&2
+      echo "   hdiutil detach '$DMG_MOUNT'" >&2
+      echo "   rm -rf '$LOCK_DIR'   # only after detach succeeds" >&2
+    fi
+  fi
+  if [ "$detach_failed" -eq 1 ]; then
+    # Do not remove a live mountpoint or unlock a slot whose next run starts with rm -rf
+    # on that path. The image is read-only, but retaining both is still the safe failure.
+    [ "$status" -ne 0 ] || status=1
+    return "$status"
+  fi
+  if [ "$status" -eq 0 ]; then
+    rm -f "$STAGED" "$STAGED_DMG"
+    rm -rf "$DMG_ROOT" "$DMG_MOUNT" "$QUARANTINE_ROOT" "$LOCK_DIR"
+    return
+  fi
   if [ -n "$RECIPIENT" ] && [ "$REGISTRATION_ATTEMPTED" -eq 1 ]; then
     echo "!! failed at or after registration, so the token may or may not be live." >&2
     echo "   The verified zip has been kept:" >&2
@@ -145,7 +193,8 @@ cleanup() {
     rm -rf "$LOCK_DIR"
     return
   fi
-  rm -f "$STAGED"
+  rm -f "$STAGED" "$STAGED_DMG"
+  rm -rf "$DMG_ROOT" "$DMG_MOUNT" "$QUARANTINE_ROOT"
   if [ -n "$RECIPIENT" ]; then rm -rf "$BUILD_DIR/$SLOT"; fi
   rm -rf "$LOCK_DIR"
 }
@@ -157,6 +206,46 @@ if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>
   echo "   Without them the app can be signed but not notarized, and every Mac that" >&2
   echo "   is not this one will refuse to open it. See the header of this script." >&2
   exit 1
+fi
+
+if [ "$PUBLIC_BUILD" -eq 1 ]; then
+  echo "==> checking invite enrollment is live"
+  ssh "$RELAY_SSH_HOST" bash -s <<'REMOTE'
+set -euo pipefail
+ENV_FILE=/etc/whisper-relay.env
+PORT=$(sed -n 's/^PORT=//p' "$ENV_FILE"); PORT=${PORT:-8787}
+BODY=$(curl -fsS -m 10 "http://127.0.0.1:$PORT/healthz")
+case "$BODY" in
+  *'"enrollment":true'*) echo "    relay enrollment is ready" ;;
+  *) echo "!! relay enrollment is not enabled; deploy the relay first" >&2; exit 1 ;;
+esac
+REMOTE
+
+  # Check the exact public base URL compiled into this app, not just loopback health.
+  # A missing nginx/edge route otherwise survives all server checks and is discovered
+  # only after a friend has downloaded a fully notarized DMG and tries to activate it.
+  RELAY_BASE_SOURCE="$ROOT_DIR/DictationKit/Sources/DictationKit/ServiceRoute.swift"
+  PUBLIC_RELAY_BASE=$(sed -En \
+    's/^ *public nonisolated static let relayBaseURL = URL\(string: "([^"]+)"\)!$/\1/p' \
+    "$RELAY_BASE_SOURCE")
+  if [ -z "$PUBLIC_RELAY_BASE" ] \
+    || [ "$(printf '%s\n' "$PUBLIC_RELAY_BASE" | wc -l | tr -d ' ')" != 1 ]; then
+    echo "!! could not unambiguously read the app's public relay URL from:" >&2
+    echo "   $RELAY_BASE_SOURCE" >&2
+    exit 1
+  fi
+  ENROLLMENT_PROBE=$(curl -sS -m 20 -w '\n%{http_code}' \
+    -H 'content-type: application/json' --data-binary '{' \
+    "$PUBLIC_RELAY_BASE/v1/enroll" || true)
+  ENROLLMENT_CODE=$(printf '%s' "$ENROLLMENT_PROBE" | tail -n 1)
+  ENROLLMENT_BODY=$(printf '%s' "$ENROLLMENT_PROBE" | sed '$d')
+  if [ "$ENROLLMENT_CODE" != 400 ] \
+    || [[ "$ENROLLMENT_BODY" != *'"code":"enrollment_invalid_request"'* ]]; then
+    echo "!! the public enrollment route compiled into the app is not working" >&2
+    echo "   $PUBLIC_RELAY_BASE/v1/enroll returned HTTP ${ENROLLMENT_CODE:-none}" >&2
+    exit 1
+  fi
+  echo "    public enrollment route is ready"
 fi
 
 # Minted before the build so the bake step has something to bake; *registered* only at
@@ -225,11 +314,24 @@ if [ -n "$RECIPIENT" ]; then
   # token back to a revoked one. Epoch seconds, which is monotonic across runs and needs
   # no state anywhere to interpret.
   ISSUED_AT=$(date +%s)
-  /usr/libexec/PlistBuddy -c "Add :WhisperRelayToken string $BUNDLED_TOKEN" \
-    "$ARCHIVE/Products/Applications/Whisper.app/Contents/Info.plist" >/dev/null
+  # Feed the plaintext credential on stdin. `PlistBuddy -c "...$BUNDLED_TOKEN"`
+  # exposed it in the process argv to any local process listing while the edit ran.
+  printf 'Add :WhisperRelayToken string %s\nSave\nExit\n' "$BUNDLED_TOKEN" \
+    | /usr/libexec/PlistBuddy \
+      "$ARCHIVE/Products/Applications/Whisper.app/Contents/Info.plist" >/dev/null
+  ARCHIVE_TOKEN=$(/usr/libexec/PlistBuddy -c 'Print :WhisperRelayToken' \
+    "$ARCHIVE/Products/Applications/Whisper.app/Contents/Info.plist" 2>/dev/null || true)
+  if [ "$ARCHIVE_TOKEN" != "$BUNDLED_TOKEN" ]; then
+    echo "!! could not write this run's token into the archive" >&2
+    exit 1
+  fi
   /usr/libexec/PlistBuddy -c "Add :WhisperRelayTokenIssuedAt integer $ISSUED_AT" \
     "$ARCHIVE/Products/Applications/Whisper.app/Contents/Info.plist" >/dev/null
   echo "    baked for '$RECIPIENT' (issuance $ISSUED_AT)"
+elif [ "$PUBLIC_BUILD" -eq 1 ]; then
+  echo "==> enabling one-time invite enrollment"
+  /usr/libexec/PlistBuddy -c "Add :WhisperInviteEnrollment bool true" \
+    "$ARCHIVE/Products/Applications/Whisper.app/Contents/Info.plist" >/dev/null
 fi
 
 echo "==> exporting with Developer ID"
@@ -255,6 +357,7 @@ xcodebuild -exportArchive -archivePath "$ARCHIVE" \
 # SIGPIPEs codesign, and under `pipefail` the pipeline then reports codesign's 141 — so
 # a correctly signed app fails the check that was supposed to wave it through.
 SIGNATURE=$(codesign -dvv "$APP" 2>&1)
+codesign --verify --deep --strict --verbose=2 "$APP"
 case "$SIGNATURE" in
   *"Developer ID Application"*) ;;
   *) echo "!! not signed with Developer ID:" >&2
@@ -269,6 +372,14 @@ esac
 # first line with parameter expansion instead of with an early-exiting reader.
 AUTHORITIES=$(printf '%s\n' "$SIGNATURE" | sed -n 's/^Authority=//p')
 echo "    ${AUTHORITIES%%$'\n'*}"
+ARCHS=$(lipo -archs "$APP/Contents/MacOS/Whisper")
+case " $ARCHS " in *" arm64 "*) ;; *)
+  echo "!! app is missing arm64: $ARCHS" >&2; exit 1
+esac
+case " $ARCHS " in *" x86_64 "*) ;; *)
+  echo "!! app is missing x86_64: $ARCHS" >&2; exit 1
+esac
+echo "    Universal: $ARCHS"
 
 echo "==> notarizing (a few minutes)"
 # Everything below stages through $STAGED and only becomes $ZIP once every check has
@@ -291,7 +402,17 @@ xcrun stapler validate "$APP"
 # Before registration, so that once the token is live the only remaining local step is
 # the same-filesystem rename at the bottom.
 mkdir -p "$DIST"
-if [ -n "$RECIPIENT" ]; then
+if [ "$PUBLIC_BUILD" -eq 1 ]; then
+  ENROLLMENT=$(/usr/libexec/PlistBuddy -c "Print :WhisperInviteEnrollment" \
+    "$APP/Contents/Info.plist" 2>/dev/null || true)
+  BUNDLED=$(/usr/libexec/PlistBuddy -c "Print :WhisperRelayToken" \
+    "$APP/Contents/Info.plist" 2>/dev/null || true)
+  if [ "$ENROLLMENT" != true ] || [ -n "$BUNDLED" ]; then
+    echo "!! public build is missing enrollment or contains a shared credential" >&2
+    exit 1
+  fi
+  echo "    public bundle contains enrollment, and no shared relay credential"
+elif [ -n "$RECIPIENT" ]; then
   # Confirms the thing the recipient actually depends on, rather than assuming the
   # PlistBuddy edit survived export and stapling.
   BAKED=$(/usr/libexec/PlistBuddy -c "Print :WhisperRelayToken" "$APP/Contents/Info.plist")
@@ -323,7 +444,7 @@ if [ -n "$RECIPIENT" ]; then
   # else the sentence they were speaking. Appended, never replaced: everyone else's
   # token has to keep working.
   REGISTRATION_ATTEMPTED=1
-  ssh "$RELAY_SSH_HOST" bash -s -- "$TOKEN_HASH" "$RECIPIENT" <<'REMOTE'
+ssh "$RELAY_SSH_HOST" bash -s -- "$TOKEN_HASH" "$RECIPIENT" <<'REMOTE'
 set -euo pipefail
 TOKEN_HASH="$1"; RECIPIENT="$2"
 ENV_FILE=/etc/whisper-relay.env
@@ -332,6 +453,7 @@ LEDGER=/opt/whisper-relay-backups/issued-tokens.tsv
 LOCK=/opt/whisper-relay-backups/.allowlist.lock
 PORT=$(sed -n 's/^PORT=//p' "$ENV_FILE"); PORT=${PORT:-8787}
 HEALTH="http://127.0.0.1:$PORT/healthz"
+EMPTY_LEGACY_SENTINEL='# whisper-relay: intentionally empty legacy allowlist'
 
 # The same lock the revoke script takes. Issuing appends while revoking rewrites from a
 # snapshot; interleaved without coordination, a revoke can silently drop a hash that was
@@ -344,10 +466,22 @@ flock -w 60 9 || { echo '!! another issue/revoke is holding the lock' >&2; exit 
 # the producer takes SIGPIPE, and under `pipefail` the pipeline reports 141 and inverts
 # the predicate. It is a race, so it passes on short lists and fails on real ones.
 effective() { awk '{ sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if (length) print tolower($0) }' "$1" | LC_ALL=C sort -u; }
+is_intentionally_empty() {
+  awk -v marker="$EMPTY_LEGACY_SENTINEL" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (length(line)) { n += 1; only = line } }
+    END { exit (n == 1 && only == marker) ? 0 : 1 }' "$1"
+}
+contains_empty_sentinel() {
+  awk -v marker="$EMPTY_LEGACY_SENTINEL" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (line == marker) found = 1 }
+    END { exit found ? 0 : 1 }' "$1"
+}
 has_hash() {
   effective "$1" | awk -v h="$2" 'BEGIN { h = tolower(h) } tolower($0) == h { f = 1 } END { exit f ? 0 : 1 }'
 }
 valid_allowlist() {
+  is_intentionally_empty "$1" && return 0
+  contains_empty_sentinel "$1" && return 1
   effective "$1" | awk '
     { n += 1; if ($0 !~ /^[a-f0-9]{64}$/) bad = 1 }
     END { exit (n > 0 && !bad) ? 0 : 1 }'
@@ -358,10 +492,15 @@ digest_of() { printf '%s' "$(effective "$1")" | sha256sum | cut -c1-16; }
 
 # Built as a candidate and validated in full before the live list is touched, so a
 # failure anywhere in here cannot leave a half-edited allowlist for the next unrelated
-# reload to apply.
-cp -a "$TOKEN_FILE" "$TOKEN_FILE.next"
-has_hash "$TOKEN_FILE.next" "$TOKEN_HASH" \
-  || printf '%s\n' "$TOKEN_HASH" >> "$TOKEN_FILE.next"
+# reload to apply. The intentional-empty marker must be the only nonblank line, so a
+# legacy issue replaces it rather than appending a hash beside it.
+if is_intentionally_empty "$TOKEN_FILE"; then
+  printf '%s\n' "$TOKEN_HASH" > "$TOKEN_FILE.next"
+else
+  cp -a "$TOKEN_FILE" "$TOKEN_FILE.next"
+  has_hash "$TOKEN_FILE.next" "$TOKEN_HASH" \
+    || printf '%s\n' "$TOKEN_HASH" >> "$TOKEN_FILE.next"
+fi
 
 # Validated the way config.js will read it, *before* the reload — the same check the
 # revoke script runs, and skipping it here reopened the same hole: a pre-existing
@@ -413,7 +552,11 @@ sleep 1
 # previous count was worse still: an old /healthz without the field made `[ "" -le "" ]`
 # an *error*, and an errored `if` condition is simply false, so the guard passed.) The
 # digest is the server telling us which list it is actually serving.
-AFTER=$(curl -fsS -m 10 "$HEALTH" | sed -n 's/.*"allowlist":"\([a-f0-9]*\)".*/\1/p' || true)
+HEALTH_BODY=$(curl -fsS -m 10 "$HEALTH" || true)
+AFTER=$(printf '%s' "$HEALTH_BODY" \
+  | sed -n 's/.*"legacyAllowlist":"\([a-f0-9]*\)".*/\1/p')
+[ -n "$AFTER" ] || AFTER=$(printf '%s' "$HEALTH_BODY" \
+  | sed -n 's/.*"allowlist":"\([a-f0-9]*\)".*/\1/p')
 if [ "$AFTER" != "$WANT" ]; then
   echo "!! relay is serving allowlist '$AFTER', expected '$WANT' — the token is NOT" >&2
   echo "   live; rolling back" >&2
@@ -424,15 +567,59 @@ printf '    %s tokens authorised (%s), nobody disconnected\n' "$COUNT" "$AFTER"
 REMOTE
 fi
 
-# Atomic within the same filesystem: dist/ never holds a half-written or half-verified
-# archive, and never holds a stale one either — it is either the previous good build or
-# this one. dist/ itself was created before registration, so this is the *only* step
-# left after the token goes live — and if even a rename fails, the trap keeps the
-# staged zip and says how to either ship it or revoke the token.
-mv -f "$STAGED" "$ZIP"
+if [ "$PUBLIC_BUILD" -eq 1 ]; then
+  echo "==> creating the public DMG"
+  rm -rf "$DMG_ROOT"
+  mkdir -p "$DMG_ROOT"
+  ditto "$APP" "$DMG_ROOT/Whisper.app"
+  ln -s /Applications "$DMG_ROOT/Applications"
+  # `diskutil image create from` is the supported spelling on macOS 27, but does not
+  # exist on the macOS 26 build machines this project still supports. Feature-detect
+  # the subcommand instead of keying off an OS version string; the old hdiutil path
+  # produces the same compressed UDZO image and remains available there.
+  if diskutil image create from --help >/dev/null 2>&1; then
+    diskutil image create from --format UDZO --volumeName Whisper \
+      "$DMG_ROOT" "$STAGED_DMG" >/dev/null
+  else
+    hdiutil create -srcfolder "$DMG_ROOT" -format UDZO -volname Whisper \
+      "$STAGED_DMG" >/dev/null
+  fi
 
-echo "==> done: $ZIP"
-if [ -n "$RECIPIENT" ]; then
+  echo "==> notarizing the DMG"
+  xcrun notarytool submit "$STAGED_DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$STAGED_DMG"
+  xcrun stapler validate "$STAGED_DMG"
+  hdiutil verify "$STAGED_DMG" >/dev/null
+
+  echo "==> checking the mounted DMG like a downloaded copy"
+  rm -rf "$DMG_MOUNT" "$QUARANTINE_ROOT"
+  mkdir -p "$DMG_MOUNT" "$QUARANTINE_ROOT"
+  hdiutil attach -readonly -nobrowse -mountpoint "$DMG_MOUNT" \
+    "$STAGED_DMG" >/dev/null
+  DMG_ATTACHED=1
+  ditto "$DMG_MOUNT/Whisper.app" "$QUARANTINE_ROOT/Whisper.app"
+  hdiutil detach "$DMG_MOUNT" >/dev/null
+  DMG_ATTACHED=0
+  xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Whisper;" \
+    "$QUARANTINE_ROOT/Whisper.app"
+  codesign --verify --deep --strict --verbose=2 "$QUARANTINE_ROOT/Whisper.app"
+  spctl -a -vvv -t exec "$QUARANTINE_ROOT/Whisper.app"
+  syspolicy_check distribution "$QUARANTINE_ROOT/Whisper.app" --verbose
+  mv -f "$STAGED_DMG" "$DMG"
+  FINAL="$DMG"
+else
+  # Atomic within the same filesystem: dist/ never holds a half-written or
+  # half-verified archive. For a personalised build this is the only local step left
+  # after registration, so a failure cannot strand a live token behind a stale ZIP.
+  mv -f "$STAGED" "$ZIP"
+  FINAL="$ZIP"
+fi
+
+echo "==> done: $FINAL"
+if [ "$PUBLIC_BUILD" -eq 1 ]; then
+  echo "    Send this one DMG to everyone. Give each person a separate code from:"
+  echo "      ./script/invite_access.sh <name>"
+elif [ -n "$RECIPIENT" ]; then
   echo "    Send this to $RECIPIENT. They unzip, drag it to 应用程序, open it, and grant"
   echo "    辅助功能 + 麦克风. Nothing to paste, nothing to configure."
   echo "    To cut them off later: ./script/revoke_token.sh $RECIPIENT"

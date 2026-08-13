@@ -25,6 +25,10 @@ public struct ServiceRoute: CustomStringConvertible {
     /// failing the connection, so a stale override cannot brick the app.
     public nonisolated static let relayBaseURLOverrideKey = "relayBaseURLOverride"
 
+    public nonisolated static var relayEnrollmentURL: URL {
+        effectiveRelayBaseURL.appendingPathComponent("v1/enroll")
+    }
+
     /// `nonisolated` like the two helpers below: this only reads `UserDefaults`, which
     /// is thread-safe, so there is no reason to pin URL construction to the main actor.
     ///

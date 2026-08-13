@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,12 +9,23 @@ import { authenticateRequest, tokenDigest } from "../src/auth.js";
 import {
   allowlistDigest,
   CLIENT_MAX_TURN_AUDIO_BYTES,
+  EMPTY_LEGACY_ALLOWLIST_SENTINEL,
   loadConfig,
   loadDeviceTokenHashes,
 } from "../src/config.js";
+import {
+  createInviteCode,
+  enrollmentClientAddress,
+  EnrollmentRegistry,
+  normalizeInviteCode,
+} from "../src/enrollment.js";
 import { routePath } from "../src/http.js";
 import { validatePolishBody } from "../src/polish.js";
-import { admitConnection, FixedWindowRateLimiter } from "../src/rate-limit.js";
+import {
+  admitConnection,
+  DailyUsageLimiter,
+  FixedWindowRateLimiter,
+} from "../src/rate-limit.js";
 import { clientEventID, safeCloseCode, validateRealtimeEvent } from "../src/realtime.js";
 
 const token = "relay_test-device-token";
@@ -27,6 +38,154 @@ test("configuration requires hashed device tokens", () => {
   assert.throws(
     () => loadConfig({ ...baseEnv, RELAY_DEVICE_TOKEN_HASHES: token }),
     /SHA-256/,
+  );
+});
+
+test("enrollment configuration is either complete or disabled", () => {
+  assert.equal(loadConfig(baseEnv).enrollmentRegistryFile, "");
+  assert.throws(
+    () => loadConfig({ ...baseEnv, RELAY_ENROLLMENT_REGISTRY_FILE: "/tmp/registry.json" }),
+    /configured together/,
+  );
+  assert.throws(
+    () => loadConfig({
+      ...baseEnv,
+      RELAY_ENROLLMENT_REGISTRY_FILE: "relative.json",
+      RELAY_ADMIN_SOCKET: "/tmp/admin.sock",
+    }),
+    /must be absolute/,
+  );
+  const configured = loadConfig({
+    ...baseEnv,
+    RELAY_ENROLLMENT_REGISTRY_FILE: "/tmp/registry.json",
+    RELAY_ADMIN_SOCKET: "/tmp/admin.sock",
+  });
+  assert.equal(configured.enrollmentRegistryFile, "/tmp/registry.json");
+  assert.equal(configured.adminSocketPath, "/tmp/admin.sock");
+
+  const directory = mkdtempSync(join(tmpdir(), "whisper-empty-legacy-"));
+  const allowlist = join(directory, "device-tokens");
+  writeFileSync(allowlist, `${EMPTY_LEGACY_ALLOWLIST_SENTINEL}\n`);
+  const enrollmentEnv = {
+    ...baseEnv,
+    RELAY_DEVICE_TOKEN_FILE: allowlist,
+    RELAY_ENROLLMENT_REGISTRY_FILE: join(directory, "registry.json"),
+    RELAY_ADMIN_SOCKET: join(directory, "admin.sock"),
+  };
+  assert.equal(loadConfig(enrollmentEnv).deviceTokenHashes.size, 0);
+  assert.throws(
+    () => loadConfig({ ...baseEnv, RELAY_DEVICE_TOKEN_FILE: allowlist }),
+    /only when enrollment is configured/,
+  );
+});
+
+test("invite codes carry 128 bits and accept pasted formatting", () => {
+  const code = createInviteCode(Buffer.from("00112233445566778899aabbccddeeff", "hex"));
+  assert.equal(code, "WHISPER-00112233-44556677-8899AABB-CCDDEEFF");
+  assert.equal(normalizeInviteCode(code.toLowerCase()), "WHISPER00112233445566778899AABBCCDDEEFF");
+  assert.equal(normalizeInviteCode("not an invite"), null);
+});
+
+test("one-time invites persist only hashes and retry idempotently", () => {
+  const directory = mkdtempSync(join(tmpdir(), "whisper-enrollment-"));
+  const registryPath = join(directory, "registry.json");
+  const registry = new EnrollmentRegistry(registryPath);
+  const issued = registry.issueInvite("alice", new Date("2026-08-13T00:00:00Z"));
+  assert.equal(issued.status, "ok");
+
+  const aliceToken = `relay_${"a".repeat(43)}`;
+  const first = registry.claim(
+    issued.code,
+    aliceToken,
+    new Date("2026-08-13T00:01:00Z"),
+  );
+  assert.deepEqual(first, { status: "ok", changed: true, label: "alice" });
+  assert.deepEqual([...registry.activeTokenHashes()], [tokenDigest(aliceToken)]);
+
+  const persisted = readFileSync(registryPath, "utf8");
+  assert.ok(!persisted.includes(issued.code));
+  assert.ok(!persisted.includes(aliceToken));
+  const reloaded = new EnrollmentRegistry(registryPath);
+  assert.deepEqual(
+    reloaded.claim(issued.code.toLowerCase(), aliceToken),
+    { status: "ok", changed: false, label: "alice" },
+  );
+  assert.equal(reloaded.issueInvite("alice").status, "label_in_use");
+  assert.equal(reloaded.issueInvite("ALICE").status, "label_in_use");
+  assert.equal(reloaded.claim(issued.code, `relay_${"b".repeat(43)}`).status, "already_used");
+
+  assert.deepEqual(
+    reloaded.revokeLabel("ALICE", new Date("2026-08-13T00:02:00Z")),
+    { status: "ok", devices: 1, invites: 0 },
+  );
+  assert.equal(reloaded.activeTokenHashes().size, 0);
+  assert.equal(reloaded.claim(issued.code, aliceToken).status, "revoked");
+  const replacement = reloaded.issueInvite("alice");
+  assert.equal(replacement.status, "ok");
+  assert.equal(reloaded.claim(replacement.code, aliceToken).status, "device_in_use");
+  const legacyToken = `relay_${"d".repeat(43)}`;
+  assert.equal(
+    reloaded.claim(replacement.code, legacyToken, new Date(), {
+      isTokenHashReserved: (hash) => hash === tokenDigest(legacyToken),
+    }).status,
+    "device_in_use",
+  );
+  assert.equal(
+    reloaded.claim(replacement.code, `relay_${"c".repeat(43)}`).status,
+    "ok",
+  );
+});
+
+test("registry rejects inconsistent invite-device relationships", () => {
+  const directory = mkdtempSync(join(tmpdir(), "whisper-enrollment-invalid-"));
+  const originalPath = join(directory, "original.json");
+  const registry = new EnrollmentRegistry(originalPath);
+  const issued = registry.issueInvite("alice", new Date("2026-08-13T00:00:00.000Z"));
+  registry.claim(
+    issued.code,
+    `relay_${"a".repeat(43)}`,
+    new Date("2026-08-13T00:01:00.000Z"),
+  );
+  const original = JSON.parse(readFileSync(originalPath, "utf8"));
+
+  const rejects = (name, mutate) => {
+    const state = structuredClone(original);
+    mutate(state);
+    const path = join(directory, `${name}.json`);
+    writeFileSync(path, JSON.stringify(state));
+    assert.throws(() => new EnrollmentRegistry(path), /enrollment registry/);
+  };
+  rejects("mismatched-label", (state) => { state.devices[0].label = "bob"; });
+  rejects("mismatched-time", (state) => {
+    state.devices[0].enrolledAt = "2026-08-13T00:02:00.000Z";
+  });
+  rejects("claimed-and-cancelled", (state) => {
+    state.invites[0].cancelledAt = "2026-08-13T00:02:00.000Z";
+  });
+  rejects("orphan-device", (state) => {
+    state.invites[0].deviceTokenHash = null;
+    state.invites[0].claimedAt = null;
+  });
+  rejects("unknown-field", (state) => { state.devices[0].secret = "surprise"; });
+});
+
+test("enrollment rate limiting ignores spoofed X-Forwarded-For prefixes", () => {
+  const request = (peer, forwarded) => ({
+    socket: { remoteAddress: peer },
+    headers: forwarded === undefined ? {} : { "x-forwarded-for": forwarded },
+  });
+  assert.equal(
+    enrollmentClientAddress(request("127.0.0.1", "spoofed, 203.0.113.9")),
+    "203.0.113.9",
+  );
+  assert.equal(
+    enrollmentClientAddress(request("::ffff:127.0.0.1", "198.51.100.3")),
+    "198.51.100.3",
+  );
+  // A direct public peer cannot make the relay trust the forwarding header at all.
+  assert.equal(
+    enrollmentClientAddress(request("198.51.100.8", "203.0.113.99")),
+    "198.51.100.8",
   );
 });
 
@@ -60,6 +219,25 @@ test("defaults are loopback-bound and derived from the client's audio buffer", (
   // The app can flush its whole 610 s buffer as one turn, so the ceiling has to sit
   // above that with room to spare rather than at a round power of two below it.
   assert.ok(config.maxTurnAudioBytes > CLIENT_MAX_TURN_AUDIO_BYTES);
+  assert.equal(config.maxTranscriptionBytesPerDevicePerDay, 48_000 * 7_200);
+  assert.equal(config.maxTotalTranscriptionBytesPerDay, 48_000 * 43_200);
+  assert.equal(config.maxPolishRequestsPerDevicePerDay, 1_000);
+  assert.equal(config.maxTotalPolishRequestsPerDay, 6_000);
+
+  const overridden = loadConfig({
+    ...baseEnv,
+    MAX_TRANSCRIPTION_SECONDS_PER_DEVICE_PER_DAY: "60",
+    MAX_TOTAL_TRANSCRIPTION_SECONDS_PER_DAY: "120",
+  });
+  assert.equal(overridden.maxTranscriptionBytesPerDevicePerDay, 48_000 * 60);
+  assert.equal(overridden.maxTotalTranscriptionBytesPerDay, 48_000 * 120);
+  assert.throws(
+    () => loadConfig({
+      ...baseEnv,
+      MAX_TRANSCRIPTION_SECONDS_PER_DEVICE_PER_DAY: String(Number.MAX_SAFE_INTEGER),
+    }),
+    /too large/,
+  );
 });
 
 test("a malformed upstream URL fails at startup, not on the first user connection", () => {
@@ -250,6 +428,30 @@ test("the allowlist can be re-read from a file, and a bad file changes nothing",
     /ENOENT/,
   );
 
+  // Revoking the last legacy identity needs a representable state, but a bare empty or
+  // comment-only file must remain a rejected partial-write signal. Only enrollment
+  // deployments accept this exact, standalone operator marker.
+  assert.throws(
+    () => loadDeviceTokenHashes(env, read(`${EMPTY_LEGACY_ALLOWLIST_SENTINEL}\n`)),
+    /only when enrollment is configured/,
+  );
+  assert.deepEqual(
+    [...loadDeviceTokenHashes(
+      env,
+      read(`${EMPTY_LEGACY_ALLOWLIST_SENTINEL}\n`),
+      { allowIntentionalEmpty: true },
+    )],
+    [],
+  );
+  assert.throws(
+    () => loadDeviceTokenHashes(
+      env,
+      read(`${EMPTY_LEGACY_ALLOWLIST_SENTINEL}\n${a}\n`),
+      { allowIntentionalEmpty: true },
+    ),
+    /must be the only nonblank line/,
+  );
+
   // No file configured: the static env list, exactly as before.
   assert.deepEqual(
     [...loadDeviceTokenHashes(baseEnv)],
@@ -366,6 +568,27 @@ test("rate limiter resets at the next window", () => {
   assert.equal(limiter.take("device", 1), true);
   assert.equal(limiter.take("device", 2), false);
   assert.equal(limiter.take("device", 100), true);
+});
+
+test("rate limiter refuses unbounded attacker keys", () => {
+  const limiter = new FixedWindowRateLimiter(2, 100, 2);
+  assert.equal(limiter.take("a", 0), true);
+  assert.equal(limiter.take("b", 0), true);
+  assert.equal(limiter.take("c", 1), false);
+  assert.equal(limiter.take("c", 100), true);
+});
+
+test("daily usage checks device and total budgets atomically and resets by UTC day", () => {
+  const limiter = new DailyUsageLimiter(5, 8, 2);
+  assert.equal(limiter.take("alice", 5, 0), null);
+  assert.equal(limiter.take("alice", 1, 1), "device");
+  // The rejected unit above did not consume the global budget.
+  assert.equal(limiter.take("bob", 3, 2), null);
+  assert.equal(limiter.take("bob", 1, 3), "total");
+  assert.equal(limiter.take("carol", 1, 4), "total");
+
+  assert.equal(limiter.take("carol", 5, 86_400_000), null);
+  assert.throws(() => limiter.take("carol", 0), /positive safe integer/);
 });
 
 test("reserved WebSocket close codes are not mirrored to the other peer", () => {

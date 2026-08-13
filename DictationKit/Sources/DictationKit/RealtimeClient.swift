@@ -998,7 +998,7 @@ public final class RealtimeClient {
             // next dictation and any settings change both start a fresh attempt.
             return TransportFailure(
                 message: viaRelay
-                    ? "转发服务器拒绝了设备 Token（\(statusCode)），请在设置里重新填写"
+                    ? "转发服务器拒绝了设备凭证（\(statusCode)），请在设置里更新"
                     : "OpenAI 拒绝了 API Key（\(statusCode)），请在设置里重新填写",
                 retryable: false,
                 rejectedCredential: true

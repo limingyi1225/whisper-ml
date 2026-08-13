@@ -6,6 +6,7 @@ public enum KeychainStore {
     private static let service = "com.mingyili.Whisper"
     private static let apiKeyAccount = "openai-api-key"
     private static let relayTokenAccount = "relay-device-token"
+    private static let pendingRelayTokenAccount = "relay-pending-enrollment-token"
 
     public static func loadAPIKey() -> String? {
         load(account: apiKeyAccount)
@@ -13,6 +14,95 @@ public enum KeychainStore {
 
     public static func loadRelayToken() -> String? {
         load(account: relayTokenAccount)
+    }
+
+    /// A generic build proposes its own final device token when claiming an invite.
+    /// Keeping that proposal in a separate keychain item makes enrollment idempotent:
+    /// if the server commits the invite but the response is lost, the retry presents
+    /// the same token and receives success instead of burning a second invite.
+    public static func pendingRelayEnrollmentToken() -> String? {
+        load(account: pendingRelayTokenAccount)
+    }
+
+    public static func prepareRelayEnrollmentToken() throws -> String {
+        if let pending = pendingRelayEnrollmentToken(), isGeneratedRelayToken(pending) {
+            return pending
+        }
+        _ = delete(account: pendingRelayTokenAccount)
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess,
+              let token = relayToken(randomBytes: Data(bytes)),
+              save(token, account: pendingRelayTokenAccount) else {
+            throw RelayEnrollmentCredentialError.couldNotPrepareToken
+        }
+        return token
+    }
+
+    /// Promotes only after a 200 response. The live item is written first: failure to
+    /// remove the now-redundant pending copy is harmless, while removing first and then
+    /// failing the live write would lose an invite the server already consumed.
+    @discardableResult
+    public static func commitPendingRelayEnrollmentToken(expectedToken: String) -> Bool {
+        // The caller holds the cross-process enrollment transaction lock. Still bind
+        // promotion to the proposal that received 200, so stale responses and future
+        // callers cannot promote "whatever happens to be pending".
+        let pending = pendingRelayEnrollmentToken()
+        switch relayEnrollmentCommitDecision(
+            liveToken: loadRelayToken(),
+            pendingToken: pending,
+            expectedToken: expectedToken
+        ) {
+        case .alreadyCommitted:
+            // Two processes can receive the idempotent 200 for the same proposal.
+            // The first has already promoted it, so the missing pending item is success,
+            // not a credential-storage failure. Only clean up if it is still ours.
+            if pending == expectedToken { _ = delete(account: pendingRelayTokenAccount) }
+            return true
+        case .promotePending:
+            break
+        case .reject:
+            return false
+        }
+        guard saveRelayToken(expectedToken) else { return false }
+        if pendingRelayEnrollmentToken() == expectedToken {
+            _ = delete(account: pendingRelayTokenAccount)
+        }
+        return true
+    }
+
+    public nonisolated static func relayEnrollmentCommitDecision(
+        liveToken: String?,
+        pendingToken: String?,
+        expectedToken: String
+    ) -> RelayEnrollmentCommitDecision {
+        if liveToken == expectedToken { return .alreadyCommitted }
+        if pendingToken == expectedToken { return .promotePending }
+        return .reject
+    }
+
+    @discardableResult
+    public static func resetPendingRelayEnrollmentToken(expectedToken: String) -> Bool {
+        // The caller holds the cross-process transaction lock. The value check is for
+        // response provenance, not a claim that two separate Keychain calls form CAS.
+        guard pendingRelayEnrollmentToken() == expectedToken else { return false }
+        return delete(account: pendingRelayTokenAccount)
+    }
+
+    public nonisolated static func relayToken(randomBytes: Data) -> String? {
+        guard randomBytes.count == 32 else { return nil }
+        let encoded = randomBytes.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "relay_\(encoded)"
+    }
+
+    public nonisolated static func isGeneratedRelayToken(_ value: String) -> Bool {
+        guard value.hasPrefix("relay_") else { return false }
+        let suffix = value.dropFirst(6)
+        return suffix.count == 43 && suffix.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
+        }
     }
 
     /// A relay device token baked into this copy of the app when it was packaged.
@@ -31,6 +121,13 @@ public enum KeychainStore {
                 as? String,
               value.hasPrefix("relay_") else { return nil }
         return value
+    }
+
+    /// Stamped into the one generic distribution build. It carries no credential; it
+    /// only tells first launch to offer invite enrollment instead of opening in direct
+    /// mode with an empty API-key field.
+    public static var inviteEnrollmentEnabled: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "WhisperInviteEnrollment") as? Bool == true
     }
 
     /// When this build's bundled token was issued (epoch seconds), stamped in by
@@ -242,5 +339,19 @@ public enum KeychainStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+    }
+}
+
+public enum RelayEnrollmentCommitDecision: Equatable, Sendable {
+    case alreadyCommitted
+    case promotePending
+    case reject
+}
+
+public enum RelayEnrollmentCredentialError: LocalizedError {
+    case couldNotPrepareToken
+
+    public var errorDescription: String? {
+        "无法在钥匙串中准备设备身份"
     }
 }

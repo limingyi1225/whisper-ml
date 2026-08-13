@@ -23,6 +23,39 @@ struct WhisperApp: App {
     }
 }
 
+/// Keeps first-launch routing and the Settings prompt on the same contract.
+/// An existing direct-mode user must never be rerouted just because this generic
+/// build has no relay token; conversely, an API key left in the Keychain must not hide
+/// activation when the user has explicitly selected relay mode.
+enum InviteEnrollmentOnboarding {
+    static func shouldDefaultToRelay(
+        inviteEnrollmentEnabled: Bool,
+        hasRelayToken: Bool,
+        hasAPIKey: Bool,
+        connectionModeWasChosen: Bool
+    ) -> Bool {
+        inviteEnrollmentEnabled
+            && !hasRelayToken
+            && !hasAPIKey
+            && !connectionModeWasChosen
+    }
+
+    static func shouldPresentInvite(
+        inviteEnrollmentEnabled: Bool,
+        hasRelayToken: Bool,
+        hasAPIKey: Bool,
+        connectionModeWasChosen: Bool,
+        connectionMode: ConnectionMode
+    ) -> Bool {
+        guard inviteEnrollmentEnabled, !hasRelayToken else { return false }
+        // Do not depend on AppDelegate having already persisted the fresh-install
+        // default before SwiftUI starts the menu-label task. The second branch is the
+        // same fresh/no-credential predicate used by `shouldDefaultToRelay`, so the
+        // prompt cannot be lost to launch ordering.
+        return connectionMode == .relay || (!connectionModeWasChosen && !hasAPIKey)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCloseObserver: NSObjectProtocol?
     private var workspaceActivationObserver: NSObjectProtocol?
@@ -61,6 +94,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // personalised build silently switched them to the relay.
         let modeWasChosen = AppSettings.connectionModeWasChosen
         if KeychainStore.seedBundledRelayTokenIfNeeded(), !modeWasChosen {
+            AppSettings.shared.connectionMode = .relay
+        } else if InviteEnrollmentOnboarding.shouldDefaultToRelay(
+            inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
+            hasRelayToken: KeychainStore.hasRelayToken(),
+            hasAPIKey: KeychainStore.hasAPIKey(),
+            connectionModeWasChosen: modeWasChosen
+        ) {
             AppSettings.shared.connectionMode = .relay
         }
 

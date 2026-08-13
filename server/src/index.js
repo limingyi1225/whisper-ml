@@ -1,21 +1,74 @@
 import http from "node:http";
+import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import { WebSocketServer } from "ws";
 
 import { authenticateRequest } from "./auth.js";
 import { allowlistDigest, loadConfig, loadDeviceTokenHashes } from "./config.js";
+import {
+  EnrollmentRegistry,
+  handleEnrollment,
+  handleEnrollmentAdmin,
+} from "./enrollment.js";
 import { errorBody, routePath, writeJSON } from "./http.js";
 import { handlePolish } from "./polish.js";
-import { admitConnection, FixedWindowRateLimiter } from "./rate-limit.js";
+import {
+  admitConnection,
+  DailyUsageLimiter,
+  FixedWindowRateLimiter,
+} from "./rate-limit.js";
 import { bridgeRealtime, revokeDownstream } from "./realtime.js";
 
 const config = loadConfig();
+const enrollmentRegistry = config.enrollmentRegistryFile
+  ? new EnrollmentRegistry(config.enrollmentRegistryFile)
+  : null;
 
 /// Mutable copy of the allowlist, so a token can be issued or revoked without a restart.
 ///
 /// Restarting drops every open WebSocket, and the app treats that as a failed utterance:
 /// handing a build to one new person would have cost everyone else mid-sentence the
 /// sentence they were speaking. `systemctl reload` sends SIGHUP instead.
-let deviceTokenHashes = new Set(config.deviceTokenHashes);
+let legacyTokenHashes = new Set(config.deviceTokenHashes);
+if (enrollmentRegistry) {
+  const enrollmentHashes = enrollmentRegistry.allTokenHashes();
+  for (const hash of legacyTokenHashes) {
+    if (enrollmentHashes.has(hash)) {
+      throw new Error("a device token cannot belong to both legacy and enrollment auth");
+    }
+  }
+}
+let deviceTokenHashes = combinedTokenHashes();
+
+function combinedTokenHashes() {
+  return new Set([
+    ...legacyTokenHashes,
+    ...(enrollmentRegistry?.activeTokenHashes() || []),
+  ]);
+}
+
+function applyAuthorization(nextLegacy = legacyTokenHashes) {
+  legacyTokenHashes = nextLegacy;
+  const next = combinedTokenHashes();
+  deviceTokenHashes = next;
+
+  let revoked = 0;
+  for (const [socket, session] of downstreamSockets) {
+    if (next.has(session.deviceID)) continue;
+    revoked += 1;
+    // Not a bare close(): stop forwarding immediately, and take the paid upstream
+    // session with it rather than waiting for the WebSocket close handshake.
+    revokeDownstream(socket, { upstream: session.upstream });
+  }
+
+  let abortedRequests = 0;
+  for (const { deviceID, abort } of inflightPolish) {
+    if (next.has(deviceID)) continue;
+    abortedRequests += 1;
+    abort();
+  }
+  return { next, revoked, abortedRequests };
+}
 
 process.on("SIGHUP", () => {
   if (!config.deviceTokenFile) {
@@ -23,34 +76,22 @@ process.on("SIGHUP", () => {
     return;
   }
   try {
-    const next = loadDeviceTokenHashes(process.env);
+    const nextLegacy = loadDeviceTokenHashes(process.env, null, {
+      allowIntentionalEmpty: enrollmentRegistry !== null,
+    });
+    const enrollmentHashes = enrollmentRegistry?.allTokenHashes() || new Set();
+    if ([...nextLegacy].some((hash) => enrollmentHashes.has(hash))) {
+      throw new Error("a device token cannot belong to both legacy and enrollment auth");
+    }
     // Swapped only after a clean parse. A half-written or truncated file must leave the
     // running allowlist alone rather than locking every device out until someone
     // notices — the failure mode of "reload" should never be worse than not reloading.
-    deviceTokenHashes = next;
-
     // Swapping the list is not revocation. A device is authenticated once, during the
     // upgrade, and the app then holds that socket for the life of the session — so
     // without this a revoked person keeps transcribing until their session happens to
     // refresh, which is up to half an hour away. Close theirs and only theirs; leaving
     // everyone else connected is the entire reason this is a reload and not a restart.
-    let revoked = 0;
-    for (const [socket, session] of downstreamSockets) {
-      if (next.has(session.deviceID)) continue;
-      revoked += 1;
-      // Not a bare close(): frames keep being parsed and forwarded for the whole
-      // CLOSING wait, so a revoked device could keep dictating on the server's key
-      // until the terminate timer fired. revokeDownstream pauses the stream first,
-      // and takes the upstream so the OpenAI session dies now, not at the reap.
-      revokeDownstream(socket, { upstream: session.upstream });
-    }
-
-    let abortedRequests = 0;
-    for (const { deviceID, abort } of inflightPolish) {
-      if (next.has(deviceID)) continue;
-      abortedRequests += 1;
-      abort();
-    }
+    const { next, revoked, abortedRequests } = applyAuthorization(nextLegacy);
     process.stdout.write(
       `reloaded allowlist: ${next.size} device tokens, ${revoked} connection(s) `
       + `and ${abortedRequests} in-flight request(s) revoked\n`,
@@ -63,6 +104,19 @@ process.on("SIGHUP", () => {
 });
 const polishRateLimiter = new FixedWindowRateLimiter(
   config.maxPolishRequestsPerMinute,
+);
+const enrollmentRateLimiter = new FixedWindowRateLimiter(
+  config.maxEnrollmentAttemptsPerMinute,
+  60_000,
+  2_000,
+);
+const transcriptionDailyUsage = new DailyUsageLimiter(
+  config.maxTranscriptionBytesPerDevicePerDay,
+  config.maxTotalTranscriptionBytesPerDay,
+);
+const polishDailyUsage = new DailyUsageLimiter(
+  config.maxPolishRequestsPerDevicePerDay,
+  config.maxTotalPolishRequestsPerDay,
 );
 const activeConnections = new Map();
 /// socket → { deviceID, upstream }: the device hash it authenticated as, so a reload
@@ -90,7 +144,33 @@ const server = http.createServer(async (request, response) => {
       ok: true,
       tokens: deviceTokenHashes.size,
       allowlist: allowlistDigest(deviceTokenHashes),
+      legacyTokens: legacyTokenHashes.size,
+      legacyAllowlist: allowlistDigest(legacyTokenHashes),
+      enrolledTokens: enrollmentRegistry?.activeTokenHashes().size || 0,
+      enrollment: enrollmentRegistry !== null,
     });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/v1/enroll" && enrollmentRegistry) {
+    try {
+      await handleEnrollment(request, response, {
+        registry: enrollmentRegistry,
+        rateLimiter: enrollmentRateLimiter,
+        onAuthorizationChanged: () => applyAuthorization(),
+        // An enrollment identity must not alias a legacy credential. Otherwise
+        // revoking either source would appear successful while the same hash remained
+        // authorised by the other source.
+        isTokenHashReserved: (hash) => legacyTokenHashes.has(hash),
+      });
+    } catch (error) {
+      process.stderr.write(`enrollment handler failed: ${error.stack || error.message}\n`);
+      if (!response.headersSent) {
+        writeJSON(response, 500, errorBody("激活服务内部错误", "enrollment_internal_error"));
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    }
     return;
   }
 
@@ -131,6 +211,7 @@ const server = http.createServer(async (request, response) => {
         inflightPolish.add(entry);
         return () => inflightPolish.delete(entry);
       },
+      takeDailyQuota: () => polishDailyUsage.take(deviceID),
     });
   } catch (error) {
     process.stderr.write(`polish handler failed: ${error.stack || error.message}\n`);
@@ -218,7 +299,9 @@ server.on("upgrade", (request, socket, head) => {
     // dies and every other user's session goes with it. One bad connection should cost
     // one connection.
     try {
-      session.upstream = bridgeRealtime(downstream, config);
+      session.upstream = bridgeRealtime(downstream, config, {
+        consumeAudio: (bytes) => transcriptionDailyUsage.take(deviceID, bytes),
+      });
     } catch (error) {
       process.stderr.write(`bridge failed to start: ${error.message}\n`);
       downstream.close(1011, "relay could not reach OpenAI");
@@ -233,10 +316,49 @@ server.listen(config.port, config.host, () => {
   );
 });
 
+let adminServer = null;
+if (enrollmentRegistry) {
+  // The public reverse proxy only reaches the TCP listener above. This second server
+  // exists solely on a mode-0600 Unix socket created inside systemd's RuntimeDirectory,
+  // so issuing or revoking access never becomes a bearer-secret admin endpoint on the
+  // internet.
+  mkdirSync(dirname(config.adminSocketPath), { recursive: true, mode: 0o700 });
+  rmSync(config.adminSocketPath, { force: true });
+  adminServer = http.createServer((request, response) => {
+    void handleEnrollmentAdmin(request, response, {
+      registry: enrollmentRegistry,
+      onAuthorizationChanged: () => applyAuthorization(),
+    }).catch((error) => {
+      process.stderr.write(`enrollment admin failed: ${error.stack || error.message}\n`);
+      if (!response.headersSent) {
+        writeJSON(response, 500, errorBody("internal error", "admin_internal_error"));
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    });
+  });
+  adminServer.listen(config.adminSocketPath, () => {
+    chmodSync(config.adminSocketPath, 0o600);
+    process.stdout.write(`Whisper enrollment admin listening on ${config.adminSocketPath}\n`);
+  });
+}
+
+let shuttingDown = false;
 function shutdown() {
-  for (const socket of downstreamSockets.keys()) {
-    socket.close(1012, "server restarting");
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // A normal close handshake keeps `message` listeners alive while CLOSING. Stop the
+  // paid paths synchronously during a deploy too; otherwise a peer that delays its FIN
+  // can keep forwarding audio until systemd's kill timeout expires.
+  for (const [socket, session] of downstreamSockets) {
+    revokeDownstream(socket, {
+      upstream: session.upstream,
+      closeCode: 1012,
+      closeReason: "server restarting",
+    });
   }
+  for (const { abort } of inflightPolish) abort();
+  adminServer?.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref();
 }

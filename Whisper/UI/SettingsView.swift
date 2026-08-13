@@ -6,7 +6,13 @@ import SwiftUI
 
 struct SettingsView: View {
     let controller: DictationController
-    @State private var selectedTab = SettingsTab.dictation
+    @State private var selectedTab = InviteEnrollmentOnboarding.shouldPresentInvite(
+        inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
+        hasRelayToken: KeychainStore.hasRelayToken(),
+        hasAPIKey: KeychainStore.hasAPIKey(),
+        connectionModeWasChosen: AppSettings.connectionModeWasChosen,
+        connectionMode: AppSettings.shared.connectionMode
+    ) ? SettingsTab.setup : .dictation
 
     private enum SettingsTab: Hashable {
         case dictation
@@ -277,10 +283,14 @@ private struct SetupSettingsTab: View {
     @State private var isEditingAPIKey = false
     @State private var apiKeyError: String?
 
-    @State private var relayTokenField = ""
+    @State private var inviteCodeField = ""
+    @State private var legacyRelayTokenField = ""
     @State private var relayTokenStored = KeychainStore.hasRelayToken()
     @State private var isEditingRelayToken = false
+    @State private var isActivatingRelay = false
     @State private var relayTokenError: String?
+    @State private var relayEnrollmentTask: Task<Void, Never>?
+    @State private var relayEnrollmentAttemptID: UUID?
 
     private let refresh = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
@@ -334,6 +344,12 @@ private struct SetupSettingsTab: View {
             accessibilityGranted = Permissions.hasAccessibility
             microphoneStatus = Permissions.microphoneStatus
         }
+        .onDisappear {
+            relayEnrollmentTask?.cancel()
+            relayEnrollmentTask = nil
+            relayEnrollmentAttemptID = nil
+            isActivatingRelay = false
+        }
     }
 
     @ViewBuilder
@@ -374,35 +390,91 @@ private struct SetupSettingsTab: View {
     @ViewBuilder
     private var relayCredentialEditor: some View {
         if relayTokenStored && !isEditingRelayToken {
-            savedCredentialRow(title: "设备 Token") {
-                relayTokenField = ""
+            savedCredentialRow(title: "设备") {
+                inviteCodeField = ""
+                legacyRelayTokenField = ""
                 relayTokenError = nil
                 isEditingRelayToken = true
             }
+        } else if KeychainStore.inviteEnrollmentEnabled {
+            inviteEnrollmentEditor
         } else {
+            legacyRelayTokenEditor
+        }
+    }
+
+    private var inviteEnrollmentEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                SecureField("设备 Token", text: $relayTokenField, prompt: Text("relay_…"))
-                    .onChange(of: relayTokenField) { relayTokenError = nil }
-                    .onSubmit { saveRelayToken() }
+                SecureField("邀请码", text: $inviteCodeField, prompt: Text("WHISPER-…"))
+                    .textContentType(.oneTimeCode)
+                    .onChange(of: inviteCodeField) { relayTokenError = nil }
+                    .onSubmit { activateRelay() }
+                    .disabled(isActivatingRelay)
 
                 if relayTokenStored {
                     Button("取消") {
-                        relayTokenField = ""
+                        inviteCodeField = ""
+                        relayTokenError = nil
+                        isEditingRelayToken = false
+                    }
+                    .disabled(isActivatingRelay)
+                }
+
+                Button(action: activateRelay) {
+                    if isActivatingRelay {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(relayTokenStored ? "重新激活" : "激活")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    inviteCodeField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || isActivatingRelay
+                )
+            }
+
+            relayCredentialError
+        }
+    }
+
+    /// Plain and personalised builds predate public invite enrollment and still need
+    /// their original manual-token recovery path. Hiding it behind the public-build
+    /// flag keeps the generic DMG invite-only without breaking those release formats.
+    private var legacyRelayTokenEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                SecureField("设备 Token", text: $legacyRelayTokenField, prompt: Text("relay_…"))
+                    .onChange(of: legacyRelayTokenField) { relayTokenError = nil }
+                    .onSubmit { saveLegacyRelayToken() }
+
+                if relayTokenStored {
+                    Button("取消") {
+                        legacyRelayTokenField = ""
                         relayTokenError = nil
                         isEditingRelayToken = false
                     }
                 }
 
-                Button(relayTokenStored ? "更新" : "保存", action: saveRelayToken)
+                Button(relayTokenStored ? "更新" : "保存", action: saveLegacyRelayToken)
                     .buttonStyle(.borderedProminent)
-                    .disabled(relayTokenField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(
+                        legacyRelayTokenField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
             }
 
-            if let relayTokenError {
-                Label(relayTokenError, systemImage: "exclamationmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(Color.red)
-            }
+            relayCredentialError
+        }
+    }
+
+    @ViewBuilder
+    private var relayCredentialError: some View {
+        if let relayTokenError {
+            Label(relayTokenError, systemImage: "exclamationmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(Color.red)
         }
     }
 
@@ -435,14 +507,51 @@ private struct SetupSettingsTab: View {
         controller.reconnect()
     }
 
-    private func saveRelayToken() {
-        let token = relayTokenField.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func activateRelay() {
+        let invite = inviteCodeField.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !invite.isEmpty, !isActivatingRelay else { return }
+        guard RelayEnrollmentClient.isPlausibleInviteCode(invite) else {
+            relayTokenError = "邀请码格式不正确"
+            return
+        }
+        isActivatingRelay = true
+        relayTokenError = nil
+        let attemptID = UUID()
+        relayEnrollmentAttemptID = attemptID
+        relayEnrollmentTask = Task {
+            defer {
+                // A cancelled task can finish after this view reappears and starts a
+                // newer activation. It may clean up only its own attempt; otherwise it
+                // would enable the button and discard the new task's cancellation handle.
+                if relayEnrollmentAttemptID == attemptID {
+                    isActivatingRelay = false
+                    relayEnrollmentTask = nil
+                    relayEnrollmentAttemptID = nil
+                }
+            }
+            do {
+                try await RelayEnrollmentClient().enroll(inviteCode: invite)
+                guard !Task.isCancelled else { return }
+                inviteCodeField = ""
+                relayTokenStored = true
+                isEditingRelayToken = false
+                settings.connectionMode = .relay
+                controller.reconnect()
+            } catch {
+                guard !Task.isCancelled else { return }
+                relayTokenError = error.localizedDescription
+            }
+        }
+    }
+
+    private func saveLegacyRelayToken() {
+        let token = legacyRelayTokenField.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { return }
         guard KeychainStore.saveRelayToken(token) else {
             relayTokenError = "无法写入钥匙串"
             return
         }
-        relayTokenField = ""
+        legacyRelayTokenField = ""
         relayTokenStored = true
         isEditingRelayToken = false
         relayTokenError = nil

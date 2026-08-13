@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync as nodeReadFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 /// The Mac app buffers at most 610 s of 24 kHz PCM16 mono (48 000 B/s) while
 /// disconnected mid-utterance and flushes it in one burst on reconnect. Every relay
@@ -7,6 +8,9 @@ import { readFileSync as nodeReadFileSync } from "node:fs";
 /// picked as a round power of two, so raising the client buffer cannot silently start
 /// tripping a server limit.
 const CLIENT_MAX_TURN_AUDIO_BYTES = 48_000 * 610;
+const PCM_BYTES_PER_SECOND = 48_000;
+export const EMPTY_LEGACY_ALLOWLIST_SENTINEL =
+  "# whisper-relay: intentionally empty legacy allowlist";
 /// Base64 inflates the wire size by 4/3.
 const CLIENT_MAX_TURN_WIRE_BYTES = Math.ceil(CLIENT_MAX_TURN_AUDIO_BYTES / 3) * 4;
 
@@ -25,6 +29,13 @@ const DEFAULTS = Object.freeze({
   maxPolishBodyBytes: 128 * 1024,
   maxPolishResponseBytes: 1024 * 1024,
   maxPolishRequestsPerMinute: 30,
+  maxEnrollmentAttemptsPerMinute: 10,
+  // Closed-beta cost backstops. The per-device ceiling contains one leaked token;
+  // the global ceiling contains several honest-but-simultaneously-busy devices.
+  maxTranscriptionSecondsPerDevicePerDay: 2 * 60 * 60,
+  maxTotalTranscriptionSecondsPerDay: 12 * 60 * 60,
+  maxPolishRequestsPerDevicePerDay: 1_000,
+  maxTotalPolishRequestsPerDay: 6_000,
   // Generous ceiling on a *tidy-up* reply. The app's entire 610 s audio buffer
   // transcribes to well under this, so hitting it means something is wrong rather
   // than that a real sentence was too long.
@@ -62,6 +73,13 @@ function positiveInteger(env, name, fallback) {
   return value;
 }
 
+function audioBytesPerDay(env, name, fallbackSeconds) {
+  const seconds = positiveInteger(env, name, fallbackSeconds);
+  const bytes = seconds * PCM_BYTES_PER_SECOND;
+  if (!Number.isSafeInteger(bytes)) throw new Error(`${name} is too large`);
+  return bytes;
+}
+
 /// The Mac app addresses the relay at `<base>/v1/...`, so a relay published under a
 /// path prefix only works if something strips it. Rather than depend on the reverse
 /// proxy being configured with the right trailing slash — a mistake that shows up as a
@@ -96,7 +114,29 @@ function endpointURL(env, name, fallback, allowedProtocols) {
 /// Accepts both shapes: the env var's comma-separated list, and the file's one-per-line
 /// form with `#` comments. Comments are stripped per line *before* splitting — stripping
 /// after would turn "# issued to alice" into four tokens and only discard the "#".
-function parseTokenHashes(raw, source) {
+function parseTokenHashes(raw, source, { allowIntentionalEmpty = false } = {}) {
+  const nonblankLines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const hasEmptySentinel = nonblankLines.includes(EMPTY_LEGACY_ALLOWLIST_SENTINEL);
+  if (hasEmptySentinel) {
+    if (!allowIntentionalEmpty) {
+      throw new Error(
+        `${source} may be intentionally empty only when enrollment is configured`,
+      );
+    }
+    // The marker is deliberately an all-or-nothing file contract. If it could sit
+    // beside hashes, a later partial write that happened to leave only the marker
+    // would look like an operator-approved revoke-all rather than corruption.
+    if (nonblankLines.length !== 1) {
+      throw new Error(
+        `${source} empty-allowlist sentinel must be the only nonblank line`,
+      );
+    }
+    return new Set();
+  }
+
   const hashes = new Set(
     raw
       .toLowerCase()
@@ -123,11 +163,15 @@ function parseTokenHashes(raw, source) {
 /// live there. A separate 0644 file can be re-read on SIGHUP — and these are SHA-256
 /// hashes, not tokens, so nothing readable is replayable. `RELAY_DEVICE_TOKEN_HASHES`
 /// stays as the static fallback for setups (and tests) with no file.
-export function loadDeviceTokenHashes(env = process.env, readFile = null) {
+export function loadDeviceTokenHashes(
+  env = process.env,
+  readFile = null,
+  { allowIntentionalEmpty = false } = {},
+) {
   const path = env.RELAY_DEVICE_TOKEN_FILE?.trim();
   if (path) {
     const read = readFile || ((p) => nodeReadFileSync(p, "utf8"));
-    return parseTokenHashes(read(path), path);
+    return parseTokenHashes(read(path), path, { allowIntentionalEmpty });
   }
   return parseTokenHashes(
     required(env, "RELAY_DEVICE_TOKEN_HASHES"),
@@ -166,11 +210,27 @@ function commaSeparatedSet(raw) {
 }
 
 export function loadConfig(env = process.env) {
-  const deviceTokenHashes = loadDeviceTokenHashes(env);
+  const enrollmentRegistryFile = env.RELAY_ENROLLMENT_REGISTRY_FILE?.trim() || "";
+  const adminSocketPath = env.RELAY_ADMIN_SOCKET?.trim() || "";
+  if ((enrollmentRegistryFile === "") !== (adminSocketPath === "")) {
+    throw new Error(
+      "RELAY_ENROLLMENT_REGISTRY_FILE and RELAY_ADMIN_SOCKET must be configured together",
+    );
+  }
+  if ((enrollmentRegistryFile && !isAbsolute(enrollmentRegistryFile))
+      || (adminSocketPath && !isAbsolute(adminSocketPath))) {
+    throw new Error("enrollment registry and admin socket paths must be absolute");
+  }
+  const enrollmentEnabled = enrollmentRegistryFile !== "";
+  const deviceTokenHashes = loadDeviceTokenHashes(env, null, {
+    allowIntentionalEmpty: enrollmentEnabled,
+  });
 
   return Object.freeze({
     /// Where to re-read the allowlist from on SIGHUP; empty means it is static.
     deviceTokenFile: env.RELAY_DEVICE_TOKEN_FILE?.trim() || "",
+    enrollmentRegistryFile,
+    adminSocketPath,
     host: env.HOST?.trim() || DEFAULTS.host,
     port: positiveInteger(env, "PORT", DEFAULTS.port),
     basePath: normalizeBasePath(env.RELAY_BASE_PATH) || DEFAULTS.basePath,
@@ -229,6 +289,31 @@ export function loadConfig(env = process.env) {
       env,
       "MAX_POLISH_REQUESTS_PER_MINUTE",
       DEFAULTS.maxPolishRequestsPerMinute,
+    ),
+    maxEnrollmentAttemptsPerMinute: positiveInteger(
+      env,
+      "MAX_ENROLLMENT_ATTEMPTS_PER_MINUTE",
+      DEFAULTS.maxEnrollmentAttemptsPerMinute,
+    ),
+    maxTranscriptionBytesPerDevicePerDay: audioBytesPerDay(
+      env,
+      "MAX_TRANSCRIPTION_SECONDS_PER_DEVICE_PER_DAY",
+      DEFAULTS.maxTranscriptionSecondsPerDevicePerDay,
+    ),
+    maxTotalTranscriptionBytesPerDay: audioBytesPerDay(
+      env,
+      "MAX_TOTAL_TRANSCRIPTION_SECONDS_PER_DAY",
+      DEFAULTS.maxTotalTranscriptionSecondsPerDay,
+    ),
+    maxPolishRequestsPerDevicePerDay: positiveInteger(
+      env,
+      "MAX_POLISH_REQUESTS_PER_DEVICE_PER_DAY",
+      DEFAULTS.maxPolishRequestsPerDevicePerDay,
+    ),
+    maxTotalPolishRequestsPerDay: positiveInteger(
+      env,
+      "MAX_TOTAL_POLISH_REQUESTS_PER_DAY",
+      DEFAULTS.maxTotalPolishRequestsPerDay,
     ),
     maxPolishCompletionTokens: positiveInteger(
       env,

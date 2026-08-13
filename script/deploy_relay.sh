@@ -4,12 +4,15 @@
 # -E so the ERR trap below is inherited by functions and subshells; without it a
 # failure inside one silently skips the rollback.
 set -Eeuo pipefail
+[ "$#" -eq 0 ] || { echo "usage: $0" >&2; exit 2; }
 
 HOST="${RELAY_SSH_HOST:-nyuclass}"
 REMOTE_DIR=/opt/whisper-relay
 ENV_FILE=/etc/whisper-relay.env
 BACKUPS=/opt/whisper-relay-backups
 TOKEN_FILE=/opt/whisper-relay/device-tokens
+REGISTRY_FILE=/var/lib/whisper-relay/registry.json
+ADMIN_SOCKET=/run/whisper-relay/admin.sock
 BASE_PATH="${RELAY_BASE_PATH:-/whisper-relay}"
 PUBLIC_HEALTH="${RELAY_PUBLIC_HEALTH:-https://limingyi.com/whisper-relay/healthz}"
 
@@ -40,8 +43,9 @@ restore_backup() {
   # by deleting it, back to not existing. Otherwise it is left strictly alone: it is
   # live data, and "rolling back" an allowlist means resurrecting revoked tokens.
   ssh "$HOST" "set -e
-    rm -rf $REMOTE_DIR/src
+    rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts
     cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src
+    cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts
     cp -a $BACKUPS/env-$STAMP $ENV_FILE
     cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service
     cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
@@ -63,7 +67,7 @@ on_failure() {
     echo "!! rolled back to $STAMP" >&2
   else
     echo "!! ROLLBACK ALSO FAILED — the relay is down; restore by hand:" >&2
-    echo "   ssh $HOST 'cd $REMOTE_DIR && cp -a $BACKUPS/src-$STAMP src && cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service && systemctl daemon-reload && npm ci --omit=dev && systemctl restart whisper-relay'" >&2
+    echo "   ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'" >&2
   fi
   exit 1
 }
@@ -151,6 +155,10 @@ if [ -z "$SMOKE_TOKEN" ] && [ "${RELAY_SKIP_SMOKE:-0}" != "1" ]; then
   echo "   or re-run with RELAY_SKIP_SMOKE=1 to accept the weaker check." >&2
   exit 1
 fi
+if [ -n "$SMOKE_TOKEN" ] && [[ ! "$SMOKE_TOKEN" =~ ^relay_[A-Za-z0-9_-]{40,80}$ ]]; then
+  echo "!! the smoke-test device token has an invalid format" >&2
+  exit 1
+fi
 [ -n "$SMOKE_TOKEN" ] || echo "    RELAY_SKIP_SMOKE=1 — the smoke test will not run"
 
 echo "==> backing up current deployment on $HOST"
@@ -166,15 +174,19 @@ STAMP=$(ssh "$HOST" "set -e
   # data, not part of the code version, and 'rolling it back' would resurrect tokens
   # revoked since the stamp. It exists so a lost file is recoverable by hand.
   if [ -f $TOKEN_FILE ]; then cp -a $TOKEN_FILE $BACKUPS/device-tokens-\$STAMP; fi
-  cp -a $REMOTE_DIR/package.json $REMOTE_DIR/package-lock.json \
+  # Also a disaster copy only. Enrollment state is live data: restoring an older copy
+  # would make used invites reusable and revive devices revoked after this deployment.
+  if [ -f $REGISTRY_FILE ]; then cp -a $REGISTRY_FILE $BACKUPS/enrollment-registry-\$STAMP; fi
+  cp -a $REMOTE_DIR/scripts $BACKUPS/scripts-\$STAMP
+  cp -a $REMOTE_DIR/package.json $REMOTE_DIR/package-lock.json $REMOTE_DIR/.env.example \
      $BACKUPS/manifests-\$STAMP/
   printf '%s' \"\$STAMP\"")
 echo "    backup stamp: $STAMP"
 
 echo "==> uploading src/ and scripts/"
 REMOTE_DIRTY=1
-tar czf - src scripts package.json package-lock.json .env.example \
-  | ssh "$HOST" "mkdir -p $REMOTE_DIR && tar xzf - -C $REMOTE_DIR"
+COPYFILE_DISABLE=1 tar czf - src scripts package.json package-lock.json .env.example \
+  | ssh "$HOST" "set -e; mkdir -p $REMOTE_DIR; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; tar xzf - -C $REMOTE_DIR"
 
 echo "==> installing dependencies from the uploaded lockfile"
 # Without this the box keeps whatever node_modules it already had, so a new or upgraded
@@ -188,11 +200,18 @@ echo "==> reconciling $ENV_FILE"
 # a hand-picked constant that can drift away from it.
 ssh "$HOST" "set -e
   umask 077
-  sed -i '/^RELAY_BASE_PATH=/d;/^CLIENT_HEARTBEAT_INTERVAL_MS=/d;/^MAX_TURN_AUDIO_BYTES=/d;/^ALLOWED_POLISH_MODELS=/d;/^ALLOWED_TRANSCRIPTION_MODELS=/d' $ENV_FILE
+  sed -i '/^RELAY_BASE_PATH=/d;/^CLIENT_HEARTBEAT_INTERVAL_MS=/d;/^MAX_TURN_AUDIO_BYTES=/d;/^ALLOWED_POLISH_MODELS=/d;/^ALLOWED_TRANSCRIPTION_MODELS=/d;/^RELAY_ENROLLMENT_REGISTRY_FILE=/d;/^RELAY_ADMIN_SOCKET=/d;/^MAX_ENROLLMENT_ATTEMPTS_PER_MINUTE=/d;/^MAX_TRANSCRIPTION_SECONDS_PER_DEVICE_PER_DAY=/d;/^MAX_TOTAL_TRANSCRIPTION_SECONDS_PER_DAY=/d;/^MAX_POLISH_REQUESTS_PER_DEVICE_PER_DAY=/d;/^MAX_TOTAL_POLISH_REQUESTS_PER_DAY=/d' $ENV_FILE
   printf 'RELAY_BASE_PATH=%s\n' '$BASE_PATH' >> $ENV_FILE
   printf 'CLIENT_HEARTBEAT_INTERVAL_MS=25000\n' >> $ENV_FILE
   printf 'ALLOWED_POLISH_MODELS=%s\n' '$POLISH_MODEL' >> $ENV_FILE
-  printf 'ALLOWED_TRANSCRIPTION_MODELS=%s\n' '$TRANSCRIPTION_MODELS' >> $ENV_FILE"
+  printf 'ALLOWED_TRANSCRIPTION_MODELS=%s\n' '$TRANSCRIPTION_MODELS' >> $ENV_FILE
+  printf 'RELAY_ENROLLMENT_REGISTRY_FILE=%s\n' '$REGISTRY_FILE' >> $ENV_FILE
+  printf 'RELAY_ADMIN_SOCKET=%s\n' '$ADMIN_SOCKET' >> $ENV_FILE
+  printf 'MAX_ENROLLMENT_ATTEMPTS_PER_MINUTE=10\n' >> $ENV_FILE
+  printf 'MAX_TRANSCRIPTION_SECONDS_PER_DEVICE_PER_DAY=7200\n' >> $ENV_FILE
+  printf 'MAX_TOTAL_TRANSCRIPTION_SECONDS_PER_DAY=43200\n' >> $ENV_FILE
+  printf 'MAX_POLISH_REQUESTS_PER_DEVICE_PER_DAY=1000\n' >> $ENV_FILE
+  printf 'MAX_TOTAL_POLISH_REQUESTS_PER_DAY=6000\n' >> $ENV_FILE"
 
 echo "==> provisioning the reloadable allowlist"
 # Asked before the file is touched, so a rollback knows whether removing it restores the
@@ -220,14 +239,35 @@ ssh "$HOST" "set -e
       printf '%s\n' \"\$MIGRATED\" > $TOKEN_FILE
       echo '    migrated existing hashes out of the env file'
     else
-      echo '!! $TOKEN_FILE is missing or empty and the env file has no hashes to' >&2
-      echo '   migrate. Refusing to invent an allowlist: restore the file from' >&2
-      echo '   $BACKUPS/device-tokens-* (cross-check the ledger for hashes revoked' >&2
-      echo '   since), or re-issue tokens, then re-run.' >&2
-      exit 1
+      # Enrollment is configured by this deploy, so a fresh install with no legacy
+      # devices has an explicit representation distinct from a truncated file.
+      printf '%s\n' '# whisper-relay: intentionally empty legacy allowlist' > $TOKEN_FILE
+      echo '    no legacy hashes to migrate; created an intentional-empty allowlist'
     fi
   fi
   chmod 0644 $TOKEN_FILE
+  EMPTY_LEGACY_SENTINEL='# whisper-relay: intentionally empty legacy allowlist'
+  if ! awk -v marker=\"\$EMPTY_LEGACY_SENTINEL\" '
+    {
+      raw = \$0
+      gsub(/^[ \t]+|[ \t]+\$/, \"\", raw)
+      if (raw == marker) markerLines += 1
+      if (length(raw)) nonblank += 1
+      line = \$0
+      sub(/#.*/, \"\", line)
+      gsub(/^[ \t]+|[ \t]+\$/, \"\", line)
+      if (length(line)) {
+        hashes += 1
+        if (tolower(line) !~ /^[a-f0-9]{64}\$/) bad = 1
+      }
+    }
+    END {
+      intentionalEmpty = (markerLines == 1 && nonblank == 1 && hashes == 0)
+      exit (intentionalEmpty || (markerLines == 0 && hashes > 0 && !bad)) ? 0 : 1
+    }' $TOKEN_FILE; then
+    echo '!! legacy allowlist is neither valid hashes nor the sole intentional-empty marker' >&2
+    exit 1
+  fi
   # The env snapshot dies the moment the file becomes the source of truth. Left in
   # place it only ever gets staler — issue/revoke touch the file, never the env — and
   # a later deploy that found the file lost would have 'migrated' that fossil back in,
@@ -236,12 +276,29 @@ ssh "$HOST" "set -e
   grep -q '^RELAY_DEVICE_TOKEN_FILE=' $ENV_FILE \
     || printf 'RELAY_DEVICE_TOKEN_FILE=%s\n' '$TOKEN_FILE' >> $ENV_FILE
   UNIT=/etc/systemd/system/whisper-relay.service
+  # Reconcile each scalar directive, rather than appending a second value only when the
+  # exact desired line is absent. An old later RuntimeDirectoryMode=0755 would otherwise
+  # override the new 0700 line even though all of the grep checks below passed.
+  grep -q '^DynamicUser=yes$' \$UNIT || {
+    echo '!! the service no longer uses DynamicUser=yes; refusing to guess ownership' >&2
+    exit 1
+  }
+  sed -i '/^RuntimeDirectory=/d;/^RuntimeDirectoryMode=/d;/^StateDirectory=/d;/^StateDirectoryMode=/d' \$UNIT
+  sed -i '/^DynamicUser=yes$/a RuntimeDirectory=whisper-relay\nRuntimeDirectoryMode=0700\nStateDirectory=whisper-relay\nStateDirectoryMode=0700' \$UNIT
+  grep -q '^RuntimeDirectory=whisper-relay$' \$UNIT
+  grep -q '^RuntimeDirectoryMode=0700$' \$UNIT
+  grep -q '^StateDirectory=whisper-relay$' \$UNIT
+  grep -q '^StateDirectoryMode=0700$' \$UNIT
   if ! grep -q '^ExecReload=' \$UNIT; then
     sed -i '/^ExecStart=/a ExecReload=/bin/kill -HUP \$MAINPID' \$UNIT
-    systemctl daemon-reload
     echo '    added ExecReload to the unit'
   fi
-  printf '    %s hashes in the allowlist\n' \"\$(grep -c . $TOKEN_FILE)\""
+  # Unconditional because any directive above may have changed the unit.
+  # Tying daemon-reload only to ExecReload meant an already-reloadable service ignored
+  # newly added StateDirectory paths and then failed its first enrollment-aware restart.
+  systemctl daemon-reload
+  LEGACY_COUNT=\$(awk '{ sub(/#.*/, \"\"); gsub(/^[ \\t]+|[ \\t]+\$/, \"\"); if (length) seen[tolower(\$0)] = 1 } END { print length(seen) }' $TOKEN_FILE)
+  printf '    %s hashes in the legacy allowlist\n' \"\$LEGACY_COUNT\""
 
 echo "==> restarting whisper-relay"
 ssh "$HOST" "systemctl restart whisper-relay && sleep 2 && systemctl is-active whisper-relay"
@@ -256,6 +313,12 @@ ssh "$HOST" "set -e
   PORT=\$(sed -n 's/^PORT=//p' $ENV_FILE); PORT=\${PORT:-8787}
   curl -fsS -m 10 http://127.0.0.1:\$PORT/healthz >/dev/null
   curl -fsS -m 10 http://127.0.0.1:\$PORT$BASE_PATH/healthz >/dev/null
+  test -S '$ADMIN_SOCKET'
+  ADMIN=\$(curl -fsS --unix-socket '$ADMIN_SOCKET' http://localhost/admin/status)
+  case \"\$ADMIN\" in
+    *'\"pendingInvites\"'*) ;;
+    *) echo '    admin socket returned the wrong body' >&2; exit 1 ;;
+  esac
   BEFORE=\$(systemctl show whisper-relay -p NRestarts --value)
   sleep 5
   AFTER=\$(systemctl show whisper-relay -p NRestarts --value)
@@ -280,7 +343,9 @@ echo "==> health check (public)"
 public_health_ok() {
   local body
   for attempt in 1 2 3; do
-    if body=$(curl -fsS -m 20 "$PUBLIC_HEALTH") && [[ "$body" == *'"ok":true'* ]]; then
+    if body=$(curl -fsS -m 20 "$PUBLIC_HEALTH") \
+      && [[ "$body" == *'"ok":true'* ]] \
+      && [[ "$body" == *'"enrollment":true'* ]]; then
       echo "    public ok: $body"
       return 0
     fi
@@ -291,13 +356,29 @@ public_health_ok() {
 }
 public_health_ok
 
+echo "==> enrollment check (public route, deliberately invalid request)"
+PUBLIC_ENROLLMENT="${PUBLIC_HEALTH%/healthz}/v1/enroll"
+ENROLLMENT_PROBE=$(curl -sS -m 20 -w '\n%{http_code}' \
+  -H 'content-type: application/json' --data-binary '{' \
+  "$PUBLIC_ENROLLMENT" || true)
+ENROLLMENT_CODE=$(printf '%s' "$ENROLLMENT_PROBE" | tail -n 1)
+ENROLLMENT_BODY=$(printf '%s' "$ENROLLMENT_PROBE" | sed '$d')
+if [ "$ENROLLMENT_CODE" != 400 ] \
+  || [[ "$ENROLLMENT_BODY" != *'"code":"enrollment_invalid_request"'* ]]; then
+  echo "!! public enrollment route failed (HTTP ${ENROLLMENT_CODE:-none})" >&2
+  false
+fi
+echo "    public enrollment route ok"
+
 if [ -n "$SMOKE_TOKEN" ]; then
   echo "==> smoke test (a real /v1/polish round trip)"
   SMOKE_URL="${PUBLIC_HEALTH%/healthz}/v1/polish"
   SMOKE_BODY=$(printf '{"model":"%s","messages":[{"role":"system","content":"只输出整理后的文本。"},{"role":"user","content":"<transcript>嗯 部署 冒烟 测试</transcript>"}],"reasoning_effort":"none"}' "$POLISH_MODEL")
   # No -f: the status code and the body are both wanted, especially on a rejection.
-  SMOKE_OUT=$(curl -sS -m 30 -w '\n%{http_code}' \
-    -H "authorization: Bearer $SMOKE_TOKEN" \
+  # Feed the credential through curl's stdin config; putting the Authorization value
+  # in `-H` exposed the plaintext token in the local process list during the request.
+  SMOKE_OUT=$(printf 'header = "authorization: Bearer %s"\n' "$SMOKE_TOKEN" \
+    | curl --config - -sS -m 30 -w '\n%{http_code}' \
     -H 'content-type: application/json' \
     -d "$SMOKE_BODY" "$SMOKE_URL" || true)
   SMOKE_CODE=$(printf '%s' "$SMOKE_OUT" | tail -n1)
@@ -328,13 +409,15 @@ echo "==> pruning old backups (keeping the 10 most recent)"
 # but rolling back a good relay because a cleanup hiccuped is a worse one.
 ssh "$HOST" "cd $BACKUPS 2>/dev/null || exit 0
   ls -1d src-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
+  ls -1d scripts-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d manifests-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1 env-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   ls -1 unit-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   ls -1 device-tokens-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+  ls -1 enrollment-registry-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   echo \"    \$(ls -1d src-* 2>/dev/null | wc -l) backups kept\"" || \
   echo "!! backup prune failed (harmless, deploy stands)" >&2
 
 trap - ERR
 echo "==> done. rollback if needed:"
-echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'"
+echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'"

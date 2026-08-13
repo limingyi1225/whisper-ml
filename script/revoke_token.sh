@@ -14,6 +14,7 @@ set -Eeuo pipefail
 
 HOST="${RELAY_SSH_HOST:-nyuclass}"
 NAME="${1:-}"
+[ "$#" -le 1 ] || { echo "usage: $0 [name]" >&2; exit 2; }
 
 if [ -z "$NAME" ]; then
   echo "==> tokens currently authorised"
@@ -23,12 +24,18 @@ ENV_FILE=/etc/whisper-relay.env
 TOKEN_FILE=/opt/whisper-relay/device-tokens
 LEDGER=/opt/whisper-relay-backups/issued-tokens.tsv
 PORT=$(sed -n 's/^PORT=//p' "$ENV_FILE"); PORT=${PORT:-8787}
+EMPTY_LEGACY_SENTINEL='# whisper-relay: intentionally empty legacy allowlist'
 
 # Reads the file exactly the way config.js does: strip a trailing comment, trim,
 # lowercase, and a hash counts once however many times it appears — the server keeps a
 # Set. Any other counting would disagree with the server, and every check in this
 # script compares against the server's own number.
 effective() { awk '{ sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if (length) print tolower($0) }' "$1" | LC_ALL=C sort -u; }
+is_intentionally_empty() {
+  awk -v marker="$EMPTY_LEGACY_SENTINEL" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (length(line)) { n += 1; only = line } }
+    END { exit (n == 1 && only == marker) ? 0 : 1 }' "$1"
+}
 
 # Never `... | grep -q`. grep exits at its first match, the producer takes SIGPIPE, and
 # under `pipefail` the pipeline then reports 141 — so the predicate inverts. It is a
@@ -49,12 +56,20 @@ count_hashes() { effective "$1" | awk 'END { print NR + 0 }'; }
 # would read as a real answer about a list that does not exist.
 digest_of() {
   [ -s "$1" ] || return 1
+  if is_intentionally_empty "$1"; then
+    printf '' | sha256sum | cut -c1-16
+    return
+  fi
   printf '%s' "$(effective "$1")" | sha256sum | cut -c1-16
 }
 
 HEALTH_BODY=$(curl -fsS -m 10 "http://127.0.0.1:$PORT/healthz" || true)
 RELAY_TOKENS=$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"tokens":\([0-9]*\).*/\1/p')
 RELAY_DIGEST=$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"allowlist":"\([a-f0-9]*\)".*/\1/p')
+LEGACY_TOKENS=$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"legacyTokens":\([0-9]*\).*/\1/p')
+LEGACY_DIGEST=$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"legacyAllowlist":"\([a-f0-9]*\)".*/\1/p')
+[ -n "$LEGACY_TOKENS" ] || LEGACY_TOKENS="$RELAY_TOKENS"
+[ -n "$LEGACY_DIGEST" ] || LEGACY_DIGEST="$RELAY_DIGEST"
 
 # Branch on the file existing instead of letting every helper fail into the output. With
 # no file, `effective` used to spray "awk: fatal: cannot open" across the table while
@@ -62,7 +77,7 @@ RELAY_DIGEST=$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"allowlist":"\([a-f0-9]*
 if [ -s "$TOKEN_FILE" ]; then
   printf '    %s in the allowlist (%s), relay reports %s (%s)\n\n' \
     "$(count_hashes "$TOKEN_FILE")" "$(digest_of "$TOKEN_FILE")" \
-    "${RELAY_TOKENS:-?}" "${RELAY_DIGEST:-?}"
+    "${LEGACY_TOKENS:-?}" "${LEGACY_DIGEST:-?}"
 else
   printf '    no allowlist file at %s yet.\n' "$TOKEN_FILE"
   printf '    Run ./script/deploy_relay.sh first — it creates the file and makes the\n'
@@ -99,6 +114,7 @@ LEDGER=/opt/whisper-relay-backups/issued-tokens.tsv
 LOCK=/opt/whisper-relay-backups/.allowlist.lock
 PORT=$(sed -n 's/^PORT=//p' "$ENV_FILE"); PORT=${PORT:-8787}
 HEALTH="http://127.0.0.1:$PORT/healthz"
+EMPTY_LEGACY_SENTINEL='# whisper-relay: intentionally empty legacy allowlist'
 
 # Issuing appends and revoking rewrites, both without coordination — interleave them and
 # a revoke's snapshot can clobber a hash that was just issued and confirmed, handing
@@ -108,6 +124,16 @@ exec 9>"$LOCK"
 flock -w 60 9 || { echo '!! another issue/revoke is holding the lock' >&2; exit 1; }
 
 effective() { awk '{ sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if (length) print tolower($0) }' "$1" | LC_ALL=C sort -u; }
+is_intentionally_empty() {
+  awk -v marker="$EMPTY_LEGACY_SENTINEL" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (length(line)) { n += 1; only = line } }
+    END { exit (n == 1 && only == marker) ? 0 : 1 }' "$1"
+}
+contains_empty_sentinel() {
+  awk -v marker="$EMPTY_LEGACY_SENTINEL" '
+    { line = $0; gsub(/^[ \t]+|[ \t]+$/, "", line); if (line == marker) found = 1 }
+    END { exit found ? 0 : 1 }' "$1"
+}
 
 # Never `... | grep -q`: grep exits at its first match, the producer takes SIGPIPE, and
 # under `pipefail` the pipeline reports 141, inverting the predicate. It is a race — it
@@ -121,6 +147,8 @@ has_hash() {
 # the reason above — the earlier `! printf … | grep -qvE …` form could report a malformed
 # list as valid, which is precisely how a rejected reload got mistaken for a good one.
 valid_allowlist() {
+  is_intentionally_empty "$1" && return 0
+  contains_empty_sentinel "$1" && return 1
   effective "$1" | awk '
     { n += 1; if ($0 !~ /^[a-f0-9]{64}$/) bad = 1 }
     END { exit (n > 0 && !bad) ? 0 : 1 }'
@@ -197,17 +225,20 @@ for HASH in $HASHES; do
   fi
 done
 if [ "$EXPECTED" -eq 0 ]; then
-  # The server refuses an empty allowlist (a truncated file must not lock everyone out),
-  # so writing one would not revoke anything — it would just be rejected. That leaves a
-  # genuine gap: the *last* remaining token cannot be revoked, which is exactly the one
-  # you would need to revoke if it leaked. Naming the way out, since the mechanism
-  # cannot: add a replacement first, then revoke.
-  echo '!! this is the last hash in the allowlist, and the relay refuses an empty one,' >&2
-  echo '   so writing it would change nothing. Issue a replacement first, then revoke:' >&2
-  echo '     ./script/package_release.sh --for <someone>   # or your own new build' >&2
-  echo '     ./script/revoke_token.sh '"$NAME" >&2
-  abandon_candidate
-  exit 1
+  # A genuinely blank/truncated file remains invalid. The exact marker is the only
+  # explicit revoke-all representation, and the server accepts it only while invite
+  # enrollment is configured. Confirm the running service reports that mode before
+  # replacing the last hash, so this cannot turn an old relay into a reload no-op.
+  CURRENT_HEALTH=$(curl -fsS -m 10 "$HEALTH" || true)
+  if [[ "$CURRENT_HEALTH" != *'"enrollment":true'* ]] \
+    || ! grep -q '^RELAY_ENROLLMENT_REGISTRY_FILE=/' "$ENV_FILE" \
+    || ! grep -q '^RELAY_ADMIN_SOCKET=/' "$ENV_FILE"; then
+    echo '!! this is the last legacy hash, but invite enrollment is not active;' >&2
+    echo '   refusing to write a revoke-all marker the running relay cannot accept.' >&2
+    abandon_candidate
+    exit 1
+  fi
+  printf '%s\n' "$EMPTY_LEGACY_SENTINEL" > "$TOKEN_FILE.next"
 fi
 if ! valid_allowlist "$TOKEN_FILE.next"; then
   echo '!! the allowlist has a line the server will refuse to load — the reload would' >&2
@@ -235,7 +266,8 @@ sleep 1
 # count can equal what the new file would have reported — so a matching count was never
 # proof, and "we think they are cut off" is the wrong thing to be unsure of. A matching
 # digest says the running server is serving exactly the list on disk.
-AFTER=$(health_field allowlist || true)
+AFTER=$(health_field legacyAllowlist || true)
+[ -n "$AFTER" ] || AFTER=$(health_field allowlist || true)
 if [ "$AFTER" != "$WANT" ]; then
   echo "!! relay is serving allowlist '$AFTER', expected '$WANT' — the revoke did NOT" >&2
   echo "   take effect; restoring the previous list" >&2

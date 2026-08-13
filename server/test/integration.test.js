@@ -1,11 +1,19 @@
 import http from "node:http";
 import net from "node:net";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import WebSocket, { WebSocketServer } from "ws";
 
 import { tokenDigest } from "../src/auth.js";
 import { loadConfig } from "../src/config.js";
+import {
+  EnrollmentRegistry,
+  handleEnrollment,
+  handleEnrollmentAdmin,
+} from "../src/enrollment.js";
 import { handlePolish } from "../src/polish.js";
 import { FixedWindowRateLimiter } from "../src/rate-limit.js";
 import { bridgeRealtime, revokeDownstream } from "../src/realtime.js";
@@ -37,6 +45,108 @@ function onceMessage(socket) {
   });
 }
 
+test("the enrollment endpoint is one-time but retries the same device safely", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "whisper-enrollment-http-"));
+  const registry = new EnrollmentRegistry(join(directory, "registry.json"));
+  const issued = registry.issueInvite("alice");
+  const limiter = new FixedWindowRateLimiter(10);
+  let authorizationChanges = 0;
+  const relay = http.createServer((request, response) => {
+    void handleEnrollment(request, response, {
+      registry,
+      rateLimiter: limiter,
+      onAuthorizationChanged: () => { authorizationChanges += 1; },
+    });
+  });
+  const relayPort = await listen(relay);
+  const enroll = (deviceToken) => fetch(`http://127.0.0.1:${relayPort}/v1/enroll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ inviteCode: issued.code, deviceToken }),
+  });
+
+  try {
+    const aliceToken = `relay_${"a".repeat(43)}`;
+    assert.equal((await enroll(aliceToken)).status, 200);
+    assert.equal((await enroll(aliceToken)).status, 200);
+    assert.equal(authorizationChanges, 1);
+    const stolen = await enroll(`relay_${"b".repeat(43)}`);
+    assert.equal(stolen.status, 409);
+    assert.equal((await stolen.json()).error.code, "enrollment_already_used");
+
+    const bob = registry.issueInvite("bob");
+    const reusedToken = await fetch(`http://127.0.0.1:${relayPort}/v1/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ inviteCode: bob.code, deviceToken: aliceToken }),
+    });
+    assert.equal(reusedToken.status, 409);
+    assert.equal((await reusedToken.json()).error.code, "enrollment_device_token_in_use");
+
+    const racing = registry.issueInvite("carol");
+    const raceEnroll = (suffix) => fetch(`http://127.0.0.1:${relayPort}/v1/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        inviteCode: racing.code,
+        deviceToken: `relay_${suffix.repeat(43)}`,
+      }),
+    });
+    const raced = await Promise.all([raceEnroll("c"), raceEnroll("d")]);
+    assert.deepEqual(raced.map((response) => response.status).sort(), [200, 409]);
+    assert.equal(authorizationChanges, 2, "only one concurrent claimant may be authorised");
+
+    const wrongContentType = await fetch(`http://127.0.0.1:${relayPort}/v1/enroll`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ inviteCode: racing.code, deviceToken: aliceToken }),
+    });
+    assert.equal(wrongContentType.status, 415);
+  } finally {
+    await close(relay);
+  }
+});
+
+test("the local admin surface issues, lists, and revokes without exposing secrets", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "whisper-enrollment-admin-"));
+  const registry = new EnrollmentRegistry(join(directory, "registry.json"));
+  let authorizationChanges = 0;
+  const admin = http.createServer((request, response) => {
+    void handleEnrollmentAdmin(request, response, {
+      registry,
+      onAuthorizationChanged: () => { authorizationChanges += 1; },
+    });
+  });
+  const port = await listen(admin);
+  const post = (path, body) => fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  try {
+    const issuedResponse = await post("/admin/invites", { label: "alice" });
+    assert.equal(issuedResponse.status, 201);
+    const issued = await issuedResponse.json();
+    assert.match(issued.code, /^WHISPER-/);
+
+    const pending = await (await fetch(`http://127.0.0.1:${port}/admin/status`)).json();
+    assert.deepEqual(pending.pendingInvites.map((item) => item.label), ["alice"]);
+    assert.equal(JSON.stringify(pending).includes(issued.code), false);
+
+    const duplicate = await post("/admin/invites", { label: "alice" });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json()).error.code, "admin_label_in_use");
+
+    const revoked = await post("/admin/revoke", { label: "alice" });
+    assert.equal(revoked.status, 200);
+    assert.deepEqual(await revoked.json(), { ok: true, devices: 0, invites: 1 });
+    assert.equal(authorizationChanges, 1);
+  } finally {
+    await close(admin);
+  }
+});
+
 async function waitUntil(predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -49,7 +159,10 @@ async function waitUntil(predicate, timeoutMs = 5_000) {
 test("polish proxy injects the server key and returns the upstream response", async () => {
   let upstreamAuthorization;
   let upstreamBody;
+  let upstreamCalls = 0;
+  let dailyQuota = null;
   const upstream = http.createServer(async (request, response) => {
+    upstreamCalls += 1;
     upstreamAuthorization = request.headers.authorization;
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -74,6 +187,7 @@ test("polish proxy injects the server key and returns the upstream response", as
       config,
       deviceID: tokenDigest(token),
       rateLimiter: new FixedWindowRateLimiter(5),
+      takeDailyQuota: () => dailyQuota,
     });
   });
   const relayPort = await listen(relay);
@@ -107,6 +221,19 @@ test("polish proxy injects the server key and returns the upstream response", as
       max_completion_tokens: baseConfig.maxPolishCompletionTokens,
     });
     assert.ok(baseConfig.maxPolishCompletionTokens > 0);
+
+    dailyQuota = "device";
+    const refused = await fetch(`http://127.0.0.1:${relayPort}/v1/polish`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    assert.equal(refused.status, 429);
+    assert.equal((await refused.json()).error.code, "relay_daily_quota");
+    assert.equal(upstreamCalls, 1, "a daily-quota rejection must not spend the server key");
   } finally {
     await close(relay);
     await close(upstream);
@@ -627,6 +754,134 @@ test("a rejected event names the client event that caused it", async () => {
     upstreamWSS.close();
     await close(relayServer);
     await close(upstreamServer);
+  }
+});
+
+test("daily audio quota is enforced before the append reaches OpenAI", async () => {
+  const receivedByUpstream = [];
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      receivedByUpstream.push(event.type);
+      if (event.type === "session.update") {
+        socket.send(JSON.stringify({ type: "session.updated" }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const consumed = [];
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeRealtime(
+      downstream,
+      {
+        ...baseConfig,
+        openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
+      },
+      {
+        consumeAudio: (bytes) => {
+          consumed.push(bytes);
+          return "device";
+        },
+      },
+    );
+  });
+  const relayPort = await listen(relayServer);
+
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    assert.deepEqual(await onceMessage(client), { type: "session.updated" });
+
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-9-1",
+      audio: Buffer.from([1, 2, 3, 4]).toString("base64"),
+    }));
+    const rejection = await onceMessage(client);
+    assert.equal(rejection.error.code, "relay_daily_quota");
+    assert.equal(rejection.error.event_id, "whisper-turn-9-1");
+    assert.deepEqual(consumed, [4]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(receivedByUpstream, ["session.update"]);
+  } finally {
+    client.terminate();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("audio rejected before upstream admission does not consume daily quota", async () => {
+  // Accept the TCP connection but never answer the WebSocket handshake, holding the
+  // OpenAI-side socket in CONNECTING while the client sends an append too large for
+  // the relay's pre-open queue.
+  const upstreamSockets = new Set();
+  const hangingUpstream = net.createServer((socket) => {
+    upstreamSockets.add(socket);
+    socket.once("close", () => upstreamSockets.delete(socket));
+  });
+  const upstreamPort = await listen(hangingUpstream);
+  const consumed = [];
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeRealtime(
+      downstream,
+      {
+        ...baseConfig,
+        openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
+        maxPreopenQueueBytes: 8,
+      },
+      { consumeAudio: (bytes) => { consumed.push(bytes); return null; } },
+    );
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-not-admitted",
+      audio: Buffer.from([1, 2, 3, 4]).toString("base64"),
+    }));
+    const closeCode = await new Promise((resolve) => client.once("close", resolve));
+    assert.equal(closeCode, 1013);
+    assert.deepEqual(consumed, []);
+  } finally {
+    client.terminate();
+    for (const socket of relayWSS.clients) socket.terminate();
+    relayWSS.close();
+    await close(relayServer);
+    for (const socket of upstreamSockets) socket.destroy();
+    await close(hangingUpstream);
   }
 });
 

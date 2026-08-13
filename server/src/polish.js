@@ -61,6 +61,7 @@ export async function handlePolish(
     fetchImpl = fetch,
     stillAuthorized = () => true,
     registerAbort = null,
+    takeDailyQuota = () => null,
   },
 ) {
   if (!rateLimiter.take(deviceID)) {
@@ -104,6 +105,21 @@ export async function handlePolish(
       401,
       errorBody("转发服务器设备 Token 无效或没有权限", "relay_unauthorized"),
       { "www-authenticate": "Bearer" },
+    );
+    return;
+  }
+
+  const dailyQuota = takeDailyQuota();
+  if (dailyQuota) {
+    writeJSON(
+      response,
+      429,
+      errorBody(
+        dailyQuota === "total"
+          ? "转发服务器今天的整理总额度已用完，请稍后再试"
+          : "今天的整理额度已用完，请明天再试",
+        "relay_daily_quota",
+      ),
     );
     return;
   }
