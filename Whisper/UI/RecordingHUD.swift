@@ -205,7 +205,7 @@ struct RecordingHUDView: View {
     private var fillOpacity: Double {
         switch state {
         case .idle, .arming, .listening, .transcribing:
-            return 0.32 + 0.48 * Double(shellExpansion)
+            return 0.48 + 0.32 * Double(shellExpansion)
         case .polishing, .settled, .failed:
             return 0.8
         }
