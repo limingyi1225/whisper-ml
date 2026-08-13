@@ -9,6 +9,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.3</title>
+            <pubDate>Thu, 13 Aug 2026 22:27:48 +0800</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.3</link>
+            <sparkle:version>4</sparkle:version>
+            <sparkle:shortVersionString>1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.3/Whisper-1.3-4.dmg" length="3099533" type="application/octet-stream" sparkle:edSignature="W7jog6mffMttd46JYp94QP6wjMdndlMh3u1OtCZGpgGyPP6OfwjyTifv5LQ4PXPdTrDOXwe+xi+iICaRBXVnCQ=="/>
+        </item>
+        <item>
             <title>1.2</title>
             <pubDate>Thu, 13 Aug 2026 22:10:02 +0800</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.2</link>
@@ -29,6 +38,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: 9ZsV6vC+wL1WxxagJuaTHDM9JyDsY/XW0wZId+HL1Gjko7HBZndqAr04zwEBfhC18nkcB6E93t/iFJ/8RCmPDQ==
-length: 1988
+edSignature: 3dt9wHm70NBMmbjdaAgQFdGMe/bip1rFQYjnltzxvtdUH0EYegOfGE1iY7MiXTUcYbdvG3YhHGQQeMs1X7N7BA==
+length: 2674
 -->
