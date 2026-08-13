@@ -327,11 +327,11 @@ final class FocusedInputMonitor {
             application,
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue else {
+        ) == .success,
+              let focusedElement = checkedAXElement(from: focusedValue) else {
             return false
         }
 
-        let focusedElement = focusedValue as! AXUIElement
         _ = AXUIElementSetMessagingTimeout(focusedElement, 0.15)
         if isEditableTextElement(focusedElement) {
             return true
@@ -343,8 +343,8 @@ final class FocusedInputMonitor {
                 attribute as CFString,
                 &ancestorValue
             ) == .success,
-               let ancestorValue,
-               isEditableTextElement(ancestorValue as! AXUIElement) {
+               let ancestorElement = checkedAXElement(from: ancestorValue),
+               isEditableTextElement(ancestorElement) {
                 return true
             }
         }
@@ -434,6 +434,27 @@ final class FocusedInputMonitor {
             || bundleIdentifier == "com.anthropic.claudefordesktop"
     }
 
+    nonisolated static func checkedAXElement(from value: CFTypeRef?) -> AXUIElement? {
+        guard let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        // Core Foundation references do not support a meaningful conditional cast:
+        // Swift reports `as? AXUIElement` as always succeeding. The Type ID check is
+        // therefore the safety boundary before reinterpreting the retained CF object.
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    nonisolated static func boundedChildReadCount(
+        reportedChildCount: Int,
+        queuedElementCount: Int,
+        maximumElements: Int,
+        pageSize: Int
+    ) -> Int {
+        let remainingCapacity = max(0, maximumElements - queuedElementCount)
+        return max(0, min(reportedChildCount, remainingCapacity, pageSize))
+    }
+
     private nonisolated static func containsEditableTextDescendant(
         of root: AXUIElement
     ) -> Bool {
@@ -446,6 +467,7 @@ final class FocusedInputMonitor {
         var index = 0
         let maximumElements = 256
         let maximumDepth = 10
+        let childPageSize = 64
         let deadline = CFAbsoluteTimeGetCurrent() + 0.3
 
         while index < queue.count,
@@ -464,17 +486,48 @@ final class FocusedInputMonitor {
             let role = stringAttribute(kAXRoleAttribute as CFString, from: current.element)
             guard shouldSearchEditableDescendants(of: role) else { continue }
 
-            var childrenValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(
+            var childCount: CFIndex = 0
+            guard CFAbsoluteTimeGetCurrent() < deadline,
+                  AXUIElementGetAttributeValueCount(
                 current.element,
                 kAXChildrenAttribute as CFString,
-                &childrenValue
+                &childCount
             ) == .success,
-                  let children = childrenValue as? [AXUIElement] else {
+                  childCount > 0 else {
                 continue
             }
-            for child in children {
-                queue.append((child, current.depth + 1))
+
+            var childIndex: CFIndex = 0
+            while childIndex < childCount,
+                  queue.count < maximumElements,
+                  CFAbsoluteTimeGetCurrent() < deadline {
+                let requestedCount = boundedChildReadCount(
+                    reportedChildCount: childCount - childIndex,
+                    queuedElementCount: queue.count,
+                    maximumElements: maximumElements,
+                    pageSize: childPageSize
+                )
+                guard requestedCount > 0 else { break }
+
+                var childPage: CFArray?
+                let copyResult = AXUIElementCopyAttributeValues(
+                    current.element,
+                    kAXChildrenAttribute as CFString,
+                    childIndex,
+                    requestedCount,
+                    &childPage
+                )
+                childIndex += requestedCount
+                guard copyResult == .success, let childPage else { break }
+
+                for childValue in childPage as [AnyObject] {
+                    guard queue.count < maximumElements,
+                          CFAbsoluteTimeGetCurrent() < deadline else {
+                        break
+                    }
+                    guard let child = checkedAXElement(from: childValue) else { continue }
+                    queue.append((child, current.depth + 1))
+                }
             }
         }
         return false

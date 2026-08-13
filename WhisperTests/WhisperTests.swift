@@ -147,6 +147,41 @@ import Testing
         ))
     }
 
+    @Test func malformedAXValuesAreRejectedBeforeElementConversion() {
+        let malformedValue = "not an accessibility element" as CFString
+        #expect(FocusedInputMonitor.checkedAXElement(from: malformedValue) == nil)
+
+        let application = AXUIElementCreateApplication(ProcessInfo.processInfo.processIdentifier)
+        #expect(FocusedInputMonitor.checkedAXElement(from: application) != nil)
+    }
+
+    @Test func childReadsNeverExceedTraversalCapacityOrPageSize() {
+        #expect(FocusedInputMonitor.boundedChildReadCount(
+            reportedChildCount: 50_000,
+            queuedElementCount: 1,
+            maximumElements: 256,
+            pageSize: 64
+        ) == 64)
+        #expect(FocusedInputMonitor.boundedChildReadCount(
+            reportedChildCount: 50_000,
+            queuedElementCount: 250,
+            maximumElements: 256,
+            pageSize: 64
+        ) == 6)
+        #expect(FocusedInputMonitor.boundedChildReadCount(
+            reportedChildCount: 50_000,
+            queuedElementCount: 256,
+            maximumElements: 256,
+            pageSize: 64
+        ) == 0)
+        #expect(FocusedInputMonitor.boundedChildReadCount(
+            reportedChildCount: 3,
+            queuedElementCount: 1,
+            maximumElements: 256,
+            pageSize: 64
+        ) == 3)
+    }
+
     @Test func idleFollowsFocusWhileActiveStatesStayVisible() {
         #expect(!RecordingHUDController.shouldShow(
             phase: .idle,
