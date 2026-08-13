@@ -226,9 +226,14 @@ verify_raw_feed() {
   remote_appcast=$(mktemp "${TMPDIR:-/tmp}/whisper-appcast-raw.XXXXXX")
   deadline=$((SECONDS + 330))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if curl -fsSL --connect-timeout 3 --max-time 5 \
+    # raw.githubusercontent.com may advertise an IPv6 path that is unusable on
+    # otherwise healthy networks. The release asset and authoritative Contents API
+    # checks above are already dual-stack; use the reliable IPv4 CDN path here and
+    # keep transient TLS retries quiet while waiting for branch-cache propagation.
+    if curl -4 -fsSL --connect-timeout 10 --max-time 15 \
+        --retry 1 --retry-delay 1 --retry-all-errors \
         -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-        "$FEED_URL" > "$remote_appcast" \
+        "$FEED_URL" > "$remote_appcast" 2>/dev/null \
         && cmp -s "$LIVE_APPCAST" "$remote_appcast"; then
       rm -f "$remote_appcast"
       return 0
