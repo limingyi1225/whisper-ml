@@ -106,6 +106,7 @@ final class RecordingHUDController {
 
 struct RecordingHUDView: View {
     let controller: DictationController
+    @Environment(\.colorScheme) private var colorScheme
     @State private var shellExpansion: CGFloat = 0
     @State private var waveformVisible = false
 
@@ -138,7 +139,16 @@ struct RecordingHUDView: View {
                 .background {
                     Capsule(style: .continuous)
                         .fill(Color(white: 0.1).opacity(fillOpacity))
+                        .overlay {
+                            Capsule(style: .continuous)
+                                .stroke(
+                                    .white.opacity(restingOutlineOpacity),
+                                    lineWidth: 0.75
+                                )
+                                .padding(-0.375)
+                        }
                 }
+                .padding(.vertical, 1)
         }
     }
 
@@ -208,6 +218,17 @@ struct RecordingHUDView: View {
             return 0.48 + 0.32 * Double(shellExpansion)
         case .polishing, .settled, .failed:
             return 0.8
+        }
+    }
+
+    private var restingOutlineOpacity: Double {
+        guard colorScheme == .dark else { return 0 }
+        switch state {
+        case .idle, .arming, .listening, .transcribing:
+            let restingAmount = min(max(1 - shellExpansion, 0), 1)
+            return 0.4 * Double(restingAmount)
+        case .polishing, .settled, .failed:
+            return 0
         }
     }
 
