@@ -115,12 +115,6 @@ final class AppSettings: DictationSettingsProviding {
     /// rather than by prompting: the realtime transcriber adds one too, so a prompt
     /// to the cleanup model alone could never cover both paths.
     var stripTrailingPeriod: Bool { didSet { store.set(stripTrailingPeriod, forKey: Key.stripTrailingPeriod) } }
-    /// Rewrite traditional Chinese as simplified. The transcriber returns 繁体 for
-    /// some of the same speech it usually returns 简体 for. Done in code, on the way
-    /// in, rather than by asking the cleanup model: a whole sentence of 繁体 differs
-    /// from its cleaned version at character zero, and `reconcile` would then rewrite
-    /// every such sentence in full — the exact flash the whitespace rule exists to avoid.
-    var simplifyChinese: Bool { didSet { store.set(simplifyChinese, forKey: Key.simplifyChinese) } }
     /// Proper nouns the transcriber keeps mis-hearing — names, products, jargon — one
     /// per line, spelled the way the user wants them. Goes to both sides: the
     /// transcription session's `keywords`, which biases recognition itself, and the
@@ -201,7 +195,6 @@ final class AppSettings: DictationSettingsProviding {
         static let transcriptionModel = "transcriptionModel"
         static let polishEnabled = "polishEnabled"
         static let stripTrailingPeriod = "stripTrailingPeriod"
-        static let simplifyChinese = "simplifyChinese"
         static let vocabulary = "vocabulary"
     }
 
@@ -216,7 +209,6 @@ final class AppSettings: DictationSettingsProviding {
         transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .liveTranscribe
         polishEnabled = store.object(forKey: Key.polishEnabled) as? Bool ?? true
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
-        simplifyChinese = store.object(forKey: Key.simplifyChinese) as? Bool ?? true
         vocabulary = store.string(forKey: Key.vocabulary) ?? ""
     }
 }

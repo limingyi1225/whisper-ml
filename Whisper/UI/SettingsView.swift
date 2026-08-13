@@ -85,8 +85,6 @@ private struct DictationSettingsTab: View {
                     }
                     .onChange(of: settings.transcriptionDelay) { controller.reconnect() }
                 }
-
-                Toggle("繁体转简体", isOn: $settings.simplifyChinese)
             }
 
             Section("整理") {
