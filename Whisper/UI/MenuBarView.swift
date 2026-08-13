@@ -63,7 +63,7 @@ struct MenuBarLabel: View {
     private var accessibilityLabel: String {
         switch controller.phase {
         case .recording: return "Whisper 正在录音"
-        case .finalizing: return "Whisper 正在转写"
+        case .finalizing: return controller.isPolishing ? "Whisper 正在整理" : "Whisper 正在转写"
         case .error: return "Whisper 出错"
         case .arming: return "Whisper 正在准备录音"
         case .idle:
@@ -141,7 +141,7 @@ struct MenuBarView: View {
     private var contextualStatus: String? {
         switch controller.phase {
         case .recording: return "● 正在录音"
-        case .finalizing: return "正在转写…"
+        case .finalizing: return controller.isPolishing ? "正在整理…" : "正在转写…"
         case .error(let message): return "出错：\(message)"
         case .idle, .arming:
             switch controller.connectionStatus {

@@ -36,6 +36,15 @@ final class DictationController {
     private(set) var history: [TranscriptEntry] = []
     private(set) var lastError: String?
     private(set) var isHotKeyActive = false
+    /// True while the cleanup pass is running, as opposed to merely waiting for the
+    /// tail of the transcript. From the outside the two look identical — nothing on
+    /// screen moves during either — but cleanup is the one that takes a second or
+    /// more and then rewrites what was already typed, so the HUD says which is which.
+    private(set) var isPolishing = false
+    /// When a cleaned-up sentence was delivered, for as long as the pill is marking
+    /// the end of it. The *moment* rather than a flag: the mark animates from wherever
+    /// the sweeping light had got to, which only the elapsed time since this can say.
+    private(set) var settledAt: Date?
 
     var connectionStatus: RealtimeClient.Status { client.status }
 
@@ -104,6 +113,9 @@ final class DictationController {
     /// Guards the 3s auto-dismiss of an error banner, so a newer error is not
     /// dismissed early by the previous error's timer.
     @ObservationIgnored private var errorEpoch = 0
+    /// Guards the settle blink the same way, so a fast second sentence does not have
+    /// its confirmation cut short by the previous one's timer.
+    @ObservationIgnored private var settleEpoch = 0
     /// The cleanup failure already shown. A blocked region or a dead key fails on
     /// every single sentence; telling the user once is information, telling them
     /// every time is noise. Cleared by the next successful cleanup.
@@ -420,6 +432,11 @@ final class DictationController {
             return
         }
 
+        // A new utterance supersedes any completion mark still finishing its release.
+        if settledAt != nil {
+            settleEpoch += 1
+            settledAt = nil
+        }
         cancelPolish()
         phase = .recording
         partialText = ""
@@ -469,6 +486,10 @@ final class DictationController {
             return
         }
         phase = .finalizing
+        // The meter is the only thing on the pill while the tail of the transcript
+        // arrives, so it has to stop reading the last level it saw before the
+        // microphone went away — flat bars are what says "not listening any more".
+        level = 0
         // Audio chunks cross from the capture thread to the main queue; any that were
         // already enqueued when the key went up would land *after* an immediate
         // commit, and the server drops them from the turn (commit clears its buffer).
@@ -629,6 +650,7 @@ final class DictationController {
             return
         }
         cancelPolish()
+        isPolishing = true
         polishTask = Task { [weak self] in
             guard let self else { return }
             let outcome = await self.polisher.polish(final, route: route)
@@ -643,9 +665,11 @@ final class DictationController {
 
             var result = final
             var notice: String?
+            var cleanupSucceeded = false
             switch outcome {
             case .cleaned(let text):
                 result = text
+                cleanupSucceeded = true
                 // Working again — so if it breaks a second time, say so a second time.
                 self.reportedPolishNotice = nil
             case .unchanged(let reason):
@@ -656,7 +680,7 @@ final class DictationController {
             // leading space kept by `normalizeLeadingSpace` and glue the sentence
             // to the word before the caret.
             if final.hasPrefix(" "), !result.hasPrefix(" ") { result = " " + result }
-            self.finish(with: result)
+            self.finish(with: result, confirmsCleanup: cleanupSucceeded)
             // After `finish`, never before: its `defer` resets the phase, which would
             // wipe the notice off the pill in the same frame it went up.
             if let notice { self.reportPolishFailure(notice) }
@@ -876,15 +900,17 @@ final class DictationController {
     private func cancelPolish() {
         polishTask?.cancel()
         polishTask = nil
+        isPolishing = false
     }
 
     /// Emits the finished text and returns to idle.
-    private func finish(with text: String?) {
+    private func finish(with text: String?, confirmsCleanup: Bool = false) {
         defer {
             partialText = ""
             rawPartial = ""
             injectedText = ""
             utteranceRoute = nil
+            isPolishing = false
             phase = .idle
         }
 
@@ -937,6 +963,26 @@ final class DictationController {
 
         history.insert(TranscriptEntry(text: text, date: Date()), at: 0)
         if history.count > 50 { history.removeLast(history.count - 50) }
+        if confirmsCleanup { markSettled() }
+    }
+
+    /// Says that cleanup is done, for a beat after it is.
+    ///
+    /// Only on the cleanup path, and only where text was actually emitted. Without
+    /// cleanup the whole thing is over in the time it takes to lift a finger, and
+    /// nobody waiting that long needs to be told it finished.
+    private func markSettled() {
+        settleEpoch += 1
+        let epoch = settleEpoch
+        settledAt = Date()
+        // 0.25 s gather + 0.5 s hold + 0.45 s release.
+        log.info("cleanup settled; holding the mark")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.settleEpoch == epoch else { return }
+                self.settledAt = nil
+            }
+        }
     }
 
     /// Fixes up already-typed text if the final text differs from what the deltas typed.
