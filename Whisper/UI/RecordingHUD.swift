@@ -1,5 +1,8 @@
 import AppKit
+import OSLog
 import SwiftUI
+
+private let log = Logger(subsystem: "com.mingyili.Whisper", category: "hud")
 
 /// A small pill that lives at the bottom-centre of the screen all the time, staying out
 /// of the way until you speak — then it grows into a live transcript readout.
@@ -17,9 +20,25 @@ final class RecordingHUDController {
     private static let panelSize = NSSize(width: 260, height: 48)
     /// Gap between the pill and the bottom of the usable screen area (above the Dock).
     private static let bottomInset: CGFloat = 10
+    /// A desktop switch is animated; the window server settles the new Space's window
+    /// list only once it has finished.
+    private static let spaceSettleDelay: TimeInterval = 0.4
+
+    /// The pill belongs to every desktop, sits above full-screen apps, and never joins
+    /// Exposé or the window cycle.
+    private static let collectionBehavior: NSWindow.CollectionBehavior = [
+        .canJoinAllSpaces,
+        .canJoinAllApplications,
+        .fullScreenAuxiliary,
+        .stationary,
+        .ignoresCycle,
+    ]
 
     private var panel: NSPanel?
     private var screenObserver: NSObjectProtocol?
+    private var spaceObserver: NSObjectProtocol?
+    private var isVisibilityRequested = false
+    private var placementEpoch = 0
 
     private init() {
         screenObserver = NotificationCenter.default.addObserver(
@@ -29,9 +48,20 @@ final class RecordingHUDController {
         ) { _ in
             MainActor.assumeIsolated { RecordingHUDController.shared.reposition() }
         }
+
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                RecordingHUDController.shared.verifyPlacementAfterSpaceSettles()
+            }
+        }
     }
 
     func show() {
+        isVisibilityRequested = true
         // Reposition only on first creation (and via the explicit calls when a
         // dictation arms or the screen layout changes) — repositioning on every
         // phase change would let the pill jump displays mid-dictation just because
@@ -41,10 +71,64 @@ final class RecordingHUDController {
             reposition()
         }
         panel?.orderFrontRegardless()
+        verifyPlacementAfterSpaceSettles()
     }
 
     func hide() {
+        isVisibilityRequested = false
+        placementEpoch &+= 1
         panel?.orderOut(nil)
+    }
+
+    /// The pill is created once and then only ordered in and out, which is normally
+    /// enough because it belongs to every desktop. It does not always stay that way:
+    /// after hours of use the window server can drop the membership, and the pill
+    /// then exists only on the desktop it was last placed on — the app still believes
+    /// it is showing the HUD while whole apps on another desktop (微信, Word) never
+    /// see it. Ordering the window out and back in does not undo that; re-assigning
+    /// the collection behaviour does, so every desktop switch re-checks and repairs.
+    private func verifyPlacementAfterSpaceSettles() {
+        placementEpoch &+= 1
+        let epoch = placementEpoch
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.spaceSettleDelay) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.placementEpoch == epoch else { return }
+                self.restorePlacementIfMissing()
+            }
+        }
+    }
+
+    private func restorePlacementIfMissing() {
+        guard isVisibilityRequested, let panel else { return }
+        let windows = Self.onScreenWindows()
+        // An empty list means the query failed rather than that the pill is gone.
+        guard !windows.isEmpty,
+              !Self.containsWindow(number: panel.windowNumber, in: windows) else {
+            return
+        }
+
+        log.warning("HUD lost its place on the active desktop; re-placing it")
+        // The assignment has to be a change for AppKit to forward it, so the
+        // single-desktop value goes on first — for the fraction of a frame before the
+        // real one replaces it, the pill is where it already was.
+        panel.collectionBehavior = Self.collectionBehavior.subtracting(.canJoinAllSpaces)
+        panel.collectionBehavior = Self.collectionBehavior
+        panel.orderFrontRegardless()
+    }
+
+    /// The windows the window server currently draws on the active desktop.
+    private nonisolated static func onScreenWindows() -> [[String: Any]] {
+        CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+    }
+
+    nonisolated static func containsWindow(
+        number: Int,
+        in windows: [[String: Any]]
+    ) -> Bool {
+        windows.contains { ($0[kCGWindowNumber as String] as? Int) == number }
     }
 
     static func shouldShow(
@@ -81,13 +165,7 @@ final class RecordingHUDController {
         )
         panel.isFloatingPanel = true
         panel.level = .statusBar
-        panel.collectionBehavior = [
-            .canJoinAllSpaces,
-            .canJoinAllApplications,
-            .fullScreenAuxiliary,
-            .stationary,
-            .ignoresCycle,
-        ]
+        panel.collectionBehavior = Self.collectionBehavior
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false

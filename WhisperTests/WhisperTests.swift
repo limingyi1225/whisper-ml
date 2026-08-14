@@ -315,6 +315,17 @@ import Testing
         ) == 3)
     }
 
+    @Test func placementCheckLooksForThePanelInTheActiveDesktopsWindows() {
+        let windows: [[String: Any]] = [
+            [kCGWindowNumber as String: 4001, kCGWindowOwnerName as String: "Dock"],
+            [kCGWindowNumber as String: 4002, kCGWindowOwnerName as String: "Whisper"],
+        ]
+
+        #expect(RecordingHUDController.containsWindow(number: 4002, in: windows))
+        #expect(!RecordingHUDController.containsWindow(number: 4003, in: windows))
+        #expect(!RecordingHUDController.containsWindow(number: 4002, in: []))
+    }
+
     @Test func idleFollowsFocusWhileActiveStatesStayVisible() {
         #expect(!RecordingHUDController.shouldShow(
             phase: .idle,
