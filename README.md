@@ -13,6 +13,33 @@
 
 短按右 ⌘ 不会触发，它仍然是普通修饰键。按住期间再按别的键（比如 ⌘C）会自动取消录音。
 
+## 自检注入链路
+
+写入别的 App 靠的是一串对**别人家 accessibility 行为**的假设：这个控件发不发布 focused element、
+那个元素一秒后还能不能比、报不报 selected range。单测答不了这些问题——曾经有一版全绿的构建，
+把每一句都送进了剪贴板而不是文档，就是因为这些问题是推出来的而不是量出来的。
+
+所以有个隐藏自检，用装好的那份签名 App 跑（TCC 认路径，别的副本没有辅助功能权限）：
+
+```bash
+open -n --env WHISPER_INJECTION_SELFTEST=2 --env WHISPER_SELFTEST_APP=TextEdit /Applications/Whisper.app
+```
+
+延迟是留给你把被测 App 切到最前的。前台 App 名字对不上就拒绝动手——它会**真的往文档里打字**，
+所以拿草稿窗口测，别拿正在写的东西测。它只跑这一件事：不装热键、不开麦克风、不连服务器，
+跑完自己退出，不会干扰你正在用的那份。结果在 `log show --predicate 'category == "selftest"'`。
+
+两类结果都正常：
+
+| App | focused element | 实时注入 | 整理改写 | 粘贴 |
+|---|---|---|---|---|
+| TextEdit / Notes | AXTextArea | ✓ | ✓ | ✓ |
+| Safari | AXTextField | ✓ | ✓ | ✓ |
+| Claude / Wink（Electron 类） | 无（`kAXErrorNoValue`） | ✓ | ✓（无范围可比，靠焦点与外来输入守卫） | 无法验证送达 |
+
+**「无」是常态，不是故障。**拿不到元素只意味着没有额外证据，不意味着反证——把它当成写入的前提，
+就会让这一整类 App 的每一句话都进剪贴板。
+
 ## 设置
 
 菜单栏图标 → 设置（⌘,）
