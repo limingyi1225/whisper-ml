@@ -540,15 +540,27 @@ public enum KeychainStore {
 
         guard save(token, account: relayTokenAccount) else { return false }
         guard saveRelayTokenProvenance(provenance, token: token, issuance: issuance) else {
+            let tokenRestored: Bool
             if let previousToken {
-                _ = save(previousToken, account: relayTokenAccount)
+                tokenRestored = save(previousToken, account: relayTokenAccount)
             } else {
-                _ = delete(account: relayTokenAccount)
+                tokenRestored = delete(account: relayTokenAccount)
             }
-            if let previousProvenance {
+            // The invariant worth protecting is that provenance never describes a token
+            // that is not the stored one. Putting the old record back is right only if
+            // the old token went back with it; if that second write failed too — the
+            // same transient condition that broke the first one, a locked login
+            // keychain — then the *new* token is live and the old record would misname
+            // it. A record bound to the wrong token fails its digest check and reads as
+            // unprovenanced, which quietly forfeits the protection an explicitly
+            // entered credential is supposed to have. Absent is the honest answer.
+            if tokenRestored, let previousProvenance {
                 _ = save(previousProvenance, account: relayTokenProvenanceAccount)
             } else {
                 _ = delete(account: relayTokenProvenanceAccount)
+            }
+            if !tokenRestored {
+                log.error("credential rollback failed; the new token is live but unprovenanced")
             }
             return false
         }
