@@ -1,0 +1,230 @@
+import ApplicationServices
+import CoreFoundation
+import Foundation
+import Testing
+@testable import DictationKit
+@testable import Whisper
+
+@Suite struct DictationRuntimeRegressionTests {
+    @Test func controllerBackstopNeverPreemptsTheClientsDynamicDeadline() {
+        let now = Date(timeIntervalSinceReferenceDate: 1_000)
+
+        #expect(DictationController.deferredBackstopDelay(
+            clientDeadline: now.addingTimeInterval(80),
+            now: now
+        ) == 81)
+        #expect(DictationController.deferredBackstopDelay(
+            clientDeadline: now.addingTimeInterval(5),
+            now: now
+        ) == 30)
+        #expect(DictationController.deferredBackstopDelay(
+            clientDeadline: nil,
+            now: now
+        ) == 30)
+    }
+
+    @Test func remoteUploadAllowanceSurvivesLocalWebSocketSendCompletion() {
+        let twoMinutesOfPCM = AudioCapture.bytesPerSecond * 120
+        let beforeRemoteCommit = RealtimeClient.responseTimeoutInterval(
+            rawAudioBytes: twoMinutesOfPCM,
+            remoteUploadAcknowledged: false
+        )
+        let afterRemoteCommit = RealtimeClient.responseTimeoutInterval(
+            rawAudioBytes: twoMinutesOfPCM,
+            remoteUploadAcknowledged: true
+        )
+
+        #expect(abs(afterRemoteCommit - 80) < 0.001)
+        #expect(abs(beforeRemoteCommit - 156.8) < 0.001)
+        #expect(beforeRemoteCommit > afterRemoteCommit)
+    }
+
+    @Test func frozenSelectionOnlyAcceptsTheExpectedSyntheticCaretAdvance() {
+        let snapshot = CFRange(location: 12, length: 4)
+
+        #expect(TextInjector.selectionMatches(
+            snapshot: snapshot,
+            current: snapshot,
+            insertedUTF16Count: 0
+        ))
+        #expect(TextInjector.selectionMatches(
+            snapshot: snapshot,
+            current: CFRange(location: 17, length: 0),
+            insertedUTF16Count: 5
+        ))
+        #expect(!TextInjector.selectionMatches(
+            snapshot: snapshot,
+            current: CFRange(location: 18, length: 0),
+            insertedUTF16Count: 5
+        ))
+        #expect(!TextInjector.selectionMatches(
+            snapshot: snapshot,
+            current: CFRange(location: 17, length: 1),
+            insertedUTF16Count: 5
+        ))
+        #expect(!TextInjector.selectionMatches(
+            snapshot: snapshot,
+            current: snapshot,
+            insertedUTF16Count: -1
+        ))
+    }
+
+    @Test func opaqueEditorsKeepElementProofButNeverInventRangeProof() {
+        let snapshot = CFRange(location: 4, length: 0)
+
+        #expect(TextInjector.selectionProof(
+            snapshot: nil,
+            current: nil,
+            insertedUTF16Count: 0
+        ) == nil)
+        #expect(TextInjector.selectionProof(
+            snapshot: snapshot,
+            current: nil,
+            insertedUTF16Count: 0
+        ) == false)
+    }
+
+    @Test func malformedFocusedAXValuesFailClosedBeforeConversion() {
+        let malformed = "not an accessibility element" as CFString
+        let application = AXUIElementCreateApplication(ProcessInfo.processInfo.processIdentifier)
+
+        #expect(TextInjector.checkedAXElement(from: malformed) == nil)
+        #expect(TextInjector.checkedAXElement(from: application) != nil)
+    }
+
+    @Test func liveDeltasUseExactFieldAndInputOrderNotImmediateCaretAck() {
+        #expect(DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: true
+        ))
+        #expect(!DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: false
+        ))
+        #expect(!DictationController.canContinueLiveInjection(
+            anchorUnchanged: false,
+            exactElementFocused: true
+        ))
+    }
+
+    @Test func shortChinesePromptCannotBecomeAnEnglishAnswer() {
+        let polisher = TranscriptPolisher()
+
+        #expect(!polisher.isPlausible("I am an AI.", from: "请问你是谁"))
+        #expect(!polisher.isPlausible("AI", from: "你是谁"))
+        #expect(!polisher.isPlausible("Meeting", from: "开会"))
+        #expect(polisher.isPlausible("Kevin", from: "凯文"))
+        #expect(polisher.isPlausible("Peter", from: "彼得", vocabulary: ["Peter"]))
+        #expect(polisher.isPlausible("Kevin 和 Amy 明天过来", from: "凯文和艾米明天过来"))
+    }
+
+    @Test func rehearsalIdentityIsDecidedFromTheCapturedUtterance() {
+        #expect(DictationController.isRehearsal(hasTarget: false, isRehearsing: true))
+        #expect(!DictationController.isRehearsal(hasTarget: true, isRehearsing: true))
+        #expect(!DictationController.isRehearsal(hasTarget: false, isRehearsing: false))
+    }
+
+    @Test func queuedRehearsalStaysFrozenIfTheGuideClosesBeforeKeyUp() {
+        let frozenWhileLongPressWasConfirmed = DictationController.QueuedGestureIdentity(
+            anchor: nil,
+            target: nil,
+            isRehearsal: true
+        )
+        let isRehearsingWhenKeyIsReleased = false
+
+        #expect(DictationController.rehearsalAtQueuedRelease(
+            frozenWhileLongPressWasConfirmed
+        ))
+        #expect(DictationController.rehearsalAtQueuedRelease(
+            frozenWhileLongPressWasConfirmed
+        ) != isRehearsingWhenKeyIsReleased)
+    }
+
+    @Test func previousSettlingBeforeQueuedKeyUpPromotesFrozenIdentityAndPrefix() {
+        let originalField = DictationController.InjectionAnchor(
+            processIdentifier: 101,
+            lastForeignInputAt: Date(timeIntervalSinceReferenceDate: 10)
+        )
+        let focusAfterPreviousSettles = DictationController.InjectionAnchor(
+            processIdentifier: 202,
+            lastForeignInputAt: Date(timeIntervalSinceReferenceDate: 20)
+        )
+        let originalElement = AXUIElementCreateApplication(101)
+        let originalTarget = TextInjectionTarget(
+            element: originalElement,
+            processIdentifier: 101,
+            selection: CFRange(location: 7, length: 0),
+            writeEpoch: 0
+        )
+        let frozenFieldIdentity = DictationController.QueuedGestureIdentity(
+            anchor: originalField,
+            target: originalTarget,
+            isRehearsal: false
+        )
+
+        let fieldDisposition = DictationController.deferredGestureDisposition(
+            isGestureActive: true,
+            frozenIdentity: frozenFieldIdentity
+        )
+        guard case .startRecording(.promoteCapturedPrefix(let promotedFieldIdentity)) = fieldDisposition else {
+            Issue.record("a confirmed queued long press must promote its captured prefix")
+            return
+        }
+        #expect(promotedFieldIdentity.anchor == originalField)
+        #expect(promotedFieldIdentity.anchor != focusAfterPreviousSettles)
+        #expect(promotedFieldIdentity.target?.processIdentifier == 101)
+        #expect(promotedFieldIdentity.target.map {
+            CFEqual($0.element, originalElement)
+        } == true)
+        #expect(promotedFieldIdentity.target?.selection?.location == 7)
+        #expect(!promotedFieldIdentity.isRehearsal)
+
+        let frozenRehearsalIdentity = DictationController.QueuedGestureIdentity(
+            anchor: nil,
+            target: nil,
+            isRehearsal: true
+        )
+        let guideIsRehearsingAfterPreviousSettles = false
+        let rehearsalDisposition = DictationController.deferredGestureDisposition(
+            isGestureActive: true,
+            frozenIdentity: frozenRehearsalIdentity
+        )
+        guard case .startRecording(.promoteCapturedPrefix(let promotedRehearsal)) = rehearsalDisposition else {
+            Issue.record("a queued rehearsal must promote its captured prefix")
+            return
+        }
+        #expect(promotedRehearsal.isRehearsal)
+        #expect(promotedRehearsal.isRehearsal != guideIsRehearsingAfterPreviousSettles)
+
+        // A press that has not yet crossed the long-press threshold is not promoted
+        // merely because the utterance ahead of it happened to settle first.
+        guard case .awaitingLongPress = DictationController.deferredGestureDisposition(
+            isGestureActive: true,
+            frozenIdentity: nil
+        ) else {
+            Issue.record("an unconfirmed press must keep waiting for the long-press threshold")
+            return
+        }
+    }
+
+    @Test func monitoringLossPreservesQueuedPrefixWhilePreviousFailureIsDisplayed() {
+        #expect(DictationController.shouldPreserveInterruptedQueuedGesture(
+            phase: .error("上一句失败"),
+            startWhenSettled: true,
+            gestureOwnsCapture: true,
+            hasFrozenIdentity: true
+        ))
+        #expect(DictationController.shouldPreserveInterruptedQueuedGesture(
+            phase: .idle,
+            startWhenSettled: true,
+            gestureOwnsCapture: true,
+            hasFrozenIdentity: true
+        ))
+        #expect(!DictationController.shouldPreserveInterruptedQueuedGesture(
+            phase: .error("上一句失败"),
+            startWhenSettled: true,
+            gestureOwnsCapture: true,
+            hasFrozenIdentity: false
+        ))
+    }
+}

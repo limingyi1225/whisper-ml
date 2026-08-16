@@ -48,6 +48,20 @@ final class DictationController {
 
     var connectionStatus: RealtimeClient.Status { client.status }
 
+    /// Set while the first-run guide is showing its 试一下 step.
+    ///
+    /// Dictation normally refuses to start when Whisper itself is frontmost, because
+    /// there is no other app to type into and saying so is the only useful answer. The
+    /// guide asks the user to try dictating at its own window, so for that one step the
+    /// same moment becomes a rehearsal instead: hotkey, microphone, connection and
+    /// cleanup all run for real, and only the injection is left out — the guide shows
+    /// the sentence itself. It is scoped to "Whisper is frontmost": speaking into any
+    /// other app while the guide is open still types there, exactly as it always did.
+    ///
+    /// Observed, not ignored: the HUD's visibility depends on it, and the guide flips it
+    /// from a view body that the HUD's own observer has to hear about.
+    var isRehearsing = false
+
     @ObservationIgnored private let hotKey = HotKeyMonitor()
     @ObservationIgnored private let audio = AudioCapture()
     @ObservationIgnored private let client = RealtimeClient()
@@ -73,19 +87,33 @@ final class DictationController {
     /// Set once the caret has demonstrably moved away; nothing more is typed or
     /// rewritten for this utterance.
     @ObservationIgnored private var injectionAbandoned = false
+    /// Whether this utterance is the guide's rehearsal, decided when it starts. Frozen
+    /// per utterance rather than read from `isRehearsing` later: the guide can be
+    /// finished while a sentence is still in flight, and that sentence must not
+    /// suddenly acquire a target it never had.
+    @ObservationIgnored private var utteranceIsRehearsal = false
     /// Set when a new dictation is waiting for the previous transcript to land.
     @ObservationIgnored private var startWhenSettled = false
     /// Dictations that were spoken and released before the previous one settled, in
-    /// the order they were spoken. Frozen at release time: the audio because the
-    /// pre-roll buffer is shared with whatever gesture comes next, and the anchor and
-    /// output mode because they describe where and how the *user spoke*, not whatever
-    /// app or settings happen to be current when the queue finally drains. One
-    /// element per hotkey gesture, so each dictation stays its own utterance.
+    /// the order they were spoken. Audio is frozen at release because the pre-roll
+    /// buffer is shared with whatever gesture comes next. Target/rehearsal identity is
+    /// frozen earlier, when the long press becomes a confirmed dictation, because the
+    /// guide or focused field may change while the user is still holding the key.
     private enum QueuedUtterance {
-        case captured(audio: Data, anchor: InjectionAnchor?)
+        case captured(
+            audio: Data,
+            anchor: InjectionAnchor?,
+            target: TextInjectionTarget?,
+            isRehearsal: Bool,
+            interruptionNotice: String?
+        )
         case failed(message: String)
     }
     @ObservationIgnored private var queuedUtterances: [QueuedUtterance] = []
+    /// The target/rehearsal identity of the confirmed queued gesture currently being
+    /// held. Never recaptured on key-up: a guide dismissal or same-app focus change
+    /// during the hold must not retarget already-spoken audio.
+    @ObservationIgnored private var queuedGestureIdentity: QueuedGestureIdentity?
     /// Non-nil when the queued gesture currently being spoken has already failed —
     /// the microphone died mid-capture, or Secure Event Input blocked capture from
     /// ever starting. Its audio is truncated or gone; the release must not enqueue
@@ -123,18 +151,49 @@ final class DictationController {
 
     /// Identifies the app and input state we typed into, so a late rewrite can tell
     /// whether it is still addressing the same place.
-    private struct InjectionAnchor: Equatable {
+    struct InjectionAnchor: Equatable {
         let processIdentifier: pid_t?
         let lastForeignInputAt: Date?
     }
 
-    /// The AX element the deltas were typed into. The anchor above is PID-level:
-    /// it cannot see a *programmatic* focus move inside the same app (a dialog, a
-    /// web page shifting fields) because neither the frontmost app nor the
-    /// foreign-input timestamp changes. Deleting text is the one operation where
-    /// that blindness is destructive, so `reconcile` additionally requires this
-    /// element to still hold focus before it backspaces.
-    @ObservationIgnored private var injectionElement: AXUIElement?
+    struct QueuedGestureIdentity {
+        let anchor: InjectionAnchor?
+        let target: TextInjectionTarget?
+        let isRehearsal: Bool
+    }
+
+    enum RecordingStart {
+        /// A long press that became confirmed without waiting behind another utterance.
+        case freshGesture
+        /// A confirmed queued long press whose identity and pre-roll already belong to it.
+        case promoteCapturedPrefix(QueuedGestureIdentity)
+    }
+
+    /// What remains of a held gesture when the utterance ahead of it settles.
+    ///
+    /// `promoteCapturedPrefix` is deliberately distinct from a fresh start: the long
+    /// press was already confirmed, its target/rehearsal identity was already frozen,
+    /// and the microphone has already captured the beginning of the sentence into
+    /// pre-roll. The transition must consume all three together instead of looking at
+    /// the now-current guide/focus state. An active gesture without a frozen identity
+    /// is only an ordinary press still waiting to cross the long-press threshold.
+    enum DeferredGestureDisposition {
+        case inactive
+        case awaitingLongPress
+        case startRecording(RecordingStart)
+    }
+
+    /// Exact AX element and selection captured for the utterance. PID-level identity is
+    /// not enough: two fields in one app share it, and asynchronous deltas/final text may
+    /// arrive after focus moves between them. Every synthetic write proves this snapshot
+    /// is still current; unavailable AX state fails closed to the clipboard.
+    @ObservationIgnored private var injectionTarget: TextInjectionTarget?
+
+    /// A recording can be cut short because Accessibility/Secure Event Input makes the
+    /// hotkey monitor disappear. The audio captured so far is still finalized; this
+    /// notice is shown afterwards so the truncation is not mistaken for a successful
+    /// full-length sentence.
+    @ObservationIgnored private var captureInterruptionNotice: String?
 
     /// Hard stop so a stuck key cannot stream forever.
     private let maxUtteranceDuration: TimeInterval = 120
@@ -196,17 +255,111 @@ final class DictationController {
     }
 
     private func refreshHotKeyHealth() {
-        guard Permissions.hasAccessibility, !Permissions.isSecureInputEnabled else {
-            hotKey.stop()
+        guard Permissions.hasAccessibility else {
+            hotKey.stop(cancellationCause: .monitoringLost(
+                "辅助功能权限中断，录音已提前结束"
+            ))
+            isHotKeyActive = false
+            return
+        }
+        guard !Permissions.isSecureInputEnabled else {
+            hotKey.stop(cancellationCause: .monitoringLost(
+                "安全输入已开启，录音已提前结束"
+            ))
             isHotKeyActive = false
             return
         }
         if !hotKey.isOperational {
-            hotKey.stop()
+            hotKey.stop(cancellationCause: .monitoringLost(
+                "热键监听中断，录音已提前结束"
+            ))
             isHotKeyActive = hotKey.start()
         } else {
             isHotKeyActive = true
         }
+    }
+
+    /// Whether an utterance with this target is the guide's rehearsal.
+    ///
+    /// Both halves are load-bearing. Without a target there is nowhere to type, but that
+    /// alone must never mean "throw the sentence away": outside the guide it is the
+    /// clipboard-fallback case, where the user spoke into an app and then switched away
+    /// before the transcript came back. Only the guide asking for a rehearsal turns a
+    /// missing target into a sentence nobody was ever going to receive.
+    static func isRehearsal(hasTarget: Bool, isRehearsing: Bool) -> Bool {
+        !hasTarget && isRehearsing
+    }
+
+    /// Release consumes the identity frozen when the long press was confirmed. This
+    /// intentionally takes no live guide/focus input, so a UI transition during the
+    /// hold cannot turn a rehearsal into a real injection (or retarget real speech).
+    static func rehearsalAtQueuedRelease(_ identity: QueuedGestureIdentity) -> Bool {
+        identity.isRehearsal
+    }
+
+    /// Live deltas intentionally depend on ordered input/focus evidence, not an
+    /// immediate caret acknowledgement: CGEvent.post is asynchronous, so the target
+    /// app may still report the pre-delta caret when the next network delta arrives.
+    static func canContinueLiveInjection(
+        anchorUnchanged: Bool,
+        exactElementFocused: Bool
+    ) -> Bool {
+        anchorUnchanged && exactElementFocused
+    }
+
+    /// Ownership, not the previous utterance's presentation phase, decides whether a
+    /// monitoring loss must preserve a queued recording. In particular `handleFailure`
+    /// moves the HUD to `.error` for 1.2 s while this gesture is still capturing.
+    static func shouldPreserveInterruptedQueuedGesture(
+        phase _: Phase,
+        startWhenSettled: Bool,
+        gestureOwnsCapture: Bool,
+        hasFrozenIdentity: Bool
+    ) -> Bool {
+        startWhenSettled && gestureOwnsCapture && hasFrozenIdentity
+    }
+
+    static func deferredGestureDisposition(
+        isGestureActive: Bool,
+        frozenIdentity: QueuedGestureIdentity?
+    ) -> DeferredGestureDisposition {
+        guard isGestureActive else { return .inactive }
+        guard let frozenIdentity else { return .awaitingLongPress }
+        return .startRecording(.promoteCapturedPrefix(frozenIdentity))
+    }
+
+    /// Resolves where a recording belongs. `captureFresh` is lazy by contract: a
+    /// promoted queued gesture must not even ask AX or the guide for their current state.
+    static func recordingIdentity(
+        for start: RecordingStart,
+        captureFresh: () -> QueuedGestureIdentity
+    ) -> QueuedGestureIdentity {
+        switch start {
+        case .freshGesture:
+            return captureFresh()
+        case .promoteCapturedPrefix(let frozenIdentity):
+            return frozenIdentity
+        }
+    }
+
+    private func captureCurrentGestureIdentity() -> QueuedGestureIdentity {
+        let anchor = currentAnchor()
+        let target = anchor?.processIdentifier.flatMap {
+            TextInjector.captureTarget(expectedPID: $0)
+        }
+        return QueuedGestureIdentity(
+            anchor: anchor,
+            target: target,
+            isRehearsal: Self.isRehearsal(
+                hasTarget: anchor != nil,
+                isRehearsing: isRehearsing
+            )
+        )
+    }
+
+    private func freezeQueuedGestureIdentity() {
+        guard queuedGestureIdentity == nil else { return }
+        queuedGestureIdentity = captureCurrentGestureIdentity()
     }
 
     /// Snapshot of where synthetic text is currently going.
@@ -223,7 +376,9 @@ final class DictationController {
 
     /// Called after the user grants Accessibility, or changes the trigger key.
     func restartHotKey() {
-        hotKey.stop()
+        hotKey.stop(cancellationCause: .monitoringLost(
+            "热键设置发生变化，录音已提前结束"
+        ))
         refreshHotKeyHealth()
     }
 
@@ -279,6 +434,7 @@ final class DictationController {
             }
             gestureOwnsCapture = true
             queuedGestureFailureMessage = nil
+            queuedGestureIdentity = nil
             if startWhenSettled {
                 audio.setPrerollCapacity(seconds: queuedPrerollCapacitySeconds)
             }
@@ -291,7 +447,9 @@ final class DictationController {
             if startWhenSettled {
                 // A queue is already waiting on the previous utterance (the phase
                 // may meanwhile be showing that utterance's error). This press has
-                // been buffering since `.armed`; it joins the queue.
+                // been buffering since `.armed`; freeze its identity now, not when
+                // the key eventually comes up.
+                freezeQueuedGestureIdentity()
                 return
             }
             if phase == .finalizing {
@@ -304,6 +462,7 @@ final class DictationController {
                     // away here would silently lose a whole sentence in the modes
                     // where nothing has been typed yet, so wait for it instead. The
                     // pre-roll buffer is already capturing, so no audio is lost.
+                    freezeQueuedGestureIdentity()
                     waitForPreviousUtterance()
                     return
                 }
@@ -333,14 +492,23 @@ final class DictationController {
                     let stopped = audio.stopAndDrainPreroll()
                     if stopped.captureFailed {
                         queuedUtterances.append(.failed(message: "麦克风不可用，录音已中断"))
-                    } else {
+                    } else if let identity = queuedGestureIdentity {
                         queuedUtterances.append(.captured(
                             audio: stopped.audio,
-                            anchor: currentAnchor()
+                            anchor: identity.anchor,
+                            target: identity.target,
+                            isRehearsal: Self.rehearsalAtQueuedRelease(identity),
+                            interruptionNotice: nil
                         ))
+                    } else {
+                        // `.released` should only follow a confirmed long press. If the
+                        // monitor violates that contract, preserve a visible outcome
+                        // instead of inventing an identity at this later focus state.
+                        queuedUtterances.append(.failed(message: "无法确认排队听写的原始输入位置"))
                     }
                 }
                 queuedGestureFailureMessage = nil
+                queuedGestureIdentity = nil
                 gestureOwnsCapture = false
                 gestureCaptureGeneration = nil
                 return
@@ -349,24 +517,50 @@ final class DictationController {
             gestureOwnsCapture = false
             endRecording()
 
-        case .cancelled:
+        case .cancelled(let cause):
+            let monitoringLoss: String?
+            switch cause {
+            case .userGesture:
+                monitoringLoss = nil
+            case .monitoringLost(let message):
+                monitoringLoss = message
+            }
+            if let monitoringLoss,
+               preserveInterruptedQueuedGestureIfNeeded(message: monitoringLoss) {
+                return
+            }
             switch phase {
             case .arming:
                 cancelCurrentGestureCapture()
-                phase = .idle
+                if let monitoringLoss {
+                    showError(monitoringLoss)
+                } else {
+                    phase = .idle
+                }
             case .finalizing:
                 // Was a shortcut after all; drop the speculative capture and let the
-                // cleanup that is still running finish normally.
+                // cleanup that is still running finish normally. A confirmed queued
+                // gesture was already consumed by the ownership check above.
                 cancelCurrentGestureCapture()
             case .recording:
-                cancelCurrentGestureCapture()
-                client.cancelUtterance()
-                stopMaxDurationTimer()
-                phase = .idle
-                partialText = ""
-                accumulatedPartial = ""
-                injectedText = ""
-                utteranceRoute = nil
+                if let monitoringLoss {
+                    // The release event is gone, but the audio already captured is valid.
+                    // Finalize that prefix so non-live output reaches the clipboard and
+                    // show why it may be truncated once the transcript settles.
+                    captureInterruptionNotice = monitoringLoss
+                    endRecording()
+                } else {
+                    cancelCurrentGestureCapture()
+                    client.cancelUtterance()
+                    stopMaxDurationTimer()
+                    phase = .idle
+                    partialText = ""
+                    accumulatedPartial = ""
+                    injectedText = ""
+                    utteranceRoute = nil
+                    injectionTarget = nil
+                    utteranceIsRehearsal = false
+                }
             case .idle, .error:
                 // `phase` may have changed underneath a speculative gesture when the
                 // previous utterance completed or failed during the hold threshold.
@@ -376,10 +570,43 @@ final class DictationController {
         }
     }
 
+    /// Freezes a confirmed queued gesture when the monitor disappears, regardless of
+    /// whether the previous utterance is still `.finalizing`, currently showing
+    /// `.error`, or has briefly reached `.idle` before its delayed drain runs.
+    private func preserveInterruptedQueuedGestureIfNeeded(message: String) -> Bool {
+        guard Self.shouldPreserveInterruptedQueuedGesture(
+            phase: phase,
+            startWhenSettled: startWhenSettled,
+            gestureOwnsCapture: gestureOwnsCapture,
+            hasFrozenIdentity: queuedGestureIdentity != nil
+        ), let identity = queuedGestureIdentity else {
+            return false
+        }
+
+        gestureOwnsCapture = false
+        gestureCaptureGeneration = nil
+        queuedGestureFailureMessage = nil
+        queuedGestureIdentity = nil
+        let stopped = audio.stopAndDrainPreroll()
+        if stopped.captureFailed {
+            queuedUtterances.append(.failed(message: "麦克风不可用，录音已中断"))
+        } else {
+            queuedUtterances.append(.captured(
+                audio: stopped.audio,
+                anchor: identity.anchor,
+                target: identity.target,
+                isRehearsal: Self.rehearsalAtQueuedRelease(identity),
+                interruptionNotice: message
+            ))
+        }
+        return true
+    }
+
     private func cancelCurrentGestureCapture() {
         gestureOwnsCapture = false
         gestureCaptureGeneration = nil
         queuedGestureFailureMessage = nil
+        queuedGestureIdentity = nil
         if startWhenSettled, queuedUtterances.isEmpty {
             // Only the in-progress gesture is abandoned. Frozen queue entries belong
             // to earlier releases and must still drain in order.
@@ -391,7 +618,7 @@ final class DictationController {
         audio.stop()
     }
 
-    private func beginRecording() {
+    private func beginRecording(from start: RecordingStart = .freshGesture) {
         // `.armed` already has the engine capturing into the pre-roll buffer. Every
         // failure exit below must stop it, or the microphone stays on until quit —
         // `.released` won't stop it either, because the phase will be `.error`.
@@ -422,7 +649,11 @@ final class DictationController {
             showError(error.localizedDescription)
             return
         }
-        guard let targetAnchor = currentAnchor() else {
+        let identity = Self.recordingIdentity(for: start) {
+            // Only an ordinary newly-confirmed gesture reads live guide/focus state.
+            self.captureCurrentGestureIdentity()
+        }
+        guard identity.anchor != nil || identity.isRehearsal else {
             audio.stop()
             gestureOwnsCapture = false
             gestureCaptureGeneration = nil
@@ -441,30 +672,44 @@ final class DictationController {
         accumulatedPartial = ""
         injectedText = ""
         pendingRawText = nil
+        captureInterruptionNotice = nil
         // A fresh start clears a capture-failure marker from a gesture whose queue
         // was dissolved before the marker was consumed; the engine is retried from
         // scratch below and will re-report if the microphone is still gone.
         queuedGestureFailureMessage = nil
         utteranceGeneration += 1
         utteranceStart = Date()
-        utteranceTypesWhileSpeaking = settings.typesWhileSpeaking
+        utteranceIsRehearsal = identity.isRehearsal
+        // A rehearsal types nothing, so it must not stream deltas either — that is the
+        // path that puts characters on screen before the key is even released.
+        utteranceTypesWhileSpeaking = !utteranceIsRehearsal && settings.typesWhileSpeaking
         utteranceRoute = route
         // Taken once, at the start. Refreshing it as each delta lands would let an
         // edit the user made mid-sentence be masked by the next delta, and the later
         // rewrite would then chew through their change.
-        injectionAnchor = targetAnchor
-        injectionElement = targetAnchor.processIdentifier.flatMap {
-            TextInjector.captureFocusedElement(expectedPID: $0)
-        }
+        injectionAnchor = identity.anchor
+        injectionTarget = identity.target
         injectionAbandoned = false
 
         client.beginUtterance()
 
-        // No-op if `.armed` already started it; a safety net if that path was skipped.
-        if let generation = audio.beginPreroll() {
-            gestureCaptureGeneration = generation
+        switch start {
+        case .freshGesture:
+            // No-op when `.armed` already started capture; a safety net if that path
+            // was skipped. A deferred start must not call this because its buffered
+            // prefix is already owned by the confirmed queued gesture.
+            if let generation = audio.beginPreroll() {
+                gestureCaptureGeneration = generation
+            }
+        case .promoteCapturedPrefix:
+            break
         }
-        let preroll = audio.startStreaming(includePreroll: true)
+        // Both the long-press threshold and any wait behind the previous utterance are
+        // part of this sentence. Promote, rather than restart, that captured prefix.
+        let preroll = audio.startStreaming(
+            includePreroll: true,
+            nextPrerollCapacitySeconds: 1
+        )
         if !preroll.isEmpty { client.appendAudio(preroll) }
 
         startMaxDurationTimer()
@@ -550,11 +795,20 @@ final class DictationController {
         // clicked elsewhere or started typing in that window, the caret is no longer
         // ours and the rest of the sentence would land in the wrong place — so stop
         // injecting rather than scattering text across their document.
+        //
+        // The frozen AX element sharpens that check when the control publishes one, and
+        // is deliberately not required. A system-wide focused-element read answers
+        // `kAXErrorNoValue` for whole classes of editors; making it a precondition
+        // abandoned injection on the first delta of every sentence in those apps and
+        // sent the transcript to the clipboard instead.
         guard let injectionAnchor,
               let current = currentAnchor(),
-              injectionAnchor == current else {
+              Self.canContinueLiveInjection(
+                anchorUnchanged: injectionAnchor == current,
+                exactElementFocused: injectionTarget.map(TextInjector.targetIsStillFocused) ?? true
+              ) else {
             injectionAbandoned = true
-            log.info("focus moved mid-utterance; stopping injection for this sentence")
+            log.info("the frozen field moved or foreign input arrived; stopping injection")
             return
         }
 
@@ -647,10 +901,11 @@ final class DictationController {
             // leading space kept by `normalizeLeadingSpace` and glue the sentence
             // to the word before the caret.
             if final.hasPrefix(" "), !result.hasPrefix(" ") { result = " " + result }
+            let captureWasInterrupted = self.captureInterruptionNotice != nil
             self.finish(with: result, confirmsCleanup: cleanupSucceeded)
             // After `finish`, never before: its `defer` resets the phase, which would
             // wipe the notice off the pill in the same frame it went up.
-            if let notice { self.reportPolishFailure(notice) }
+            if let notice, !captureWasInterrupted { self.reportPolishFailure(notice) }
         }
     }
 
@@ -666,24 +921,49 @@ final class DictationController {
         startWhenSettled = true
         log.info("previous transcript still in flight; holding the new utterance")
 
-        // No deadline of our own — the client already fails an utterance whose
-        // transcript never arrives, and that path releases the queued dictation.
-        // This is only a backstop in case nothing fires at all.
+        armDeferredStartBackstop()
+    }
+
+    /// Keeps the controller-level backstop behind the client's current legal deadline.
+    /// The client can extend that deadline when a slow connection becomes ready or when
+    /// the server acknowledges a long upload, so every firing re-checks and reschedules.
+    private func armDeferredStartBackstop() {
         deferredStartTimer?.invalidate()
+        let delay = Self.deferredBackstopDelay(
+            clientDeadline: client.currentUtteranceTimeoutDeadline,
+            now: Date()
+        )
         // `.common`, not the default mode: this backstop must keep ticking while
         // the menu-bar menu is open (menu tracking suspends `.default`).
-        let timer = Timer(timeInterval: 30, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.startWhenSettled else { return }
-                log.warning("previous utterance never settled; releasing the queued one")
+                if let deadline = self.client.currentUtteranceTimeoutDeadline,
+                   deadline > Date() {
+                    self.armDeferredStartBackstop()
+                    return
+                }
+                log.warning("previous utterance exceeded its authoritative timeout")
                 self.client.cancelUtterance()
                 self.pendingRawText = nil
-                self.phase = .idle
-                self.startDeferredIfPending()
+                // Visible, unlike the old direct phase reset: if the client's own
+                // timeout callback vanished, the sentence must not disappear silently.
+                self.handleFailure("等待上一句转写结果超时")
             }
         }
         deferredStartTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    static func deferredBackstopDelay(
+        clientDeadline: Date?,
+        now: Date,
+        minimumDelay: TimeInterval = 30
+    ) -> TimeInterval {
+        guard let clientDeadline else { return minimumDelay }
+        // One second ensures the client's authoritative timer and failure callback get
+        // the first chance to settle the utterance when both live on the main run loop.
+        return max(minimumDelay, clientDeadline.timeIntervalSince(now) + 1)
     }
 
     /// Starts the dictation that was held back, provided the key is still down.
@@ -757,23 +1037,45 @@ final class DictationController {
             return
         }
 
-        audio.setPrerollCapacity(seconds: 1)
         if let failureMessage = queuedGestureFailureMessage {
             // Capture for this gesture failed while it was being spoken; its audio
             // is gone. Now that the previous utterance has settled, say so.
             queuedGestureFailureMessage = nil
+            audio.setPrerollCapacity(seconds: 1)
             handleFailure(failureMessage)
             return
         }
-        guard hotKey.isGestureActive else {
+        switch Self.deferredGestureDisposition(
+            isGestureActive: hotKey.isGestureActive,
+            frozenIdentity: queuedGestureIdentity
+        ) {
+        case .inactive:
             // No live gesture — either never spoken (key went up before the long
             // press confirmed) or abandoned by a chord, in which case the physical
             // key may still be down but its release will never be reported.
+            audio.setPrerollCapacity(seconds: 1)
             audio.stop()
             gestureCaptureGeneration = nil
             return
+        case .awaitingLongPress:
+            // The preceding utterance settled during this gesture's hold threshold.
+            // Keep its existing pre-roll, but do not turn a tap/shortcut into dictation.
+            // If the threshold is crossed, `.longPressBegan` follows the ordinary
+            // `.arming` path and captures identity at that confirmation moment.
+            audio.setPrerollCapacity(seconds: 1)
+            phase = .arming
+            lastError = nil
+            return
+        case .startRecording(let start):
+            // Consume the frozen identity exactly once. Key-up now follows the normal
+            // `.recording` path and cannot enqueue the same gesture a second time.
+            queuedGestureIdentity = nil
+            beginRecording(from: start)
+            // Successful promotion already reset this atomically after detaching the
+            // full prefix. This also restores the ordinary cap on an early failure,
+            // where `beginRecording` stopped capture before reaching that transition.
+            audio.setPrerollCapacity(seconds: 1)
         }
-        beginRecording()
     }
 
     /// A queued gesture can wait behind several already-frozen turns, each with its
@@ -800,16 +1102,22 @@ final class DictationController {
     ///
     /// Unlike `beginRecording` this never touches the microphone pipeline: the audio
     /// was frozen when the key was released, and both the engine and the pre-roll
-    /// buffer may already belong to the next dictation. The anchor was frozen at
-    /// the same moment, so the text goes where the user was when they spoke — if
-    /// they have switched apps since, the anchor mismatch downstream keeps it out
+    /// buffer may already belong to the next dictation. The anchor was frozen when
+    /// the long press was confirmed, so the text goes where the user began speaking —
+    /// if they have switched apps since, the anchor mismatch downstream keeps it out
     /// of the wrong window. The output mode is deliberately *not* frozen: it must
     /// match the session that will transcribe this audio, which is whatever is
     /// current now (a settings change mid-queue reconnects at the settle boundary,
     /// right before this call) — a mode frozen at release time would expect deltas
     /// from a model that no longer streams them, or vice versa.
     private func commitQueuedUtterance(_ utterance: QueuedUtterance) -> String? {
-        guard case .captured(let audio, let anchor) = utterance else {
+        guard case .captured(
+            let audio,
+            let anchor,
+            let target,
+            let isRehearsal,
+            let interruptionNotice
+        ) = utterance else {
             return "排队的听写内容无效"
         }
         let route: ServiceRoute
@@ -827,13 +1135,13 @@ final class DictationController {
         utteranceStart = Date()
         utteranceRoute = route
         injectionAnchor = anchor
-        // Captured now, not at release: this is where live deltas are about to
-        // land, and where a later rewrite would delete from.
-        injectionElement = anchor?.processIdentifier.flatMap {
-            TextInjector.captureFocusedElement(expectedPID: $0)
-        }
-        utteranceTypesWhileSpeaking = settings.typesWhileSpeaking
+        // The target and rehearsal identity describe where this sentence was spoken.
+        // Re-capturing either now would let a later focus move or guide close retarget it.
+        injectionTarget = target
+        utteranceIsRehearsal = isRehearsal
+        utteranceTypesWhileSpeaking = !utteranceIsRehearsal && settings.typesWhileSpeaking
         injectionAbandoned = false
+        captureInterruptionNotice = interruptionNotice
         phase = .finalizing
 
         client.beginUtterance()
@@ -868,13 +1176,20 @@ final class DictationController {
 
     /// Emits the finished text and returns to idle.
     private func finish(with text: String?, confirmsCleanup: Bool = false) {
+        let interruptionNotice = captureInterruptionNotice
         defer {
             partialText = ""
             accumulatedPartial = ""
             injectedText = ""
             utteranceRoute = nil
+            injectionTarget = nil
+            utteranceIsRehearsal = false
+            captureInterruptionNotice = nil
             isPolishing = false
             phase = .idle
+            if let interruptionNotice {
+                showError(interruptionNotice)
+            }
         }
 
         guard var text, !text.isEmpty else { return }
@@ -895,7 +1210,13 @@ final class DictationController {
 
         let canPostSyntheticEvents = Permissions.hasAccessibility
             && !Permissions.isSecureInputEnabled
-        if !canPostSyntheticEvents {
+        if utteranceIsRehearsal {
+            // 试一下 in the first-run guide. Nothing is typed and nothing is put on the
+            // clipboard either: there is no sentence at risk here, only a sample the
+            // guide is about to show, and quietly replacing the user's clipboard with
+            // it would be a side effect nobody asked for.
+            log.info("rehearsal finished; showing the transcript in the guide only")
+        } else if !canPostSyntheticEvents {
             // TCC can be revoked, or the same app can enter a password field, while
             // the transcript/cleanup is still in flight. Synthetic paste/backspace
             // is then discarded by macOS. Keep the sentence recoverable instead of
@@ -907,13 +1228,14 @@ final class DictationController {
         } else if let targetPID = injectionAnchor?.processIdentifier,
                   targetPID != ProcessInfo.processInfo.processIdentifier,
                   targetPID == NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            // `paste` revalidates the app, and the frozen element and caret wherever the
+            // control publishes them, immediately before mutating the pasteboard or
+            // posting ⌘V. Failure keeps the full transcript on the clipboard.
             TextInjector.paste(text, targetPID: targetPID)
         } else {
             // The transcript takes a second or two to arrive after the key goes up.
             // If the user has ⌘Tab'd away in that window, pasting would drop the
-            // sentence into the wrong app — put it on the clipboard instead, one ⌘V
-            // away. Only the app is compared: clicking around inside the same app
-            // still means "paste it where my caret is".
+            // sentence into the wrong app — put it on the clipboard instead.
             log.info("frontmost app changed since dictation; copying instead of pasting")
             TextInjector.copyToClipboard(text)
         }
@@ -969,9 +1291,18 @@ final class DictationController {
         guard !injectionAbandoned,
               let injectionAnchor,
               let current = currentAnchor(),
-              injectionAnchor == current else {
+              let targetPID = injectionAnchor.processIdentifier,
+              injectionAnchor == current,
+              injectionTarget.map(TextInjector.targetIsStillFocused) ?? true else {
             log.info("focus moved since the text was typed; full transcript copied to clipboard")
             TextInjector.copyToClipboard(final)
+            return
+        }
+
+        // A live model is allowed to produce no deltas. In that case use the proven
+        // paste path rather than unacknowledged Unicode typing for the entire result.
+        if typed.isEmpty {
+            TextInjector.paste(final, targetPID: targetPID)
             return
         }
 
@@ -981,17 +1312,20 @@ final class DictationController {
         log.info("rewriting from char \(shared): -\(deleteCount) +\(addition.count)")
 
         if deleteCount > 0 {
-            // The PID-level anchor above cannot see a focus move *within* the
-            // app (programmatic, or a click — no foreign keystroke involved).
-            // Backspacing into whatever control is focused now would eat its
-            // content, so deletion also requires the element the deltas were
-            // typed into to still hold focus.
-            if let injectionElement, !TextInjector.elementIsStillFocused(injectionElement) {
+            // The PID-level anchor above cannot see a focus move *within* the app
+            // (programmatic, or a click — no foreign keystroke involved). Backspacing
+            // into whatever control is focused now would eat its content, so deletion
+            // also requires the element the deltas were typed into to still hold focus.
+            if let injectionTarget,
+               !TextInjector.elementIsStillFocused(injectionTarget.element) {
                 log.warning("focus moved to another element in the same app; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
             }
-            switch TextInjector.matchesTextImmediatelyBeforeCaret(typed) {
+            switch TextInjector.matchesTextImmediatelyBeforeCaret(
+                typed,
+                expectedProcessIdentifier: targetPID
+            ) {
             case false:
                 // The target app transformed our keystrokes (smart quotes/dashes,
                 // autocorrect, input-method composition). Backspacing by our original
@@ -1001,11 +1335,23 @@ final class DictationController {
                 return
             case nil:
                 // Some Electron/WebView controls do not expose text ranges through AX.
-                // Keep the established behavior there; focus/foreign-input guards above
-                // still protect against the common caret-movement cases.
+                // That is silence, not denial, and it is the answer a large share of
+                // real editors give. Requiring a positive answer here strands every
+                // cleaned-up sentence on the clipboard while the raw deltas stay on
+                // screen — the whole cleanup feature reads as broken. The focus and
+                // foreign-input guards above are what protect this path there.
                 log.info("target does not expose AX text ranges; reconciling with anchor checks only")
             case true:
                 break
+            }
+            // The AX text query above can block for its full messaging timeout.
+            // Confirm the field did not move while it did, immediately before posting
+            // the destructive key events.
+            if let injectionTarget,
+               !TextInjector.elementIsStillFocused(injectionTarget.element) {
+                log.warning("focus moved while the document was being read; copying corrected transcript")
+                TextInjector.copyToClipboard(final)
+                return
             }
             TextInjector.deleteBackward(count: deleteCount)
         }
@@ -1013,6 +1359,7 @@ final class DictationController {
             TextInjector.type(addition)
         }
     }
+
 
     static func commonPrefixLength(_ lhs: String, _ rhs: String) -> Int {
         var count = 0
@@ -1049,6 +1396,8 @@ final class DictationController {
 
     private func handleFailure(_ message: String) {
         log.error("dictation failed: \(message)")
+        let displayMessage = captureInterruptionNotice ?? Self.friendlyMessage(message)
+        captureInterruptionNotice = nil
         cancelPolish()
         // Only stop capture when no next dictation is using the pipeline. It may be
         // queued (`startWhenSettled`), or still speculative — armed while this
@@ -1067,7 +1416,9 @@ final class DictationController {
         injectedText = ""
         pendingRawText = nil
         utteranceRoute = nil
-        showError(Self.friendlyMessage(message))
+        injectionTarget = nil
+        utteranceIsRehearsal = false
+        showError(displayMessage)
         let epoch = errorEpoch
 
         // Do not strand a dictation queued behind the one that just failed — but
@@ -1076,6 +1427,8 @@ final class DictationController {
         // with a non-live model the failed sentence would vanish without any trace
         // at all: no text, no history entry, no visible error.
         if startWhenSettled {
+            deferredStartTimer?.invalidate()
+            deferredStartTimer = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self, self.errorEpoch == epoch else { return }

@@ -5,6 +5,26 @@ import OSLog
 
 private let log = Logger(subsystem: "com.mingyili.Whisper", category: "inject")
 
+/// The exact editable target and selection a dictation began against.
+///
+/// PID alone is not an insertion target: two fields in the same app share it, and an
+/// asynchronous transcript can arrive after focus has moved between them. This snapshot
+/// is captured once per utterance and every later synthetic write must prove it is still
+/// current. Targets that do not expose enough AX state fail closed to the clipboard.
+struct TextInjectionTarget {
+    let element: AXUIElement
+    let processIdentifier: pid_t
+    /// Some real editors (Electron/WebView/Terminal variants) expose an exact focused
+    /// AX element but no selected-text range. Selection strengthens the proof when the
+    /// control supports it and is absent, not disproven, when it does not.
+    let selection: CFRange?
+    /// How many synthetic writes this app had posted when the snapshot was taken.
+    /// A frozen caret only predicts the live one while that number has not moved:
+    /// our own keystrokes advance the caret perfectly legitimately, and a queued
+    /// second dictation captures its target *before* the first one is pasted.
+    let writeEpoch: Int
+}
+
 /// Types text into whatever app currently has focus.
 ///
 /// The hard part: while dictating, the trigger modifier (e.g. right ⌘) is physically
@@ -56,18 +76,12 @@ enum TextInjector {
     /// A clipboard restore that has been scheduled but not yet executed. Later
     /// sentences are posted as Unicode behind its still-unacknowledged ⌘V, so they
     /// cannot overwrite the data that first paste may still need.
-    private struct PasteAnchor {
-        let element: AXUIElement
-        let targetPID: pid_t
-        let selectionBeforePaste: CFRange
-    }
-
     private struct PendingRestore {
         let id: UUID
         let changeCount: Int
         let targetPID: pid_t
         let pastedText: String
-        let anchor: PasteAnchor?
+        let anchor: TextInjectionTarget?
         var queuedTypedText = ""
         var deferredClipboardText = ""
         let task: Task<Void, Never>
@@ -127,6 +141,16 @@ enum TextInjector {
         guard !text.isEmpty else { return }
         let pasteboard = NSPasteboard.general
 
+        // Only the app is compared. Clicking around inside the same app still means
+        // "paste it where my caret is": the caret this utterance froze seconds ago has
+        // no authority over where the finished sentence belongs, and asserting it sent
+        // the whole transcript to the clipboard for an ordinary click. The caret that
+        // does matter is captured fresh below, for the restore proof.
+        guard writeIsStillSafe(targetPID) else {
+            copyToClipboard(text)
+            return
+        }
+
         if var pending = pendingRestore,
            pasteboard.changeCount == pending.changeCount {
             // Do not overwrite a clipboard that an earlier synthetic ⌘V may not have
@@ -139,7 +163,7 @@ enum TextInjector {
             // immediately before any keystroke is posted.
             if pending.targetPID == targetPID,
                anchorElementIsStillFocused(pending.anchor),
-               NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID {
+               writeIsStillSafe(targetPID) {
                 pending.queuedTypedText += text
                 pendingRestore = pending
                 type(text)
@@ -153,7 +177,7 @@ enum TextInjector {
                 // settles, in case this target rejects synthetic text.
                 pending.deferredClipboardText += text
                 pendingRestore = pending
-                if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID {
+                if writeIsStillSafe(targetPID) {
                     type(text)
                 }
             }
@@ -169,7 +193,7 @@ enum TextInjector {
             // target rejects synthetic typing, it becomes recoverable from the
             // clipboard the moment the hold lifts.
             unprovenPaste?.fallbackText += text
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID {
+            if writeIsStillSafe(targetPID) {
                 type(text)
             }
             return
@@ -185,7 +209,13 @@ enum TextInjector {
         pendingRestore?.task.cancel()
         pendingRestore = nil
 
-        let pasteAnchor = capturePasteAnchor(targetPID: targetPID)
+        // The proof that lets the clipboard be restored compares this control's caret
+        // before and after the Cmd-V, so it has to be the caret as it stands *now* —
+        // not the one frozen when the utterance began. A second sentence pasted right
+        // behind a first starts from a caret the first one already moved, and an anchor
+        // taken before that move can never be satisfied: the restore then times out and
+        // the board is left holding the transcript instead of the user's own clipboard.
+        let pasteAnchor = captureTarget(expectedPID: targetPID)
         let snapshotChangeCount = pasteboard.changeCount
         let saved = snapshot(pasteboard)
         // Both AX and a full multi-representation clipboard snapshot can block.
@@ -195,23 +225,44 @@ enum TextInjector {
             // Someone else wrote the board mid-flight; it must not be clobbered.
             // Keyboard focus is unaffected by that, so fall back to typing while
             // the target is still frontmost rather than dropping the sentence.
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID {
+            if writeIsStillSafe(targetPID) {
                 type(text)
             }
             return
         }
-        guard pasteTargetIsStillCurrent(pasteAnchor, targetPID: targetPID) else {
+        guard targetIsUnmoved(pasteAnchor, targetPID: targetPID) else {
             replaceClipboard(with: text)
             return
         }
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
             if let saved { restore(saved, to: pasteboard) }
-            type(text)
+            if writeIsStillSafe(targetPID) {
+                type(text)
+            } else {
+                replaceClipboard(with: text)
+            }
             return
         }
         let ourChangeCount = pasteboard.changeCount
 
+        // Setting the board and the AX probes above are separate blocking operations.
+        // Prove both focus and ownership of the clipboard one final time immediately
+        // before posting Cmd-V. If focus moved, leaving `text` on the board is the
+        // intended fail-closed result; if another writer won, their contents win.
+        guard targetIsUnmoved(pasteAnchor, targetPID: targetPID) else {
+            // Focus moved while the board was being written. Leaving `text` on the
+            // board is the intended fail-closed result — one Cmd-V recovers it.
+            return
+        }
+        guard pasteboard.changeCount == ourChangeCount else {
+            // Another writer won the board, so `text` is no longer on it either.
+            // Without this it would be neither pasted, nor typed, nor recoverable.
+            if writeIsStillSafe(targetPID) {
+                type(text)
+            }
+            return
+        }
         postKey(vKeyCode, flags: .maskCommand)
 
         // There is no acknowledgement for a synthetic ⌘V. Restoring after a fixed
@@ -358,32 +409,189 @@ enum TextInjector {
         return system
     }
 
+    /// AX APIs return untyped CF values. Never force-cast a focused value supplied by
+    /// another process; malformed Accessibility implementations must fail closed.
+    static func checkedAXElement(from value: CFTypeRef?) -> AXUIElement? {
+        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
     /// Whether the element the pending paste's proof is anchored to still has
     /// keyboard focus. A `nil` anchor carries no element to compare against, so
     /// the caller's PID check is the best available discriminator.
-    private static func anchorElementIsStillFocused(_ anchor: PasteAnchor?) -> Bool {
+    private static func anchorElementIsStillFocused(_ anchor: TextInjectionTarget?) -> Bool {
         guard let anchor else { return true }
         return elementIsStillFocused(anchor.element)
     }
 
-    /// The AX element that currently has keyboard focus in the app identified by
-    /// `expectedPID`, or nil when it cannot be determined or belongs elsewhere.
-    static func captureFocusedElement(expectedPID: pid_t) -> AXUIElement? {
+    /// Captures the exact field a new utterance is addressing, plus its selection when
+    /// the control exposes one. Returning nil means even element identity cannot be
+    /// proven and is never an invitation to fall back to PID-only injection.
+    static func captureTarget(expectedPID: pid_t) -> TextInjectionTarget? {
         let system = systemWideElement()
         var focusedValue: CFTypeRef?
+        // `kAXErrorNoValue` here is ordinary, not an error worth reporting: whole
+        // classes of editors publish no system-wide focused element at all. Callers
+        // treat a nil target as "no extra evidence", never as a reason to refuse.
         guard AXUIElementCopyAttributeValue(
             system,
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue else { return nil }
-        let focused = focusedValue as! AXUIElement
+        ) == .success, let focused = checkedAXElement(from: focusedValue) else {
+            return nil
+        }
         _ = AXUIElementSetMessagingTimeout(focused, 0.2)
+
         var actualPID = pid_t()
         guard AXUIElementGetPid(focused, &actualPID) == .success,
               actualPID == expectedPID else {
             return nil
         }
-        return focused
+        return TextInjectionTarget(
+            element: focused,
+            processIdentifier: expectedPID,
+            selection: selectedTextRange(of: focused),
+            writeEpoch: writeEpoch
+        )
+    }
+
+    /// Whether the application this utterance was aimed at is still the one in front.
+    ///
+    /// Element identity deliberately does not participate, and that is the whole point.
+    /// An `AXUIElement` is only comparable against one read moments earlier: by the time
+    /// the first delta lands, the target app has rebuilt its accessibility tree around
+    /// the text just typed into it, and a great many apps then vend a fresh object for
+    /// the same field. `CFEqual` against the copy frozen at the start of the utterance
+    /// is false for a caret that never moved — which abandoned injection on the first
+    /// delta of every sentence and sent the whole transcript to the clipboard instead of
+    /// into the document.
+    ///
+    /// Where a false negative is worth paying for — the destructive rewrite — proof
+    /// comes from re-reading the live element (`targetIsStillCurrent`) and from the text
+    /// actually sitting before the caret, never from object identity.
+    static func targetIsStillFocused(_ target: TextInjectionTarget) -> Bool {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier
+            == target.processIdentifier
+    }
+
+    /// Whether a synthetic write may still go out once this utterance has already put
+    /// characters into the target.
+    ///
+    /// The app has to be the one in front; the caret deliberately does not have to be
+    /// where the utterance froze it. By this point our own paste has moved it, and
+    /// asserting the original position refused every follow-on sentence — a second
+    /// dictation landing inside the first paste's restore window was dropped outright,
+    /// and the user's clipboard was left holding the first one.
+    static func writeIsStillSafe(_ targetPID: pid_t) -> Bool {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID
+    }
+
+    /// Whether nothing has moved since this utterance froze its target: the app is in
+    /// front and, where the control publishes a caret, the caret is still the one aimed
+    /// at. This is the "you clicked somewhere else while the transcript was in flight"
+    /// check, so it runs only before the first mutation.
+    ///
+    /// Absent evidence is not disproof. That rule is the one the shipped version has
+    /// always used — "lack of an anchor merely disables restoration" — and inverting it
+    /// made a missing focused element, which is the common case rather than the
+    /// exception, silently redirect every transcript to the clipboard.
+    static func targetIsUnmoved(_ target: TextInjectionTarget?, targetPID: pid_t) -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
+            return false
+        }
+        guard let target else { return true }
+        // Our own keystrokes since the snapshot moved the caret by a distance this
+        // check has no way to know — the text belonged to a previous utterance. The
+        // frozen caret has stopped predicting anything, so it stops being evidence
+        // rather than becoming disproof.
+        guard target.writeEpoch == writeEpoch else { return true }
+        return targetIsStillCurrent(target, insertedUTF16Count: 0)
+    }
+
+    /// Bumped by every synthetic keystroke this app posts.
+    private static var writeEpoch = 0
+
+    /// Proves the app and, when the control supports it, the expected caret.
+    /// Controls without AXSelectedTextRange fall back to the process check; callers
+    /// about to perform a destructive rewrite use `targetSelectionIsStillCurrent`.
+    static func targetIsStillCurrent(
+        _ target: TextInjectionTarget,
+        insertedUTF16Count: Int
+    ) -> Bool {
+        guard targetIsStillFocused(target) else { return false }
+        // Read the caret live rather than through the frozen handle: a replaced proxy
+        // answers `nil` for its selection, and `nil` against a non-nil snapshot counts
+        // as disproof, which would fail every rewrite closed for a caret sitting
+        // exactly where it was left. No live element at all means no range evidence in
+        // either direction — the app check above is what stands.
+        guard let live = captureTarget(expectedPID: target.processIdentifier) else {
+            return true
+        }
+        let proof = selectionProof(
+            snapshot: target.selection,
+            current: live.selection,
+            insertedUTF16Count: insertedUTF16Count
+        )
+        guard proof != false else {
+            return false
+        }
+        return targetIsStillFocused(target)
+    }
+
+    /// Strict range proof for correction/deletion. `nil` selection is deliberately
+    /// false here: exact element identity is enough to append ordinary live deltas, but
+    /// not enough to prove that backspace still addresses our original text.
+    static func targetSelectionIsStillCurrent(
+        _ target: TextInjectionTarget,
+        insertedUTF16Count: Int
+    ) -> Bool {
+        guard targetIsStillFocused(target),
+              selectionProof(
+                snapshot: target.selection,
+                current: selectedTextRange(of: target.element),
+                insertedUTF16Count: insertedUTF16Count
+              ) == true else {
+            return false
+        }
+        return targetIsStillFocused(target)
+    }
+
+    /// `nil` means this control offers no range proof; false means it offered one and
+    /// it no longer matches. Keeping that distinction is the compatibility contract for
+    /// opaque editors while destructive callers can still require a positive result.
+    static func selectionProof(
+        snapshot: CFRange?,
+        current: CFRange?,
+        insertedUTF16Count: Int
+    ) -> Bool? {
+        guard let snapshot else { return nil }
+        guard let current else { return false }
+        return selectionMatches(
+            snapshot: snapshot,
+            current: current,
+            insertedUTF16Count: insertedUTF16Count
+        )
+    }
+
+    static func selectionMatches(
+        snapshot: CFRange,
+        current: CFRange,
+        insertedUTF16Count: Int
+    ) -> Bool {
+        guard insertedUTF16Count >= 0,
+              snapshot.location >= 0,
+              snapshot.length >= 0,
+              current.location >= 0,
+              current.length >= 0,
+              snapshot.location <= Int.max - insertedUTF16Count else {
+            return false
+        }
+        if insertedUTF16Count == 0 {
+            return current.location == snapshot.location
+                && current.length == snapshot.length
+        }
+        return current.location == snapshot.location + insertedUTF16Count
+            && current.length == 0
     }
 
     /// Whether `element` is still the focused UI element system-wide.
@@ -394,10 +602,11 @@ enum TextInjector {
             system,
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue else {
+        ) == .success, let focusedValue,
+              CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
             return false
         }
-        return CFEqual(focusedValue as! AXUIElement, element)
+        return CFEqual(focusedValue, element)
     }
 
     /// Whether the app is currently servicing requests. AX messages are handled
@@ -428,10 +637,9 @@ enum TextInjector {
             system,
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue else {
+        ) == .success, let focused = checkedAXElement(from: focusedValue) else {
             return nil
         }
-        let focused = focusedValue as! AXUIElement
         if let expectedProcessIdentifier {
             var actualProcessIdentifier = pid_t()
             guard AXUIElementGetPid(focused, &actualProcessIdentifier) == .success,
@@ -526,28 +734,10 @@ enum TextInjector {
         pasteboard.setString(text, forType: .string)
     }
 
-    private static func capturePasteAnchor(targetPID: pid_t) -> PasteAnchor? {
-        let system = systemWideElement()
-        var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            system,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        ) == .success, let focusedValue else {
-            return nil
-        }
-        let focused = focusedValue as! AXUIElement
-        _ = AXUIElementSetMessagingTimeout(focused, 0.2)
-
-        var actualPID = pid_t()
-        guard AXUIElementGetPid(focused, &actualPID) == .success,
-              actualPID == targetPID else {
-            return nil
-        }
-
+    private static func selectedTextRange(of element: AXUIElement) -> CFRange? {
         var selectionValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
-            focused,
+            element,
             kAXSelectedTextRangeAttribute as CFString,
             &selectionValue
         ) == .success, let selectionValue,
@@ -556,18 +746,17 @@ enum TextInjector {
         }
         var selection = CFRange()
         guard AXValueGetValue(selectionValue as! AXValue, .cfRange, &selection),
-              selection.location >= 0 else {
+              selection.location >= 0,
+              selection.length >= 0 else {
             return nil
         }
-        return PasteAnchor(
-            element: focused,
-            targetPID: targetPID,
-            selectionBeforePaste: selection
-        )
+        return selection
     }
 
-    private static func pasteWasConsumed(_ text: String, from anchor: PasteAnchor?) -> Bool {
-        guard let anchor, !text.isEmpty else { return false }
+    private static func pasteWasConsumed(_ text: String, from anchor: TextInjectionTarget?) -> Bool {
+        guard let anchor, let originalSelection = anchor.selection, !text.isEmpty else {
+            return false
+        }
 
         let system = systemWideElement()
         var focusedValue: CFTypeRef?
@@ -575,16 +764,15 @@ enum TextInjector {
             system,
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue else {
+        ) == .success, let focused = checkedAXElement(from: focusedValue) else {
             return false
         }
-        let focused = focusedValue as! AXUIElement
         guard CFEqual(focused, anchor.element) else { return false }
         _ = AXUIElementSetMessagingTimeout(focused, 0.2)
 
         var actualPID = pid_t()
         guard AXUIElementGetPid(focused, &actualPID) == .success,
-              actualPID == anchor.targetPID else {
+              actualPID == anchor.processIdentifier else {
             return false
         }
 
@@ -599,8 +787,11 @@ enum TextInjector {
         }
         var selection = CFRange()
         guard AXValueGetValue(selectionValue as! AXValue, .cfRange, &selection),
-              selection.length == 0,
-              selection.location == anchor.selectionBeforePaste.location + text.utf16.count else {
+              selectionMatches(
+                snapshot: originalSelection,
+                current: selection,
+                insertedUTF16Count: text.utf16.count
+              ) else {
             return false
         }
 
@@ -621,53 +812,8 @@ enum TextInjector {
         return actual.utf16.count == text.utf16.count && actual == text
     }
 
-    private static func pasteTargetIsStillCurrent(
-        _ anchor: PasteAnchor?,
-        targetPID: pid_t
-    ) -> Bool {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
-            return false
-        }
-        // Some controls expose no AX selection. PID validation still prevents a
-        // cross-application paste; lack of an anchor merely disables restoration.
-        guard let anchor else { return true }
-
-        let system = systemWideElement()
-        var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            system,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        ) == .success, let focusedValue else {
-            return false
-        }
-        let focused = focusedValue as! AXUIElement
-        guard CFEqual(focused, anchor.element) else { return false }
-        _ = AXUIElementSetMessagingTimeout(focused, 0.2)
-
-        var actualPID = pid_t()
-        guard AXUIElementGetPid(focused, &actualPID) == .success,
-              actualPID == targetPID else {
-            return false
-        }
-        var selectionValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            focused,
-            kAXSelectedTextRangeAttribute as CFString,
-            &selectionValue
-        ) == .success, let selectionValue,
-              CFGetTypeID(selectionValue) == AXValueGetTypeID() else {
-            return false
-        }
-        var selection = CFRange()
-        guard AXValueGetValue(selectionValue as! AXValue, .cfRange, &selection) else {
-            return false
-        }
-        return selection.location == anchor.selectionBeforePaste.location
-            && selection.length == anchor.selectionBeforePaste.length
-    }
-
     private static func postUnicode(_ units: [UniChar]) {
+        writeEpoch &+= 1
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
         else { return }
@@ -682,6 +828,7 @@ enum TextInjector {
     }
 
     private static func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
+        writeEpoch &+= 1
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
         else { return }

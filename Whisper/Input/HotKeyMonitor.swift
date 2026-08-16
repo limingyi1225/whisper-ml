@@ -16,6 +16,14 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "hotkey")
 @MainActor
 final class HotKeyMonitor {
     enum Event {
+        enum CancellationCause {
+            /// An ordinary modifier tap or chord; no dictation should be produced.
+            case userGesture
+            /// Monitoring disappeared after the gesture had begun. The controller must
+            /// finalize or visibly fail captured speech rather than treating it as a tap.
+            case monitoringLost(String)
+        }
+
         /// Key went down. Nothing is committed yet — we may still turn out to be a shortcut.
         case armed
         /// Held past the threshold: this is a dictation gesture.
@@ -23,7 +31,7 @@ final class HotKeyMonitor {
         /// Released after a long press. Finish the utterance.
         case released
         /// Released early, or the user pressed another key: abandon without transcribing.
-        case cancelled
+        case cancelled(CancellationCause)
     }
 
     var onEvent: ((Event) -> Void)?
@@ -118,7 +126,9 @@ final class HotKeyMonitor {
         return true
     }
 
-    func stop() {
+    func stop(
+        cancellationCause: Event.CancellationCause = .monitoringLost("热键监听中断，录音已提前结束")
+    ) {
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
@@ -139,7 +149,7 @@ final class HotKeyMonitor {
             isKeyDown = false
             didLongPress = false
             isTriggerHeld = false
-            onEvent?(.cancelled)
+            onEvent?(.cancelled(cancellationCause))
         }
     }
 
@@ -151,7 +161,9 @@ final class HotKeyMonitor {
         isKeyDown = false
         didLongPress = false
         isTriggerHeld = false
-        if hadGesture { onEvent?(.cancelled) }
+        if hadGesture {
+            onEvent?(.cancelled(.monitoringLost("热键监听被系统中断，录音已提前结束")))
+        }
 
         guard Permissions.hasAccessibility,
               !Permissions.isSecureInputEnabled,
@@ -203,7 +215,7 @@ final class HotKeyMonitor {
                 onEvent?(.released)
             } else {
                 // Tapped, not held — an ordinary modifier press. Never transcribe it.
-                onEvent?(.cancelled)
+                onEvent?(.cancelled(.userGesture))
             }
         }
     }
@@ -223,7 +235,7 @@ final class HotKeyMonitor {
         isKeyDown = false
         didLongPress = false
         cancelHold()
-        onEvent?(.cancelled)
+        onEvent?(.cancelled(.userGesture))
     }
 
     private func cancelHold() {

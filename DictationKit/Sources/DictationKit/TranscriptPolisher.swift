@@ -340,6 +340,23 @@ public final class TranscriptPolisher {
     /// once changes no outcome, because the cap swallows the difference.
     public func isPlausible(_ cleaned: String, from raw: String, vocabulary: [String] = []) -> Bool {
         guard !cleaned.isEmpty else { return false }
+        if raw.containsHan, !cleaned.containsHan {
+            // Latin growth exists for transliterated names, not for answering or
+            // translating a Chinese utterance. Preserve names explicitly taught by
+            // the prompt/list, but reject arbitrary one-word answers/translations too
+            // ("你是谁" → "AI" was otherwise indistinguishable from a short name).
+            let latinName = String(cleaned.filter { $0.isASCII && $0.isLetter })
+            let recognizedPromptName = ["amy", "kevin", "jack"]
+                .contains(latinName.lowercased())
+            let recognizedVocabularyName = vocabulary.contains {
+                $0.caseInsensitiveCompare(latinName) == .orderedSame
+            }
+            let isSingleTransliteratedName = raw.latinLetterCount == 0
+                && raw.count <= 4
+                && cleaned.latinWordCount == 1
+                && (recognizedPromptName || recognizedVocabularyName)
+            guard isSingleTransliteratedName else { return false }
+        }
         let ratio = Double(cleaned.count) / Double(max(raw.count, 1))
         let shortEnoughToJudgeByEye = raw.count <= 30
         let notTooShort = ratio > 0.4 || shortEnoughToJudgeByEye
@@ -358,4 +375,12 @@ public final class TranscriptPolisher {
 private extension String {
     /// ASCII letters — the script a transliterated name comes back in.
     var latinLetterCount: Int { count { $0.isASCII && $0.isLetter } }
+
+    var latinWordCount: Int {
+        split(whereSeparator: { !$0.isASCII || !$0.isLetter }).count
+    }
+
+    var containsHan: Bool {
+        range(of: "\\p{Han}", options: .regularExpression) != nil
+    }
 }

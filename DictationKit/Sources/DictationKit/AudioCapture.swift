@@ -178,12 +178,23 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
     }
 
     /// Promotes the session to live streaming and returns the buffered pre-roll audio.
-    public func startStreaming(includePreroll: Bool) -> Data {
+    ///
+    /// The optional next capacity is installed under the same lock, *after* the full
+    /// buffered prefix has been detached. A queued gesture can have minutes of pre-roll;
+    /// shrinking its buffer in a separate call before this transition would let the
+    /// audio thread trim that already-spoken prefix down to the ordinary one-second cap.
+    public func startStreaming(
+        includePreroll: Bool,
+        nextPrerollCapacitySeconds: Int? = nil
+    ) -> Data {
         lock.withLock {
             isStreaming = true
             let preroll = includePreroll ? Data(prerollChunks.joined()) : Data()
             prerollChunks.removeAll()
             prerollBytes = 0
+            if let nextPrerollCapacitySeconds {
+                prerollCapacityBytes = Self.bytesPerSecond * max(0, nextPrerollCapacitySeconds)
+            }
             return preroll
         }
     }
