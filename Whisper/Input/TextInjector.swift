@@ -237,7 +237,11 @@ enum TextInjector {
             return
         }
         guard targetIsUnmoved(pasteAnchor, targetPID: targetPID) else {
-            replaceClipboard(with: text)
+            // The board is being handed over anyway, so anything recovered from a
+            // previously hung target rides along instead of being dropped — it is
+            // text the user already spoke, and the clipboard is the only place left
+            // where it can still surface.
+            replaceClipboard(with: deferredSeed + text)
             return
         }
         pasteboard.clearContents()
@@ -246,7 +250,7 @@ enum TextInjector {
             if writeIsStillSafe(targetPID) {
                 type(text)
             } else {
-                replaceClipboard(with: text)
+                replaceClipboard(with: deferredSeed + text)
             }
             return
         }
@@ -478,8 +482,10 @@ enum TextInjector {
     /// into the document.
     ///
     /// Where a false negative is worth paying for — the destructive rewrite — proof
-    /// comes from re-reading the live element (`targetIsStillCurrent`) and from the text
-    /// actually sitting before the caret, never from object identity.
+    /// comes from the text actually sitting before the caret. Object identity is the
+    /// tiebreak for controls that publish no text range at all, and it is consulted
+    /// through `focusedElementMatches`, which distinguishes "the system named a
+    /// different element" from "the system named nothing".
     static func targetIsStillFocused(_ target: TextInjectionTarget) -> Bool {
         NSWorkspace.shared.frontmostApplication?.processIdentifier
             == target.processIdentifier
@@ -607,6 +613,19 @@ enum TextInjector {
 
     /// Whether `element` is still the focused UI element system-wide.
     static func elementIsStillFocused(_ element: AXUIElement) -> Bool {
+        focusedElementMatches(element) == true
+    }
+
+    /// The same comparison, with the two reasons it can fail kept apart.
+    ///
+    /// `nil` is the system publishing no focused element at all — the norm for Electron
+    /// and WebView targets, not a signal about focus. `false` is a system that named a
+    /// focused element and it is not ours. Even that is weaker evidence than it looks:
+    /// apps rebuild their accessibility tree around text just typed into them, so a
+    /// `CFEqual` mismatch is a fresh object for the same field at least as often as it
+    /// is a real focus move. Callers that can obtain text evidence should prefer it and
+    /// consult this only when the control offers none.
+    static func focusedElementMatches(_ element: AXUIElement) -> Bool? {
         let system = systemWideElement()
         var focusedValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -615,9 +634,21 @@ enum TextInjector {
             &focusedValue
         ) == .success, let focusedValue,
               CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
-            return false
+            return focusedElementVerdict(focused: nil, expected: element)
         }
-        return CFEqual(focusedValue, element)
+        return focusedElementVerdict(
+            focused: (focusedValue as! AXUIElement),
+            expected: element
+        )
+    }
+
+    /// The `nil`-vs-`false` decision on its own, away from the AX call that produces it.
+    /// A test cannot make the running system publish no focused element on demand, so
+    /// the branch that matters most is unreachable while it stays welded to the query —
+    /// and an unreachable branch is exactly where this rule got inverted before.
+    static func focusedElementVerdict(focused: AXUIElement?, expected: AXUIElement) -> Bool? {
+        guard let focused else { return nil }
+        return CFEqual(focused, expected)
     }
 
     /// Whether the app is currently servicing requests. AX messages are handled

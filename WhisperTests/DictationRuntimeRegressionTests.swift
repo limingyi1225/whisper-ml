@@ -126,9 +126,62 @@ import Testing
     /// 坏了" looked like: the raw deltas stay on screen and the cleaned sentence lands
     /// on the clipboard instead.
     @Test func aRewriteDeletesWhenTheDocumentIsSilentButNotWhenItDisagrees() {
-        #expect(DictationController.rewriteMayDelete(typedTextStillBeforeCaret: nil))
-        #expect(DictationController.rewriteMayDelete(typedTextStillBeforeCaret: true))
-        #expect(!DictationController.rewriteMayDelete(typedTextStillBeforeCaret: false))
+        // The full truth table, because the interesting half of it is the diagonal.
+        for element in [nil, true, false] as [Bool?] {
+            // A document that contradicts us is disproof no matter what focus says.
+            #expect(!DictationController.rewriteMayDelete(
+                typedTextStillBeforeCaret: false,
+                sameElementStillFocused: element
+            ))
+            // A document that confirms us is proof no matter what focus says — the
+            // element mismatch below is the common case, not the alarming one: apps
+            // rebuild their accessibility tree around text just typed into them and
+            // hand out a fresh object for the very field we are still addressing.
+            #expect(DictationController.rewriteMayDelete(
+                typedTextStillBeforeCaret: true,
+                sameElementStillFocused: element
+            ))
+        }
+        // With no text proof, focus is the only evidence left. Silence permits;
+        // the system naming some *other* element is the one case that refuses.
+        #expect(DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: nil
+        ))
+        #expect(DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: true
+        ))
+        #expect(!DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: false
+        ))
+    }
+
+    /// `elementIsStillFocused` answers one question with two very different failures
+    /// folded together, and the destructive path used to consume it that way. An
+    /// Electron or WebView target publishes no focused element at all — that is the
+    /// norm — and reading it as "focus moved" is the exact shape of the bug that broke
+    /// cleanup three times.
+    @Test func anUnpublishedFocusIsNotADifferentFocus() throws {
+        let unrelated = AXUIElementCreateApplication(
+            try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier) &+ 10_000
+        )
+        // The decision itself, where "nothing published" is reachable. A test cannot
+        // make the live system stop publishing a focused element on demand.
+        #expect(TextInjector.focusedElementVerdict(focused: nil, expected: unrelated) == nil)
+        #expect(TextInjector.focusedElementVerdict(focused: unrelated, expected: unrelated) == true)
+        let other = AXUIElementCreateApplication(
+            try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier) &+ 20_000
+        )
+        #expect(TextInjector.focusedElementVerdict(focused: other, expected: unrelated) == false)
+
+        // An application element is never the focused *text* element, so the live query
+        // is either nil or false — never true — and the collapsing wrapper must agree
+        // with the tri-state source it is built on.
+        #expect(TextInjector.focusedElementMatches(unrelated) != true)
+        #expect(TextInjector.elementIsStillFocused(unrelated)
+                == (TextInjector.focusedElementMatches(unrelated) == true))
     }
 
     /// A paste with no AX target at all is still a paste. Requiring one sent whole

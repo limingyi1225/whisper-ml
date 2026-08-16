@@ -314,14 +314,30 @@ final class DictationController {
 
     /// Whether the destructive half of a cleanup rewrite may post its backspaces.
     ///
-    /// `false` is a control that answered and contradicted us: our keystrokes are no
-    /// longer what sits before the caret, so backspacing by our own count would cross
-    /// into the user's text. `nil` is a control that exposes no text range to answer
-    /// with, which is not the same thing — refusing on it leaves the raw deltas on
+    /// Two independent kinds of evidence, both optional, because most targets publish
+    /// neither and absent evidence is not disproof.
+    ///
+    /// `typedTextStillBeforeCaret` outranks the other. `false` is a control that
+    /// answered and contradicted us: our keystrokes are no longer what sits before the
+    /// caret, so backspacing by our own count would cross into the user's text. `true`
+    /// is positive proof that the caret is exactly where the deltas left it, and it
+    /// settles the question on its own — in particular it overrides an element mismatch,
+    /// because an app that rebuilt its accessibility tree around the text we just typed
+    /// vends a fresh object for the very field we are still correctly addressing.
+    ///
+    /// `sameElementStillFocused` only decides the remaining case: a control that
+    /// exposes no text range at all. There, `false` — the system naming some *other*
+    /// element — is the only signal left that focus moved within the app, and
+    /// backspacing would eat that other control's content. `nil` is the system naming
+    /// nothing, which is not the same thing; refusing on it leaves the raw deltas on
     /// screen and strands the corrected sentence on the clipboard, which is what the
     /// whole cleanup feature looks like when it is broken.
-    static func rewriteMayDelete(typedTextStillBeforeCaret: Bool?) -> Bool {
-        typedTextStillBeforeCaret != false
+    static func rewriteMayDelete(
+        typedTextStillBeforeCaret: Bool?,
+        sameElementStillFocused: Bool?
+    ) -> Bool {
+        if let typedTextStillBeforeCaret { return typedTextStillBeforeCaret }
+        return sameElementStillFocused != false
     }
 
     /// Ownership, not the previous utterance's presentation phase, decides whether a
@@ -1330,37 +1346,41 @@ final class DictationController {
 
         if deleteCount > 0 {
             // The PID-level anchor above cannot see a focus move *within* the app
-            // (programmatic, or a click — no foreign keystroke involved). Backspacing
-            // into whatever control is focused now would eat its content, so deletion
-            // also requires the element the deltas were typed into to still hold focus.
-            if let injectionTarget,
-               !TextInjector.elementIsStillFocused(injectionTarget.element) {
-                log.warning("focus moved to another element in the same app; copying corrected transcript")
-                TextInjector.copyToClipboard(final)
-                return
-            }
+            // (programmatic, or a click — no foreign keystroke involved), so deletion
+            // needs evidence about the field itself. Both sources are optional; see
+            // `rewriteMayDelete` for why the text outranks the element identity.
             let typedTextProof = TextInjector.matchesTextImmediatelyBeforeCaret(
                 typed,
                 expectedProcessIdentifier: targetPID
             )
-            guard Self.rewriteMayDelete(typedTextStillBeforeCaret: typedTextProof) else {
-                // The target app transformed our keystrokes (smart quotes/dashes,
-                // autocorrect, input-method composition). Backspacing by our original
-                // count could cross into the user's pre-existing text.
-                log.warning("typed text no longer matches the document; copying corrected transcript")
+            guard Self.rewriteMayDelete(
+                typedTextStillBeforeCaret: typedTextProof,
+                sameElementStillFocused: injectionTarget.flatMap {
+                    TextInjector.focusedElementMatches($0.element)
+                }
+            ) else {
+                // Either the target app transformed our keystrokes (smart quotes,
+                // autocorrect, input-method composition) so backspacing by our original
+                // count would cross into the user's text, or the control offers no text
+                // proof and the system says a different element holds focus.
+                log.warning("the document no longer agrees that our text is before the caret; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
             }
             if typedTextProof == nil {
-                // The focus and foreign-input guards above are what protect this path
-                // for controls that expose no range at all.
+                // The anchor and focus guards are all that protect this path for
+                // controls that expose no range at all.
                 log.info("target does not expose AX text ranges; reconciling with anchor checks only")
             }
-            // The AX text query above can block for its full messaging timeout.
-            // Confirm the field did not move while it did, immediately before posting
-            // the destructive key events.
-            if let injectionTarget,
-               !TextInjector.elementIsStillFocused(injectionTarget.element) {
+            // The AX text query above can block for its full messaging timeout. Confirm
+            // the field did not move while it did, immediately before posting the
+            // destructive key events.
+            guard Self.rewriteMayDelete(
+                typedTextStillBeforeCaret: typedTextProof,
+                sameElementStillFocused: injectionTarget.flatMap {
+                    TextInjector.focusedElementMatches($0.element)
+                }
+            ) else {
                 log.warning("focus moved while the document was being read; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
