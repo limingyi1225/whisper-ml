@@ -26,7 +26,7 @@ lift() {
   ' "$SCRIPT"
 }
 
-for fn in probe_with_retries probe_attempt_verdict capture_backup restore_backup; do
+for fn in probe_with_retries probe_attempt_verdict capture_backup restore_script restore_backup; do
   eval "$(lift "$fn")"
   [ "$(type -t "$fn")" = function ] || { echo "could not lift $fn" >&2; exit 1; }
 done

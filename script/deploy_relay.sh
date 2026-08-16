@@ -157,7 +157,12 @@ acquire_remote_lock() {
 
 trap release_remote_lock_quietly EXIT
 
-restore_backup() {
+# The text of the rollback, as one remote script. It is written to the backup directory
+# at backup time as well as run from here, so the by-hand recovery instructions can point
+# at a file on the box instead of restating this — an earlier version restated it as a
+# one-liner in two `echo`s, and keeping three copies in step by hand is not a thing that
+# stays true.
+restore_script() {
   # The unit file is part of the version too. This deploy adds ExecReload=kill -HUP to
   # it; roll back the source without rolling that back and the restored server has no
   # SIGHUP handler — Node's default for SIGHUP is to die — so the next issue/revoke's
@@ -165,24 +170,53 @@ restore_backup() {
   # The allowlist file is restored only in the one case where this run created it —
   # by deleting it, back to not existing. Otherwise it is left strictly alone: it is
   # live data, and "rolling back" an allowlist means resurrecting revoked tokens.
-  remote_ssh "set -e
-    rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts
-    cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src
-    cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts
-    cp -a $BACKUPS/env-$STAMP $ENV_FILE
-    cp -a $BACKUPS/unit-$STAMP $UNIT_FILE
-    cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
-    if [ '$CREATED_TOKEN_FILE' = 1 ]; then rm -f $TOKEN_FILE; fi
-    systemctl daemon-reload
-    # Prefer the snapshot: it is already known to pair with the restored lockfile, and
-    # a rollback is exactly the moment not to depend on the registry being reachable.
-    if [ -d $BACKUPS/modules-$STAMP ]; then
-      rm -rf $REMOTE_DIR/node_modules
-      cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules
-    else
-      cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
-    fi
-    systemctl restart whisper-relay"
+  cat <<REMOTE
+set -e
+# Copy into place beside the live tree, then swap. Copying is the part that can run out
+# of disk or be cut off, and while it runs the live tree is still whole; the swap that
+# follows is renames within one filesystem. Deleting first and copying second — which is
+# what this used to do — meant an interrupted rollback left no src/ at all: not the old
+# version, not the new one, nothing to serve and nothing to diff.
+rm -rf $REMOTE_DIR/src.restoring $REMOTE_DIR/scripts.restoring $REMOTE_DIR/node_modules.restoring
+cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src.restoring
+cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts.restoring
+# Prefer the dependency snapshot: it is already known to pair with the restored
+# lockfile, and a rollback is exactly the moment not to depend on the registry being
+# reachable. Absent only for a first-ever deploy.
+if [ -d $BACKUPS/modules-$STAMP ]; then
+  cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules.restoring
+fi
+
+rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts
+mv $REMOTE_DIR/src.restoring $REMOTE_DIR/src
+mv $REMOTE_DIR/scripts.restoring $REMOTE_DIR/scripts
+if [ -d $REMOTE_DIR/node_modules.restoring ]; then
+  rm -rf $REMOTE_DIR/node_modules
+  mv $REMOTE_DIR/node_modules.restoring $REMOTE_DIR/node_modules
+else
+  # No snapshot to restore, so the tree still standing here is whatever the failed
+  # deploy left — possibly half-installed, and in any case matched to the *new*
+  # lockfile rather than the one being restored. Reinstall from the restored one.
+  cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
+fi
+
+cp -a $BACKUPS/env-$STAMP $ENV_FILE
+cp -a $BACKUPS/unit-$STAMP $UNIT_FILE
+cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
+if [ '$CREATED_TOKEN_FILE' = 1 ]; then rm -f $TOKEN_FILE; fi
+systemctl daemon-reload
+systemctl restart whisper-relay
+REMOTE
+}
+
+restore_backup() {
+  # Via a variable, not straight into the argument: a command substitution that fails
+  # expands to the empty string, and `remote_ssh ""` runs an empty remote script and
+  # succeeds — a rollback that does nothing at all and reports that it worked.
+  local script
+  script=$(restore_script) || return 1
+  [ -n "$script" ] || { echo "!! rollback script came out empty; refusing to run it" >&2; return 1; }
+  remote_ssh "$script"
 }
 
 on_failure() {
@@ -295,6 +329,16 @@ fi
 if [ -n "$SMOKE_TOKEN" ] && [[ ! "$SMOKE_TOKEN" =~ ^relay_[A-Za-z0-9_-]{40,80}$ ]]; then
   echo "!! the smoke-test device token has an invalid format" >&2
   exit 1
+fi
+# The token is validated because it is a credential; this one is validated because it is
+# spliced into command text that a *remote* shell then re-parses — inside single quotes
+# at the env-file write, and bare inside a URL at the loopback check. A quote or a
+# semicolon in it would run as root on the relay host. Every other operator-settable
+# value either stays local (RELAY_PUBLIC_HEALTH) or is passed as a single argv entry
+# that ssh never re-parses (RELAY_SSH_HOST).
+if [[ ! "$BASE_PATH" =~ ^(/[A-Za-z0-9_.-]+)*$ ]]; then
+  echo "!! RELAY_BASE_PATH must be empty or /-separated path segments: $BASE_PATH" >&2
+  exit 2
 fi
 [ -n "$SMOKE_TOKEN" ] || echo "    RELAY_SKIP_SMOKE=1 — the smoke test will not run"
 
