@@ -96,6 +96,10 @@ public final class RealtimeClient {
     @ObservationIgnored private var keepAlivePingInFlight: Int?
     @ObservationIgnored private var refreshTimer: Timer?
     @ObservationIgnored private var responseTimeoutTimer: Timer?
+    /// The deadline currently governing the active utterance. Exposed read-only so the
+    /// controller's queue backstop can stay behind the client's real, length-aware
+    /// timeout instead of cancelling a legitimate long transcription at a fixed 30 s.
+    @ObservationIgnored private var responseTimeoutDeadline: Date?
     @ObservationIgnored private var reconnectWorkItem: DispatchWorkItem?
 
     /// Cap on locally buffered audio while the socket is not ready. Must cover a
@@ -112,7 +116,7 @@ public final class RealtimeClient {
     /// `appendAudio` could only drop it wholesale. ~21 s of audio per chunk.
     private static let appendChunkBytes = 1 << 20
     /// How long to wait for `…transcription.completed` after committing.
-    private let responseTimeout: TimeInterval = 20
+    private static let responseTimeout: TimeInterval = 20
     /// Extra budget while the commit is queued behind a connection that is still
     /// coming up. The reconnect ladder legally waits up to 30 s between attempts
     /// and `waitsForConnectivity` sits silently through all of it — timing out
@@ -139,14 +143,16 @@ public final class RealtimeClient {
     /// upload allowance in the response timeout: a queued multi-minute utterance
     /// can still be uploading long after the commit is enqueued locally.
     @ObservationIgnored private var utteranceUploadedBytes = 0
-    /// Raw PCM bytes the transport has confirmed accepted (send completions).
-    /// The upload allowance is sized from the *unaccepted remainder*, and every
-    /// acceptance re-arms the pending timeout — so the timer measures stalls,
-    /// not total upload time, and a link slower than the assumed throughput
-    /// keeps its utterance alive as long as bytes keep moving.
-    @ObservationIgnored private var utteranceAcceptedBytes = 0
-
     private var settings: any DictationSettingsProviding { DictationEnvironment.settings }
+
+    /// The active utterance's authoritative timeout, if one has been armed. A WebSocket
+    /// send completion is deliberately not represented here as remote progress:
+    /// Foundation only promises that those bytes reached the local kernel. The deadline
+    /// therefore keeps its upload allowance until the server itself acknowledges
+    /// `input_audio_buffer.committed`.
+    public var currentUtteranceTimeoutDeadline: Date? {
+        utteranceActive ? responseTimeoutDeadline : nil
+    }
 
     // MARK: - Connection lifecycle
 
@@ -202,7 +208,7 @@ public final class RealtimeClient {
         keepAliveTimeoutTimer?.invalidate(); keepAliveTimeoutTimer = nil
         keepAlivePingInFlight = nil
         refreshTimer?.invalidate(); refreshTimer = nil
-        responseTimeoutTimer?.invalidate(); responseTimeoutTimer = nil
+        clearResponseTimeout()
         sessionExpiry = nil
 
         // Buffered audio belongs to the session that just died. Carrying it into the
@@ -278,9 +284,7 @@ public final class RealtimeClient {
         pendingAudio.removeAll()
         pendingBytes = 0
         utteranceUploadedBytes = 0
-        utteranceAcceptedBytes = 0
-        responseTimeoutTimer?.invalidate()
-        responseTimeoutTimer = nil
+        clearResponseTimeout()
 
         if status.isReady {
             send(["type": "input_audio_buffer.clear"])
@@ -321,20 +325,7 @@ public final class RealtimeClient {
 
     private func transmitAudioChunk(_ data: Data) {
         utteranceUploadedBytes += data.count
-        let bytes = data.count
-        let turn = currentTurnSequence
-        send(
-            ["type": "input_audio_buffer.append", "audio": data.base64EncodedString()],
-            onSent: { [weak self] in
-                guard let self, self.utteranceActive, self.currentTurnSequence == turn else { return }
-                self.utteranceAcceptedBytes += bytes
-                // Upload progress extends the stall budget: re-arm the pending
-                // timeout with an allowance sized from what is still unaccepted.
-                if self.responseTimeoutTimer != nil {
-                    self.startResponseTimeout()
-                }
-            }
-        )
+        send(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()])
     }
 
     /// Ends the utterance. The transcript arrives later via `onCompleted`.
@@ -357,19 +348,12 @@ public final class RealtimeClient {
     /// far longer than 20 s to transmit (a queued multi-minute utterance) —
     /// timing out mid-upload would drop a perfectly good completion later, which
     /// for the non-streaming models means the whole sentence vanishes. So: arm an
-    /// upload-aware backstop now, then re-arm the plain budget once the transport
-    /// has accepted every queued byte (the commit's send completion) and again
-    /// when the server acknowledges it (`input_audio_buffer.committed`).
+    /// upload-aware backstop now, then re-arm the plain budget only when the server
+    /// acknowledges it (`input_audio_buffer.committed`). URLSession's send completion
+    /// only proves that the frame was written to the local kernel; treating that as a
+    /// remote acknowledgement cuts off working slow links and relay backpressure.
     private func sendCommit() {
-        // Tied to the turn, not just `utteranceActive`: a commit whose upload
-        // outlived its own timeout can see its send completion arrive while the
-        // *next* turn is active — re-arming then would cut that turn's
-        // upload-aware backstop short.
-        let turn = currentTurnSequence
-        send(["type": "input_audio_buffer.commit"], onSent: { [weak self] in
-            guard let self, self.utteranceActive, self.currentTurnSequence == turn else { return }
-            self.scheduleResponseTimeout(after: self.transcriptionBudget)
-        })
+        send(["type": "input_audio_buffer.commit"])
         startResponseTimeout()
     }
 
@@ -380,8 +364,7 @@ public final class RealtimeClient {
         commitPending = false
         pendingAudio.removeAll()
         pendingBytes = 0
-        responseTimeoutTimer?.invalidate()
-        responseTimeoutTimer = nil
+        clearResponseTimeout()
         guard status.isReady else {
             // Nothing ever reached the server; the local buffers above were the
             // whole utterance.
@@ -515,8 +498,7 @@ public final class RealtimeClient {
                 log.info("dropping transcript for an utterance that is no longer active")
                 return
             }
-            responseTimeoutTimer?.invalidate()
-            responseTimeoutTimer = nil
+            clearResponseTimeout()
             utteranceActive = false
             let transcript = payload["transcript"] as? String ?? ""
             applyPendingRefreshIfSettled()
@@ -524,8 +506,7 @@ public final class RealtimeClient {
 
         case "conversation.item.input_audio_transcription.failed":
             guard utteranceActive, belongsToCurrentTurn(payload) else { return }
-            responseTimeoutTimer?.invalidate()
-            responseTimeoutTimer = nil
+            clearResponseTimeout()
             utteranceActive = false
             retireCurrentTurn()
             let message = ((payload["error"] as? [String: Any])?["message"] as? String) ?? "转写失败"
@@ -590,8 +571,7 @@ public final class RealtimeClient {
                 return
             }
 
-            responseTimeoutTimer?.invalidate()
-            responseTimeoutTimer = nil
+            clearResponseTimeout()
             utteranceActive = false
             let hadKnownItemID = currentItemID != nil
             if hadKnownItemID {
@@ -657,14 +637,9 @@ public final class RealtimeClient {
         case turn(Int)
     }
 
-    /// `onSent` runs on the main actor once the transport has accepted the frame —
-    /// because messages send in order, that also means every earlier frame has
-    /// been accepted. Generation-guarded like the failure path: it never fires
-    /// for a socket that has since been torn down.
     private func send(
         _ originalObject: [String: Any],
-        context explicitContext: ClientEventContext? = nil,
-        onSent: (() -> Void)? = nil
+        context explicitContext: ClientEventContext? = nil
     ) {
         var object = originalObject
         let context: ClientEventContext
@@ -692,17 +667,10 @@ public final class RealtimeClient {
 
         let generation = self.generation
         socket.send(.string(text)) { [weak self] error in
-            guard let error else {
-                if let onSent {
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated {
-                            guard let self, generation == self.generation else { return }
-                            onSent()
-                        }
-                    }
-                }
-                return
-            }
+            // A nil completion only proves the frame was accepted by URLSession/the
+            // local transport. Remote progress is established by server events such as
+            // `input_audio_buffer.committed`, never by this callback.
+            guard let error else { return }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     // A failed send means this socket is done for. Waiting for the
@@ -952,14 +920,15 @@ public final class RealtimeClient {
         guard !didTryBundledTokenRecovery,
               activeRoute?.mode == .relay,
               let bundled = KeychainStore.bundledRelayToken,
-              bundled != activeRoute?.credential else { return false }
+              let rejectedCredential = activeRoute?.credential,
+              bundled != rejectedCredential else { return false }
         // The rejection belongs to the credential *this* socket used. If the keychain
         // has moved on since, the 401 says nothing about what is stored now and
         // overwriting it would destroy a token the user had just saved — reachable
         // whenever a save lands while an utterance is still in flight, because the
         // reconnect is deferred to the settle boundary and the old socket's handshake
         // can fail after it.
-        guard KeychainStore.loadRelayToken() == activeRoute?.credential else { return false }
+        guard KeychainStore.loadRelayToken() == rejectedCredential else { return false }
         // Never sideways or backwards: an older copy of the app must not answer a 401 by
         // installing the token it happens to carry over a newer one already in use.
         guard KeychainStore.mayRecoverWithBundledToken else { return false }
@@ -968,7 +937,10 @@ public final class RealtimeClient {
         // unlocked a minute later, the app still refused to try until it was relaunched.
         // No loop opens up in exchange: after a successful adopt the stored token *is*
         // the bundled one, and the `bundled != credential` guard refuses a second pass.
-        guard KeychainStore.adoptBundledRelayToken(bundled) else { return false }
+        guard KeychainStore.adoptBundledRelayToken(
+            bundled,
+            replacing: rejectedCredential
+        ) else { return false }
         didTryBundledTokenRecovery = true
         log.info("device token was rejected; falling back to the one this build carries")
         return true
@@ -1095,30 +1067,47 @@ public final class RealtimeClient {
     /// legitimately chewing on, and drop the completion that arrives right after.
     /// 0.5× realtime is generous; observed transcription is well under that.
     private var transcriptionBudget: TimeInterval {
-        let audioSeconds =
-            Double(utteranceUploadedBytes + pendingBytes) / Double(AudioCapture.bytesPerSecond)
-        return responseTimeout + audioSeconds * 0.5
+        Self.responseTimeoutInterval(
+            rawAudioBytes: utteranceUploadedBytes + pendingBytes,
+            remoteUploadAcknowledged: true
+        )
     }
 
-    /// Arms the response timeout with an allowance for audio that may still be in
-    /// flight. Each transport acceptance re-arms with the shrunken remainder and
-    /// `sendCommit` re-arms the plain budget once the upload is provably done, so
-    /// the allowance only ever covers bytes the transport has genuinely not
-    /// accepted yet — and a dead transport fails faster through the send/ping
-    /// error paths regardless.
+    /// Shared by the live timeout and regression tests. Before the server's committed
+    /// event, the budget includes remote upload time; local WebSocket send completions
+    /// never select the acknowledged branch.
+    static func responseTimeoutInterval(
+        rawAudioBytes: Int,
+        remoteUploadAcknowledged: Bool
+    ) -> TimeInterval {
+        let bytes = max(0, rawAudioBytes)
+        let audioSeconds = Double(bytes) / Double(AudioCapture.bytesPerSecond)
+        let transcription = responseTimeout + audioSeconds * 0.5
+        guard !remoteUploadAcknowledged else { return transcription }
+        return transcription + Double(bytes) / Double(assumedUploadBytesPerSecond)
+    }
+
+    /// Arms the response timeout with an allowance for audio whose remote receipt is not
+    /// yet proven. A URLSession send completion only means "written to the local kernel",
+    /// so the whole allowance remains until `input_audio_buffer.committed` arrives.
+    /// Dead transports still fail faster through the send/receive paths.
     private func startResponseTimeout() {
-        let unaccepted = max(0, utteranceUploadedBytes + pendingBytes - utteranceAcceptedBytes)
-        let uploadAllowance = Double(unaccepted) / Double(Self.assumedUploadBytesPerSecond)
-        scheduleResponseTimeout(after: transcriptionBudget + uploadAllowance)
+        let remotelyUnacknowledged = utteranceUploadedBytes + pendingBytes
+        scheduleResponseTimeout(after: Self.responseTimeoutInterval(
+            rawAudioBytes: remotelyUnacknowledged,
+            remoteUploadAcknowledged: false
+        ))
     }
 
     private func scheduleResponseTimeout(after interval: TimeInterval) {
-        responseTimeoutTimer?.invalidate()
+        clearResponseTimeout()
+        responseTimeoutDeadline = Date().addingTimeInterval(interval)
         responseTimeoutTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.utteranceActive else { return }
                 self.utteranceActive = false
                 self.responseTimeoutTimer = nil
+                self.responseTimeoutDeadline = nil
                 if self.commitPending {
                     // The commit never went out; drop the local buffers too, or the
                     // audio of an utterance we just told the user failed would be
@@ -1142,5 +1131,11 @@ public final class RealtimeClient {
                 self.onFailure?("等待转写结果超时")
             }
         }
+    }
+
+    private func clearResponseTimeout() {
+        responseTimeoutTimer?.invalidate()
+        responseTimeoutTimer = nil
+        responseTimeoutDeadline = nil
     }
 }

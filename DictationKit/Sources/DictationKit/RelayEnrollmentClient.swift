@@ -1,9 +1,9 @@
 import Foundation
+import CoreFoundation
 import Darwin
 
 public struct RelayEnrollmentClient {
     private static let enrollmentGate = RelayEnrollmentGate()
-    private static let processLock = RelayEnrollmentProcessLock()
     private let session: URLSession
 
     public init(session: URLSession = .shared) {
@@ -27,10 +27,14 @@ public struct RelayEnrollmentClient {
             // individual reads and writes: Security.framework has no compare-and-delete
             // primitive, so a read/check/delete sequence alone cannot be cross-process
             // atomic. Waiting happens on the lock's private queue, never MainActor.
-            let processLease = try await Self.processLock.acquire()
+            let processLease = try await KeychainStore.acquireRelayCredentialTransaction()
             defer { processLease.release() }
             try Task.checkCancellation()
-            try await enroll(validatedInviteCode: invite, mayRefreshDeviceToken: true)
+            try await enroll(
+                validatedInviteCode: invite,
+                mayRefreshDeviceToken: true,
+                lease: processLease
+            )
             await Self.enrollmentGate.release()
         } catch {
             await Self.enrollmentGate.release()
@@ -38,9 +42,13 @@ public struct RelayEnrollmentClient {
         }
     }
 
-    private func enroll(validatedInviteCode invite: String, mayRefreshDeviceToken: Bool) async throws {
+    private func enroll(
+        validatedInviteCode invite: String,
+        mayRefreshDeviceToken: Bool,
+        lease: RelayCredentialProcessLease
+    ) async throws {
         try Task.checkCancellation()
-        let deviceToken = try KeychainStore.prepareRelayEnrollmentToken()
+        let deviceToken = try KeychainStore.prepareRelayEnrollmentToken(lease: lease)
         var request = URLRequest(url: ServiceRoute.relayEnrollmentURL)
         request.httpMethod = "POST"
         request.timeoutInterval = 20
@@ -63,25 +71,57 @@ public struct RelayEnrollmentClient {
         guard http.statusCode == 200 else {
             let error = (try? JSONDecoder().decode(ErrorEnvelope.self, from: data))?.error
             if error?.code == "enrollment_device_token_in_use", mayRefreshDeviceToken {
-                guard KeychainStore.resetPendingRelayEnrollmentToken(expectedToken: deviceToken) else {
+                guard KeychainStore.resetPendingRelayEnrollmentToken(
+                    expectedToken: deviceToken,
+                    lease: lease
+                ) else {
                     throw RelayEnrollmentError.message("无法更新钥匙串中的设备身份，请重试")
                 }
-                try await enroll(validatedInviteCode: invite, mayRefreshDeviceToken: false)
+                try await enroll(
+                    validatedInviteCode: invite,
+                    mayRefreshDeviceToken: false,
+                    lease: lease
+                )
                 return
             }
             // This invite was previously committed for this exact proposal and the
             // resulting device has since been revoked. It can never succeed again;
             // keeping the proposal would poison the next fresh invite too.
             if error?.code == "enrollment_revoked" {
-                _ = KeychainStore.resetPendingRelayEnrollmentToken(expectedToken: deviceToken)
+                _ = KeychainStore.resetPendingRelayEnrollmentToken(
+                    expectedToken: deviceToken,
+                    lease: lease
+                )
             }
             throw RelayEnrollmentError.message(
                 error?.message ?? Self.fallbackMessage(for: http.statusCode)
             )
         }
-        guard KeychainStore.commitPendingRelayEnrollmentToken(expectedToken: deviceToken) else {
+        guard Self.isValidSuccessResponse(data) else {
+            throw RelayEnrollmentError.message("激活服务器返回了无效的成功响应；设备身份未写入")
+        }
+        guard KeychainStore.commitPendingRelayEnrollmentToken(
+            expectedToken: deviceToken,
+            lease: lease
+        ) else {
             throw RelayEnrollmentError.message("激活成功，但无法把设备身份存入钥匙串；请重试")
         }
+    }
+
+    /// The server has already committed the claim by the time this runs, and a failure
+    /// here throws before the token is promoted while leaving the pending proposal in
+    /// place — the retry then receives the identical idempotent body and fails the same
+    /// way, forever, with the invite spent. So this checks that `ok` is genuinely the
+    /// boolean true and nothing more: demanding an exact one-key shape would let a
+    /// single added field in a future server response brick enrollment for every client
+    /// already installed.
+    public nonisolated static func isValidSuccessResponse(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = object["ok"] as? NSNumber,
+              CFGetTypeID(ok) == CFBooleanGetTypeID(),
+              ok.boolValue
+        else { return false }
+        return true
     }
 
     public nonisolated static func isPlausibleInviteCode(_ value: String) -> Bool {
@@ -118,10 +158,10 @@ public struct RelayEnrollmentClient {
 /// Serialises Keychain enrollment transactions across old/new app copies and `open -n`
 /// instances. `flock` belongs to the open file descriptor, so a crash or force-quit
 /// closes it in the kernel and releases the lock without recovery bookkeeping.
-private final class RelayEnrollmentProcessLock: @unchecked Sendable {
+final class RelayCredentialProcessLock: @unchecked Sendable {
     private let waitQueue = DispatchQueue(label: "com.mingyili.Whisper.relay-enrollment-lock")
 
-    func acquire() async throws -> RelayEnrollmentProcessLease {
+    func acquire() async throws -> RelayCredentialProcessLease {
         let cancellation = RelayEnrollmentLockCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -141,7 +181,7 @@ private final class RelayEnrollmentProcessLock: @unchecked Sendable {
                             continuation.resume(throwing: CancellationError())
                         } else {
                             continuation.resume(
-                                returning: RelayEnrollmentProcessLease(descriptor: descriptor)
+                                returning: RelayCredentialProcessLease(descriptor: descriptor)
                             )
                         }
                     } catch {
@@ -156,6 +196,26 @@ private final class RelayEnrollmentProcessLock: @unchecked Sendable {
             // also checks cancellation after a successful handoff to cover that race.
             cancellation.cancel()
         }
+    }
+
+    /// Synchronous credential writers use the same file lock as the async enrollment
+    /// transaction. They fail closed when it is busy rather than block MainActor: an
+    /// enrollment response itself resumes on MainActor, so blocking that actor on the
+    /// lease it must release would deadlock. The caller can retry; it cannot overwrite
+    /// the transaction that won the lock.
+    func withLock<T>(_ body: () throws -> T) throws -> T {
+        let descriptor = try Self.openLockFile()
+        defer { Darwin.close(descriptor) }
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            if errno == EINTR { continue }
+            // Contention is the one failure a caller must respect: somebody else is
+            // mid-transaction. Everything else means the lock itself is broken, which
+            // callers may choose to proceed through.
+            if errno == EWOULDBLOCK { throw RelayEnrollmentLockError.contended }
+            throw RelayEnrollmentLockError.system(errno)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
     }
 
     private nonisolated static func openLockFile() throws -> Int32 {
@@ -217,12 +277,16 @@ private final class RelayEnrollmentProcessLock: @unchecked Sendable {
     }
 }
 
-private final class RelayEnrollmentProcessLease: @unchecked Sendable {
+final class RelayCredentialProcessLease: @unchecked Sendable {
     private let stateLock = NSLock()
     private var descriptor: Int32?
 
     init(descriptor: Int32) {
         self.descriptor = descriptor
+    }
+
+    var isHeld: Bool {
+        stateLock.withLock { descriptor != nil }
     }
 
     func release() {
@@ -242,18 +306,20 @@ private final class RelayEnrollmentProcessLease: @unchecked Sendable {
 
 private final class RelayEnrollmentLockCancellation: @unchecked Sendable {
     private let lock = NSLock()
-    private var cancelled = false
+    nonisolated(unsafe) private var cancelled = false
 
-    var isCancelled: Bool {
+    nonisolated var isCancelled: Bool {
         lock.withLock { cancelled }
     }
 
-    func cancel() {
+    nonisolated func cancel() {
         lock.withLock { cancelled = true }
     }
 }
 
-private enum RelayEnrollmentLockError: LocalizedError {
+enum RelayEnrollmentLockError: LocalizedError {
+    /// Another process holds the credential lock right now.
+    case contended
     case unavailable
     case system(Int32)
 

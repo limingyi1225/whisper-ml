@@ -1,5 +1,9 @@
 import Foundation
+import CryptoKit
+import OSLog
 import Security
+
+private let log = Logger(subsystem: "com.mingyili.Whisper", category: "keychain")
 
 /// Credentials live in the login keychain, not in the binary or in UserDefaults.
 public enum KeychainStore {
@@ -7,6 +11,8 @@ public enum KeychainStore {
     private static let apiKeyAccount = "openai-api-key"
     private static let relayTokenAccount = "relay-device-token"
     private static let pendingRelayTokenAccount = "relay-pending-enrollment-token"
+    private static let relayTokenProvenanceAccount = "relay-device-token-provenance"
+    private static let relayCredentialProcessLock = RelayCredentialProcessLock()
 
     public static func loadAPIKey() -> String? {
         load(account: apiKeyAccount)
@@ -24,7 +30,16 @@ public enum KeychainStore {
         load(account: pendingRelayTokenAccount)
     }
 
-    public static func prepareRelayEnrollmentToken() throws -> String {
+    static func acquireRelayCredentialTransaction() async throws -> RelayCredentialProcessLease {
+        try await relayCredentialProcessLock.acquire()
+    }
+
+    static func prepareRelayEnrollmentToken(
+        lease: RelayCredentialProcessLease
+    ) throws -> String {
+        guard lease.isHeld else {
+            throw RelayEnrollmentCredentialError.couldNotPrepareToken
+        }
         if let pending = pendingRelayEnrollmentToken(), isGeneratedRelayToken(pending) {
             return pending
         }
@@ -42,8 +57,12 @@ public enum KeychainStore {
     /// remove the now-redundant pending copy is harmless, while removing first and then
     /// failing the live write would lose an invite the server already consumed.
     @discardableResult
-    public static func commitPendingRelayEnrollmentToken(expectedToken: String) -> Bool {
-        // The caller holds the cross-process enrollment transaction lock. Still bind
+    static func commitPendingRelayEnrollmentToken(
+        expectedToken: String,
+        lease: RelayCredentialProcessLease
+    ) -> Bool {
+        guard lease.isHeld else { return false }
+        // The caller holds the cross-process credential transaction lock. Still bind
         // promotion to the proposal that received 200, so stale responses and future
         // callers cannot promote "whatever happens to be pending".
         let pending = pendingRelayEnrollmentToken()
@@ -55,7 +74,13 @@ public enum KeychainStore {
         case .alreadyCommitted:
             // Two processes can receive the idempotent 200 for the same proposal.
             // The first has already promoted it, so the missing pending item is success,
-            // not a credential-storage failure. Only clean up if it is still ours.
+            // not a credential-storage failure. Repair provenance too: the prior process
+            // may have crashed after writing the live item but before writing metadata.
+            // A failure to write that second item is not a failed enrollment — the live
+            // token is already correct and working — and reporting one would tell the
+            // user the opposite of what happened. Provenance repairs itself on the next
+            // successful write.
+            _ = saveRelayTokenProvenance(.enrollment, token: expectedToken)
             if pending == expectedToken { _ = delete(account: pendingRelayTokenAccount) }
             return true
         case .promotePending:
@@ -63,7 +88,11 @@ public enum KeychainStore {
         case .reject:
             return false
         }
-        guard saveRelayToken(expectedToken) else { return false }
+        guard replaceRelayToken(
+            with: expectedToken,
+            provenance: .enrollment,
+            adoptedHighWater: nil
+        ) else { return false }
         if pendingRelayEnrollmentToken() == expectedToken {
             _ = delete(account: pendingRelayTokenAccount)
         }
@@ -81,7 +110,11 @@ public enum KeychainStore {
     }
 
     @discardableResult
-    public static func resetPendingRelayEnrollmentToken(expectedToken: String) -> Bool {
+    static func resetPendingRelayEnrollmentToken(
+        expectedToken: String,
+        lease: RelayCredentialProcessLease
+    ) -> Bool {
+        guard lease.isHeld else { return false }
         // The caller holds the cross-process transaction lock. The value check is for
         // response provenance, not a claim that two separate Keychain calls form CAS.
         guard pendingRelayEnrollmentToken() == expectedToken else { return false }
@@ -146,10 +179,9 @@ public enum KeychainStore {
     }
 
     /// The highest issuance this app has ever installed. A high-water mark, never
-    /// cleared — including when the user types a token of their own, because "this
-    /// issuance has already been applied here" stays true no matter what replaced it.
-    /// Clearing it would let the same build re-install its token on every launch and
-    /// overwrite the user's choice forever.
+    /// cleared. Only bundled seedings record one: an explicit identity that claimed
+    /// `Int.max` could never be superseded by any future personalised build, which is
+    /// the provenance veto restated as arithmetic.
     private static let adoptedIssuanceKey = "adoptedRelayTokenIssuance"
 
     private static var adoptedIssuance: Int? {
@@ -175,25 +207,85 @@ public enum KeychainStore {
     /// Returns true when something was written.
     @discardableResult
     public static func seedBundledRelayTokenIfNeeded() -> Bool {
+        // A public invite build has no bundled token and therefore no evidence about an
+        // unprovenanced stored credential. It may be a legacy personalised token, a
+        // hand-entered token, or an enrollment from the immediately preceding version.
+        // Never make an irreversible enrollment/Int.max inference merely from build type.
         guard let bundled = bundledRelayToken else { return false }
-        let issuance = bundledTokenIssuance
-        guard shouldSeed(
-            hasStoredToken: hasRelayToken(),
-            bundledIssuance: issuance,
-            adoptedIssuance: adoptedIssuance
-        ) else { return false }
+        return withRelayCredentialLock(fallback: false) {
+            let stored = loadRelayToken()
+            let provenanceRecord: RelayTokenProvenanceRecord?
+            if let stored {
+                provenanceRecord = loadRelayTokenProvenanceRecord(stored)
+            } else {
+                provenanceRecord = nil
+            }
+            let provenance = provenanceRecord?.source
 
-        guard saveRelayToken(bundled) else { return false }
-        recordAdopted(issuance)
-        return true
+            // A previous version may have written this exact bundled token before
+            // provenance existed. Annotating it is safe; changing the credential is not.
+            if stored == bundled {
+                guard provenance == nil || provenance == .bundled else { return false }
+                guard saveRelayTokenProvenance(
+                    .bundled,
+                    token: bundled,
+                    issuance: bundledTokenIssuance
+                ) else { return false }
+                recordAdopted(bundledTokenIssuance)
+                return false
+            }
+
+            // Ordering by issuance — not provenance — decides this, for the reason the
+            // doc comment on `shouldSeed` gives: a personalised build is handed to one
+            // person and its token is the hash registered under their name. Vetoing on
+            // provenance meant anyone who had ever typed a token or enrolled by invite
+            // could never be handed a working rebuilt copy again. Provenance still
+            // sharpens the ordering baseline below, and still governs 401 recovery.
+            let issuance = bundledTokenIssuance
+            guard shouldSeed(
+                hasStoredToken: stored != nil,
+                bundledIssuance: issuance,
+                adoptedIssuance: bundledOrderingBaseline(
+                    provenanceIssuance: provenanceRecord?.issuance,
+                    adoptedIssuance: adoptedIssuance
+                )
+            ) else { return false }
+
+            return replaceRelayToken(
+                with: bundled,
+                provenance: .bundled,
+                issuance: issuance,
+                adoptedHighWater: issuance
+            )
+        }
     }
 
     /// Installs the bundled token in response to the server rejecting what we had.
     @discardableResult
-    public static func adoptBundledRelayToken(_ token: String) -> Bool {
-        guard saveRelayToken(token) else { return false }
-        recordAdopted(bundledTokenIssuance)
-        return true
+    public static func adoptBundledRelayToken(
+        _ token: String,
+        replacing expectedRejectedToken: String
+    ) -> Bool {
+        withRelayCredentialLock(fallback: false) {
+            guard token == bundledRelayToken,
+                  let current = loadRelayToken(),
+                  rejectedCredentialIsStillCurrent(
+                    currentToken: current,
+                    expectedRejectedToken: expectedRejectedToken
+                  ),
+                  shouldRecoverWithBundled(
+                    bundledIssuance: bundledTokenIssuance,
+                    adoptedIssuance: adoptedIssuance,
+                    provenance: recoveryProvenance(for: current)
+                  )
+            else { return false }
+            return replaceRelayToken(
+                with: token,
+                provenance: .bundled,
+                issuance: bundledTokenIssuance,
+                adoptedHighWater: bundledTokenIssuance
+            )
+        }
     }
 
     /// Whether this build's own token is the identity it should be using.
@@ -222,7 +314,9 @@ public enum KeychainStore {
         guard hasStoredToken else { return true }
         // Something is stored but this app has never applied an issuance: a token typed
         // by hand, or seeded by a build from before this scheme. This build's identity
-        // wins, once.
+        // wins, once. Refusing here is what makes `revoke_token.sh` lie — the ledger
+        // records the rebuilt copy's token while the Mac keeps authenticating as the
+        // old one, so revoking the person cuts off a hash nobody is using.
         guard let adoptedIssuance else { return true }
         return bundledIssuance > adoptedIssuance
     }
@@ -230,10 +324,63 @@ public enum KeychainStore {
     /// The recovery decision against this app's own recorded state. The pure function
     /// below carries the reasoning and is what the tests drive.
     static var mayRecoverWithBundledToken: Bool {
-        mayRecoverWithBundled(
+        guard let current = loadRelayToken() else { return false }
+        return shouldRecoverWithBundled(
             bundledIssuance: bundledTokenIssuance,
-            adoptedIssuance: adoptedIssuance
+            adoptedIssuance: adoptedIssuance,
+            provenance: recoveryProvenance(for: current)
         )
+    }
+
+    /// Current digest-bound bundled metadata is the identity being ordered. A historical
+    /// `Int.max` only says an explicit identity existed before deletion; it must not make
+    /// the bundled token seeded into the now-empty slot impossible to rotate forever.
+    public nonisolated static func bundledOrderingBaseline(
+        provenanceIssuance: Int?,
+        adoptedIssuance: Int?
+    ) -> Int? {
+        provenanceIssuance ?? adoptedIssuance
+    }
+
+    /// The rejection authorises replacing only the exact credential used by that
+    /// failed socket. Re-checking under the writer lock is the CAS boundary; an old app
+    /// process may have written a new unprovenanced token after RealtimeClient's earlier
+    /// optimistic check.
+    public nonisolated static func rejectedCredentialIsStillCurrent(
+        currentToken: String?,
+        expectedRejectedToken: String
+    ) -> Bool {
+        currentToken == expectedRejectedToken
+    }
+
+    /// Recovery has stronger evidence than startup seeding: the caller has tied a 401
+    /// to the exact credential still in Keychain. An unprovenanced credential is
+    /// therefore eligible for ordered forward recovery, preserving support for
+    /// personalised builds issued before provenance existed. Explicit manual/enrollment
+    /// credentials remain protected even after rejection; the user must replace those
+    /// deliberately rather than letting a bundled identity silently take ownership.
+    public nonisolated static func shouldRecoverWithBundled(
+        bundledIssuance: Int?,
+        adoptedIssuance: Int?,
+        provenance: RelayTokenRecoveryProvenance
+    ) -> Bool {
+        switch provenance {
+        case .explicit:
+            return false
+        case .unknown:
+            return mayRecoverWithBundled(
+                bundledIssuance: bundledIssuance,
+                adoptedIssuance: adoptedIssuance
+            )
+        case .bundled(let issuance):
+            return mayRecoverWithBundled(
+                bundledIssuance: bundledIssuance,
+                adoptedIssuance: bundledOrderingBaseline(
+                    provenanceIssuance: issuance,
+                    adoptedIssuance: adoptedIssuance
+                )
+            )
+        }
     }
 
     /// Whether a rejected credential may be answered with the bundled token.
@@ -241,7 +388,7 @@ public enum KeychainStore {
     /// Guards the same downgrade from the other side. Without it, a recipient running
     /// the current build (token B) whose token is later revoked could have an *older*
     /// copy's 401 recovery install A — superseded, already revoked — and then loop.
-    public static func mayRecoverWithBundled(
+    public nonisolated static func mayRecoverWithBundled(
         bundledIssuance: Int?,
         adoptedIssuance: Int?
     ) -> Bool {
@@ -250,6 +397,20 @@ public enum KeychainStore {
         // `>=`, not `>`: re-installing this build's own token is exactly the repair
         // wanted when the stored value was hand-typed, or was rotated out from under it.
         return bundledIssuance >= adoptedIssuance
+    }
+
+    private static func recoveryProvenance(
+        for token: String
+    ) -> RelayTokenRecoveryProvenance {
+        guard let provenance = loadRelayTokenProvenanceRecord(token) else {
+            return .unknown
+        }
+        switch provenance.source {
+        case .bundled:
+            return .bundled(issuance: provenance.issuance)
+        case .manual, .enrollment:
+            return .explicit
+        }
     }
 
     /// Whether a credential is stored, without copying it out.
@@ -295,7 +456,15 @@ public enum KeychainStore {
 
     @discardableResult
     public static func saveRelayToken(_ token: String) -> Bool {
-        save(token, account: relayTokenAccount)
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return withRelayCredentialLock(fallback: false) {
+            replaceRelayToken(
+                with: trimmed,
+                provenance: .manual,
+                adoptedHighWater: nil
+            )
+        }
     }
 
     private static func save(_ value: String, account: String) -> Bool {
@@ -325,7 +494,98 @@ public enum KeychainStore {
 
     @discardableResult
     public static func deleteRelayToken() -> Bool {
-        delete(account: relayTokenAccount)
+        withRelayCredentialLock(fallback: false) {
+            let deletedToken = delete(account: relayTokenAccount)
+            let deletedProvenance = delete(account: relayTokenProvenanceAccount)
+            return deletedToken && deletedProvenance
+        }
+    }
+
+    /// Serialises credential writes across processes, and — critically — only refuses
+    /// the write when somebody else genuinely holds the lock.
+    ///
+    /// The lock is mutual exclusion, not a correctness precondition: if no lock can be
+    /// established at all (Application Support unwritable, `chmod` refused, `open`
+    /// failed), then there is also no contending holder to protect against, and failing
+    /// closed would make every relay-credential write on that install impossible
+    /// forever — silently, with the user told only 「无法写入钥匙串」. Proceed unserialised
+    /// and say so in the log.
+    private static func withRelayCredentialLock<T>(
+        fallback defaultValue: T,
+        _ body: () -> T
+    ) -> T {
+        do {
+            return try relayCredentialProcessLock.withLock(body)
+        } catch RelayEnrollmentLockError.contended {
+            return defaultValue
+        } catch {
+            log.warning("no credential lock available; writing unserialised")
+            return body()
+        }
+    }
+
+    /// Writes the live token and its digest-bound provenance as one recoverable local
+    /// transaction. Keychain has no multi-item CAS, so snapshot and rollback are
+    /// explicit. The UserDefaults high-water mark is written only after both Keychain
+    /// items succeed; a failed metadata write must never permanently label the old live
+    /// identity as manual/enrolled.
+    private static func replaceRelayToken(
+        with token: String,
+        provenance: RelayTokenProvenance,
+        issuance: Int? = nil,
+        adoptedHighWater: Int?
+    ) -> Bool {
+        let previousToken = loadRelayToken()
+        let previousProvenance = load(account: relayTokenProvenanceAccount)
+
+        guard save(token, account: relayTokenAccount) else { return false }
+        guard saveRelayTokenProvenance(provenance, token: token, issuance: issuance) else {
+            if let previousToken {
+                _ = save(previousToken, account: relayTokenAccount)
+            } else {
+                _ = delete(account: relayTokenAccount)
+            }
+            if let previousProvenance {
+                _ = save(previousProvenance, account: relayTokenProvenanceAccount)
+            } else {
+                _ = delete(account: relayTokenProvenanceAccount)
+            }
+            return false
+        }
+
+        recordAdopted(adoptedHighWater)
+        return true
+    }
+
+    private static func saveRelayTokenProvenance(
+        _ source: RelayTokenProvenance,
+        token: String,
+        issuance: Int? = nil
+    ) -> Bool {
+        let record = RelayTokenProvenanceRecord(
+            tokenDigest: relayTokenDigest(token),
+            source: source,
+            issuance: issuance
+        )
+        guard let data = try? JSONEncoder().encode(record),
+              let value = String(data: data, encoding: .utf8)
+        else { return false }
+        return save(value, account: relayTokenProvenanceAccount)
+    }
+
+    private static func loadRelayTokenProvenanceRecord(
+        _ token: String
+    ) -> RelayTokenProvenanceRecord? {
+        guard let value = load(account: relayTokenProvenanceAccount),
+              let data = value.data(using: .utf8),
+              let record = try? JSONDecoder().decode(RelayTokenProvenanceRecord.self, from: data),
+              record.tokenDigest == relayTokenDigest(token)
+        else { return nil }
+        return record
+    }
+
+    private static func relayTokenDigest(_ token: String) -> String {
+        SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func delete(account: String) -> Bool {
@@ -340,6 +600,24 @@ public enum KeychainStore {
             kSecAttrAccount as String: account,
         ]
     }
+}
+
+private struct RelayTokenProvenanceRecord: Codable {
+    let tokenDigest: String
+    let source: RelayTokenProvenance
+    let issuance: Int?
+}
+
+private enum RelayTokenProvenance: String, Codable {
+    case manual
+    case bundled
+    case enrollment
+}
+
+public enum RelayTokenRecoveryProvenance: Equatable, Sendable {
+    case unknown
+    case bundled(issuance: Int?)
+    case explicit
 }
 
 public enum RelayEnrollmentCommitDecision: Equatable, Sendable {
