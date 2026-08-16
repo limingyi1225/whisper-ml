@@ -179,7 +179,8 @@ npm install
 npm run generate-token
 cp .env.example .env
 # 编辑 .env：填 OPENAI_API_KEY，并把生成出来的 hash 填入
-# RELAY_DEVICE_TOKEN_HASHES
+# RELAY_DEVICE_TOKEN_HASHES。普通本机启动保持两个 enrollment 路径为注释状态；
+# 它们是 systemd 部署选项，不应指向本机通常不存在的 /var/lib 和 /run 目录。
 npm test
 npm start
 ```
@@ -350,9 +351,9 @@ low 811ms、medium 1250ms、high 1937ms。设置里叫「出字前先听多久�
 全部重打——差异出现在句首就等于整句重写，看起来就是"闪一下"。而 realtime 模型会在中文
 句号后面加个空格、整理模型又会把它去掉，正好制造句首差异。所以纯空格差异直接跳过不改。
 
-**整理模型固定为 gpt-5.6-terra，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
+**整理模型固定为 gpt-5.6-luna，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
 中位 1.68s 但出现过 4.70s；gpt-5.6 系列中位都在 1.7s 上下、尾部收敛），档位之间的差距
-在噪音以内，不值得一个设置项，最终按质量档位定为 terra 并写死。
+在噪音以内，不值得一个设置项，最终按当前客户端档位定为 luna 并写死。
 
 ## 已知边界（有意的取舍，不是待修 bug）
 

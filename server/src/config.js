@@ -53,6 +53,10 @@ const DEFAULTS = Object.freeze({
   // Two missed sweeps' worth of silence. The app pings every 20 s, so a client that
   // is merely idle always answers well inside this.
   clientHeartbeatIntervalMs: 25_000,
+  // Heartbeats are intentionally suspended while a target send buffer is congested.
+  // Bound that exemption separately: continued drain progress renews it, but a frozen
+  // half-open TCP target must not retain a bridge and paid upstream forever.
+  backpressureStallTimeoutMs: 60_000,
 });
 
 export { CLIENT_MAX_TURN_AUDIO_BYTES, CLIENT_MAX_TURN_WIRE_BYTES };
@@ -253,7 +257,7 @@ export function loadConfig(env = process.env) {
       || "gpt-live-transcribe,gpt-transcribe",
     ),
     allowedPolishModels: commaSeparatedSet(
-      env.ALLOWED_POLISH_MODELS || "gpt-5.6-terra",
+      env.ALLOWED_POLISH_MODELS || "gpt-5.6-luna",
     ),
     maxWebSocketPayloadBytes: positiveInteger(
       env,
@@ -339,6 +343,11 @@ export function loadConfig(env = process.env) {
       env,
       "CLIENT_HEARTBEAT_INTERVAL_MS",
       DEFAULTS.clientHeartbeatIntervalMs,
+    ),
+    backpressureStallTimeoutMs: positiveInteger(
+      env,
+      "BACKPRESSURE_STALL_TIMEOUT_MS",
+      DEFAULTS.backpressureStallTimeoutMs,
     ),
   });
 }

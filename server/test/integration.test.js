@@ -67,8 +67,12 @@ test("the enrollment endpoint is one-time but retries the same device safely", a
 
   try {
     const aliceToken = `relay_${"a".repeat(43)}`;
-    assert.equal((await enroll(aliceToken)).status, 200);
-    assert.equal((await enroll(aliceToken)).status, 200);
+    const firstEnrollment = await enroll(aliceToken);
+    assert.equal(firstEnrollment.status, 200);
+    assert.deepEqual(await firstEnrollment.json(), { ok: true });
+    const idempotentEnrollment = await enroll(aliceToken);
+    assert.equal(idempotentEnrollment.status, 200);
+    assert.deepEqual(await idempotentEnrollment.json(), { ok: true });
     assert.equal(authorizationChanges, 1);
     const stolen = await enroll(`relay_${"b".repeat(43)}`);
     assert.equal(stolen.status, 409);
@@ -194,7 +198,7 @@ test("polish proxy injects the server key and returns the upstream response", as
 
   try {
     const body = {
-      model: "gpt-5.6-terra",
+      model: "gpt-5.6-luna",
       messages: [
         { role: "system", content: "tidy only" },
         { role: "user", content: "<transcript>raw</transcript>" },
@@ -276,7 +280,7 @@ test("a cleanup the app abandons stops costing money upstream", async () => {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-5.6-terra",
+        model: "gpt-5.6-luna",
         messages: [
           { role: "system", content: "tidy only" },
           { role: "user", content: "<transcript>raw</transcript>" },
@@ -329,7 +333,7 @@ test("a polish request that outlives its authorisation is refused before OpenAI 
 
   try {
     const body = JSON.stringify({
-      model: "gpt-5.6-terra",
+      model: "gpt-5.6-luna",
       messages: [
         { role: "system", content: "tidy only" },
         { role: "user", content: "<transcript>raw</transcript>" },
@@ -422,7 +426,7 @@ test("revoking a device aborts the cleanup request it already has in flight", as
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-5.6-terra",
+        model: "gpt-5.6-luna",
         messages: [
           { role: "system", content: "tidy only" },
           { role: "user", content: "<transcript>raw</transcript>" },
@@ -1018,6 +1022,214 @@ test("backpressure does not let the heartbeat mistake a healthy client for a dea
     assert.deepEqual(closes, [], "a backed-up client must not be reaped as dead");
     assert.equal(receivedByUpstream.length, expected, "no audio may be dropped");
   } finally {
+    client.terminate();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("target-side upstream congestion does not queue a ping then reap the upstream", async () => {
+  // This is deliberately different from the localhost fast-drain test above. The
+  // OpenAI stand-in stops reading its TCP socket, so the relay's *target* send buffer
+  // fills. `upstream.isPaused` remains false in this state: only the downstream source
+  // is paused. A heartbeat keyed solely to isPaused queues ping behind the audio, sees
+  // no pong on the next sweep, and terminates a healthy but congested upstream.
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({
+    server: upstreamServer,
+    maxPayload: baseConfig.maxWebSocketPayloadBytes,
+  });
+  const receivedByUpstream = [];
+  let congestedSocket;
+  upstreamWSS.on("connection", (socket) => {
+    congestedSocket = socket;
+    socket._socket.pause();
+    socket.on("message", (data) => receivedByUpstream.push(data.length));
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({
+    server: relayServer,
+    maxPayload: baseConfig.maxWebSocketPayloadBytes,
+  });
+  let relayDownstream;
+  let relayUpstream;
+  relayWSS.on("connection", (downstream) => {
+    relayDownstream = downstream;
+    relayUpstream = bridgeRealtime(downstream, {
+      ...baseConfig,
+      openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
+      maxForwardBufferBytes: 1024,
+      clientHeartbeatIntervalMs: 80,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    const upstreamOpenDeadline = Date.now() + 5_000;
+    while ((relayUpstream?.readyState !== WebSocket.OPEN || !congestedSocket)
+        && Date.now() < upstreamOpenDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(relayUpstream?.readyState, WebSocket.OPEN, "the upstream must open before flooding");
+    client.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    const chunk = Buffer.alloc(1 << 20).toString("base64");
+    const sent = 30;
+    for (let i = 0; i < sent; i += 1) {
+      client.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        event_id: `target-backpressure-${i}`,
+        audio: chunk,
+      }));
+    }
+
+    const congestionDeadline = Date.now() + 5_000;
+    while ((!relayDownstream?.isPaused || relayUpstream?.bufferedAmount <= 1024)
+        && Date.now() < congestionDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(relayDownstream?.isPaused, true, "the source should be backpressured");
+    assert.ok(relayUpstream.bufferedAmount > 1024, "the upstream target must be congested");
+
+    // More than two complete heartbeat sweeps: the buggy bridge always closed here.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(client.readyState, WebSocket.OPEN, "the healthy client must remain open");
+    assert.equal(relayUpstream.readyState, WebSocket.OPEN, "the congested upstream must remain open");
+
+    congestedSocket._socket.resume();
+    const expected = sent + 1;
+    const drainDeadline = Date.now() + 15_000;
+    while (receivedByUpstream.length < expected && Date.now() < drainDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(receivedByUpstream.length, expected, "every queued audio frame must drain");
+  } finally {
+    congestedSocket?._socket.resume();
+    client.terminate();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("a target that stops draining is reaped after the backpressure progress deadline", async () => {
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({
+    server: upstreamServer,
+    maxPayload: baseConfig.maxWebSocketPayloadBytes,
+  });
+  let frozenSocket;
+  upstreamWSS.on("connection", (socket) => {
+    frozenSocket = socket;
+    // Complete the WebSocket handshake, then model a half-open peer whose TCP receive
+    // side never advances again. No pong can get ahead of the already queued audio.
+    socket._socket.pause();
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({
+    server: relayServer,
+    maxPayload: baseConfig.maxWebSocketPayloadBytes,
+  });
+  let relayDownstream;
+  let relayUpstream;
+  relayWSS.on("connection", (downstream) => {
+    relayDownstream = downstream;
+    relayUpstream = bridgeRealtime(downstream, {
+      ...baseConfig,
+      openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
+      maxForwardBufferBytes: 1024,
+      clientHeartbeatIntervalMs: 80,
+      backpressureStallTimeoutMs: 250,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    // Register before creating congestion. With the deliberately short watchdog the
+    // relay can correctly close while the fixture is still proving that it paused;
+    // attaching afterwards turns that success into a missed-event timeout.
+    const clientClosed = new Promise((resolve) => {
+      client.once("close", () => resolve(true));
+    });
+    const upstreamOpenDeadline = Date.now() + 5_000;
+    while ((relayUpstream?.readyState !== WebSocket.OPEN || !frozenSocket)
+        && Date.now() < upstreamOpenDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(relayUpstream?.readyState, WebSocket.OPEN);
+
+    client.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-live-transcribe", delay: "low" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    const chunk = Buffer.alloc(1 << 20).toString("base64");
+    for (let i = 0; i < 30; i += 1) {
+      client.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        event_id: `frozen-target-${i}`,
+        audio: chunk,
+      }));
+    }
+
+    const congestionDeadline = Date.now() + 5_000;
+    while ((!relayDownstream?.isPaused || relayUpstream?.bufferedAmount <= 1024)
+        && Date.now() < congestionDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(relayDownstream?.isPaused, true, "the fixture must reach target backpressure");
+
+    let closeDeadline;
+    const closeTimedOut = new Promise((resolve) => {
+      closeDeadline = setTimeout(() => resolve(false), 2_000);
+    });
+    const closed = client.readyState === WebSocket.CLOSED
+      ? true
+      : await Promise.race([clientClosed, closeTimedOut]);
+    clearTimeout(closeDeadline);
+    assert.equal(closed, true, "a frozen target must not retain the bridge indefinitely");
+  } finally {
+    frozenSocket?._socket.resume();
     client.terminate();
     for (const socket of relayWSS.clients) socket.terminate();
     for (const socket of upstreamWSS.clients) socket.terminate();

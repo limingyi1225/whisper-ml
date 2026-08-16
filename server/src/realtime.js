@@ -8,11 +8,11 @@ const ALLOWED_EVENT_TYPES = new Set([
 ]);
 const ALLOWED_DELAYS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
-// Mirrors AppSettings.vocabularyTermLimit / vocabularyTermLengthLimit. Re-checked here
-// rather than trusted from the app, because this is the boundary that decides what an
-// authenticated device may spend the upstream session on: without a cap, `keywords`
+// AppSettings accepts 100 user-entered terms and prepends one built-in name. Re-checked
+// here rather than trusted from the app, because this is the boundary that decides what
+// an authenticated device may spend the upstream session on: without a cap, `keywords`
 // is a free-text channel to OpenAI that happens to be shaped like a word list.
-const MAX_KEYWORDS = 100;
+const MAX_KEYWORDS = 101;
 const MAX_KEYWORD_LENGTH = 40;
 
 /// Chinese lead, English detail in parentheses. These reach the user through the app's
@@ -231,19 +231,47 @@ function forward(target, data, isBinary, config) {
 /// normally looks dead for the whole pause, and the first tick after resuming would
 /// act on a verdict that was really about backpressure. Measured, not assumed:
 /// zero pongs are delivered while paused.
-function pauseUntilDrained(source, target, config, isSettled, onResume) {
+function pauseUntilDrained(source, target, config, isSettled, {
+  onBackpressure,
+  onResume,
+  onStall,
+} = {}) {
   if (source.isPaused) return;
+  onBackpressure?.();
   source.pause();
+  // A one-byte change is not proof that a multi-megabyte queue is draining. Measure
+  // bounded windows and require enough movement to clear at least one eighth of the
+  // configured high-water mark per window. At the production defaults this is only
+  // about 17 KiB/s, deliberately below realtime PCM throughput, while still bounding
+  // a half-open socket that merely dribbles kernel-buffer bookkeeping forever.
+  const minimumWindowProgress = Math.max(
+    1,
+    Math.ceil(config.maxForwardBufferBytes / 8),
+  );
+  let windowStartedAt = Date.now();
+  let windowStartBufferedAmount = target.bufferedAmount;
   const timer = setInterval(() => {
+    const now = Date.now();
+    const bufferedAmount = target.bufferedAmount;
     const done = isSettled()
       || target.readyState !== WebSocket.OPEN
-      || target.bufferedAmount <= config.maxForwardBufferBytes / 2;
-    if (!done) return;
-    clearInterval(timer);
-    if (source.readyState === WebSocket.OPEN && source.isPaused) {
-      source.resume();
-      onResume?.();
+      || bufferedAmount <= config.maxForwardBufferBytes / 2;
+    if (done) {
+      clearInterval(timer);
+      if (source.readyState === WebSocket.OPEN && source.isPaused) {
+        source.resume();
+        onResume?.();
+      }
+      return;
     }
+    if (now - windowStartedAt < config.backpressureStallTimeoutMs) return;
+    if (windowStartBufferedAmount - bufferedAmount >= minimumWindowProgress) {
+      windowStartedAt = now;
+      windowStartBufferedAmount = bufferedAmount;
+      return;
+    }
+    clearInterval(timer);
+    onStall?.();
   }, 50);
   timer.unref();
 }
@@ -263,8 +291,44 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
   // about the peer, only about backpressure.
   let downstreamAlive = true;
   let upstreamAlive = true;
+  // A socket can be unobservable for either of two independent reasons. It may be the
+  // paused source, in which case ws cannot parse its pong; or it may be the congested
+  // target, in which case our ping sits behind megabytes already queued to it. Looking
+  // only at `isPaused` covers the first case and falsely reaps the second one.
+  let downstreamTargetBackpressured = false;
+  let upstreamTargetBackpressured = false;
   const markDownstreamAlive = () => { downstreamAlive = true; };
   const markUpstreamAlive = () => { upstreamAlive = true; };
+  const pauseForUpstream = () => pauseUntilDrained(
+    downstream,
+    upstream,
+    config,
+    () => settled,
+    {
+      onBackpressure: () => { upstreamTargetBackpressured = true; },
+      onResume: () => {
+        upstreamTargetBackpressured = false;
+        markDownstreamAlive();
+        markUpstreamAlive();
+      },
+      onStall: () => terminateBoth(),
+    },
+  );
+  const pauseForDownstream = () => pauseUntilDrained(
+    upstream,
+    downstream,
+    config,
+    () => settled,
+    {
+      onBackpressure: () => { downstreamTargetBackpressured = true; },
+      onResume: () => {
+        downstreamTargetBackpressured = false;
+        markUpstreamAlive();
+        markDownstreamAlive();
+      },
+      onStall: () => terminateBoth(),
+    },
+  );
 
   const closeBoth = (code = 1011, reason = "relay closed") => {
     if (settled) return;
@@ -274,6 +338,19 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
         || upstream.readyState === WebSocket.CONNECTING) {
       upstream.close(code, reason);
     }
+  };
+
+  // A no-progress deadline is different from an ordinary protocol failure. The source
+  // is paused and may itself have a large outbound queue, so a graceful close frame can
+  // sit behind that queue until ws's 30-second close timer. Force both TCP connections
+  // down to release the paid upstream and the relay slot at the watchdog deadline.
+  const terminateBoth = () => {
+    if (settled) return;
+    settled = true;
+    if (downstream.readyState === WebSocket.OPEN
+        || downstream.readyState === WebSocket.CONNECTING) downstream.terminate();
+    if (upstream.readyState === WebSocket.OPEN
+        || upstream.readyState === WebSocket.CONNECTING) upstream.terminate();
   };
 
   const rejectConsumedAudio = () => {
@@ -312,7 +389,7 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
       const result = forward(upstream, data, isBinary, config);
       if (result === "closed") closeBoth(1011, "upstream closed");
       else if (result === "over") {
-        pauseUntilDrained(downstream, upstream, config, () => settled, markDownstreamAlive);
+        pauseForUpstream();
       }
       return;
     }
@@ -336,7 +413,7 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
     preopenQueue.length = 0;
     preopenBytes = 0;
     if (upstream.bufferedAmount > config.maxForwardBufferBytes) {
-      pauseUntilDrained(downstream, upstream, config, () => settled, markDownstreamAlive);
+      pauseForUpstream();
     }
   });
 
@@ -344,7 +421,7 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
     const result = forward(downstream, data, isBinary, config);
     if (result === "closed") closeBoth(1011, "client closed");
     else if (result === "over") {
-      pauseUntilDrained(upstream, downstream, config, () => settled, markUpstreamAlive);
+      pauseForDownstream();
     }
   });
 
@@ -402,7 +479,7 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
     // liveness is simply unobservable — checking anyway would terminate a perfectly
     // healthy client mid-utterance and lose audio that has already been handed to
     // the socket and therefore cannot be replayed.
-    if (!downstream.isPaused) {
+    if (!downstream.isPaused && !downstreamTargetBackpressured) {
       if (!downstreamAlive) {
         // No pong across a whole interval. `terminate`, not `close`: a peer that is
         // not answering will not complete a closing handshake either.
@@ -414,7 +491,9 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
       if (downstream.readyState === WebSocket.OPEN) downstream.ping();
     }
 
-    if (upstream.readyState === WebSocket.OPEN && !upstream.isPaused) {
+    if (upstream.readyState === WebSocket.OPEN
+        && !upstream.isPaused
+        && !upstreamTargetBackpressured) {
       if (!upstreamAlive) {
         upstream.terminate();
         closeBoth(1011, "upstream went away");

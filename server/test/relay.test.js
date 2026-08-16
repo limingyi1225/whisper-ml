@@ -21,6 +21,7 @@ import {
 } from "../src/enrollment.js";
 import { routePath } from "../src/http.js";
 import { validatePolishBody } from "../src/polish.js";
+import { classifyRelaySmoke } from "../../script/relay_smoke_verdict.mjs";
 import {
   admitConnection,
   DailyUsageLimiter,
@@ -33,6 +34,97 @@ const baseEnv = {
   OPENAI_API_KEY: "test-openai-key",
   RELAY_DEVICE_TOKEN_HASHES: tokenDigest(token),
 };
+
+test("deploy mutations share the flock owner's SSH connection and fail closed", () => {
+  const script = readFileSync(
+    new URL("../../script/deploy_relay.sh", import.meta.url),
+    "utf8",
+  );
+
+  // The primary session is both the ControlMaster and the remote fd-8 flock owner.
+  // Every later remote command must be a multiplexed channel on that same transport,
+  // with fallback disabled if the owner/connection disappears.
+  assert.match(script, /ssh -M -S "\$REMOTE_LOCK_TEMP\/control"/);
+  assert.match(script, /exec 8>\$DEPLOY_LOCK_FILE[\s\S]*flock -n 8/);
+  assert.match(
+    script,
+    /remote_ssh\(\)[\s\S]*ssh -S "\$REMOTE_LOCK_TEMP\/control"[\s\S]*-o ProxyCommand=false/,
+  );
+
+  const mutableTransaction = script.slice(script.indexOf("acquire_remote_lock\n"));
+  const unlockedCommands = mutableTransaction
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .filter((line) => !line.trimStart().startsWith("echo "))
+    .filter((line) => /\bssh\s+"\$HOST"/.test(line));
+  assert.deepEqual(unlockedCommands, []);
+
+  // Only a real remote `test` false (1) means this deploy created the token file.
+  // Transport 255 and lost-lease 74 must enter rollback without setting the flag,
+  // otherwise rollback can delete the pre-existing production allowlist.
+  const tokenProbe = script.slice(
+    script.indexOf('if remote_ssh "[ -s $TOKEN_FILE ]"'),
+    script.indexOf("# The allowlist has to live somewhere"),
+  );
+  assert.match(tokenProbe, /TOKEN_FILE_STATUS=\$\?/);
+  assert.match(tokenProbe, /if \[ "\$TOKEN_FILE_STATUS" -eq 1 \]/);
+  assert.ok(tokenProbe.indexOf("-eq 1") < tokenProbe.indexOf("CREATED_TOKEN_FILE=1"));
+  assert.match(tokenProbe, /else[\s\S]*false/);
+});
+
+test("deploy polish smoke separates bad artifacts from transient upstream failures", () => {
+  const deployScript = readFileSync(
+    new URL("../../script/deploy_relay.sh", import.meta.url),
+    "utf8",
+  );
+  assert.match(deployScript, /SMOKE_ALL_SAME_ROLLBACK=1/);
+  assert.match(
+    deployScript,
+    /\[ "\$SMOKE_ROLLBACK_REASON" != "\$SMOKE_REASON" \][\s\S]*SMOKE_ALL_SAME_ROLLBACK=0/,
+  );
+  assert.match(
+    deployScript,
+    /\[ "\$SMOKE_FINAL_VERDICT" = rollback \][\s\S]*\[ "\$SMOKE_ALL_SAME_ROLLBACK" -eq 1 \][\s\S]*false/,
+  );
+
+  const valid = JSON.stringify({
+    choices: [{ message: { content: "部署冒烟测试" } }],
+  });
+  assert.deepEqual(
+    classifyRelaySmoke("200", valid),
+    { verdict: "pass", reason: "client-contract" },
+  );
+  assert.equal(classifyRelaySmoke("200", "<html>edge error</html>").verdict, "rollback");
+  assert.equal(classifyRelaySmoke("200", JSON.stringify({ choices: [] })).verdict, "rollback");
+  assert.deepEqual(
+    classifyRelaySmoke("404", '{"error":{"code":"relay_not_found"}}'),
+    { verdict: "rollback", reason: "http-404" },
+  );
+  assert.deepEqual(
+    classifyRelaySmoke("404", "<html>nginx route missing</html>"),
+    { verdict: "rollback", reason: "http-404" },
+  );
+  assert.equal(classifyRelaySmoke("401", '{"error":{"code":"relay_unauthorized"}}').verdict, "rollback");
+  assert.equal(classifyRelaySmoke("424", '{"error":{"code":"relay_upstream_authentication"}}').verdict, "rollback");
+  assert.equal(classifyRelaySmoke("500", '{"error":{"code":"relay_internal_error"}}').verdict, "rollback");
+  assert.equal(classifyRelaySmoke("400", '{"error":{"code":"model_not_found"}}').verdict, "rollback");
+  assert.equal(
+    classifyRelaySmoke("400", '{"error":{"type":"invalid_request_error","code":null}}').verdict,
+    "rollback",
+  );
+  assert.equal(classifyRelaySmoke("400", "<html>edge error</html>").verdict, "inconclusive");
+  assert.equal(classifyRelaySmoke("400", "").verdict, "inconclusive");
+
+  for (const status of ["000", "301", "403", "408", "425", "429", "502", "503", "504"]) {
+    assert.equal(classifyRelaySmoke(status, "").verdict, "inconclusive");
+  }
+  // OpenAI's own 500 is forwarded as-is; only the relay's explicit internal-error body
+  // proves the deployed handler failed.
+  assert.equal(
+    classifyRelaySmoke("500", '{"error":{"code":"server_error"}}').verdict,
+    "inconclusive",
+  );
+});
 
 test("configuration requires hashed device tokens", () => {
   assert.throws(
@@ -277,7 +369,7 @@ test("Bearer authentication returns only the token hash", () => {
 test("polish requests are restricted to the allowlisted shape", () => {
   const config = loadConfig(baseEnv);
   const valid = {
-    model: "gpt-5.6-terra",
+    model: "gpt-5.6-luna",
     messages: [
       { role: "system", content: "tidy only" },
       { role: "user", content: "<transcript>hello</transcript>" },
@@ -347,11 +439,21 @@ test("Realtime validation bounds the keywords list", () => {
 
   assert.equal(validateRealtimeEvent(withKeywords(["李铭一", "Xcode"]), false, config, state), null);
   assert.equal(validateRealtimeEvent(withKeywords([]), false, config, state), null);
+  assert.equal(
+    validateRealtimeEvent(
+      withKeywords(["李铭一", ...Array.from({ length: 100 }, (_, i) => `user-${i}`)]),
+      false,
+      config,
+      state,
+    ),
+    null,
+    "the app's built-in term must fit beside all 100 user terms",
+  );
 
   // The caps are the point: without them an authenticated device could push arbitrary
   // text upstream through a field that merely looks like a word list.
   for (const bad of [
-    Array.from({ length: 101 }, (_, i) => `t${i}`), // too many
+    Array.from({ length: 102 }, (_, i) => `t${i}`), // too many
     ["x".repeat(41)], // one term too long
     [""], // empty term
     ["has\nnewline"],
