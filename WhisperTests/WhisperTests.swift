@@ -326,6 +326,25 @@ import Testing
         #expect(!RecordingHUDController.containsWindow(number: 4002, in: []))
     }
 
+    /// 试一下 tells the user that the bar at the bottom of their screen is the pill in
+    /// the guide's window. Focus is inside Whisper itself while they read that, which is
+    /// exactly the case the focus rule hides the pill for — so without this the sentence
+    /// pointed at an empty strip of desktop.
+    @Test func theGuidesRehearsalKeepsThePillOnScreenWithoutFocus() {
+        #expect(RecordingHUDController.shouldShow(
+            phase: .idle,
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: false,
+            isRehearsing: true
+        ))
+        #expect(!RecordingHUDController.shouldShow(
+            phase: .idle,
+            hasFocusedEditableInput: false,
+            isShowingSettledMark: false,
+            isRehearsing: false
+        ))
+    }
+
     @Test func idleFollowsFocusWhileActiveStatesStayVisible() {
         #expect(!RecordingHUDController.shouldShow(
             phase: .idle,
@@ -720,6 +739,71 @@ import Testing
     }
 }
 
+// MARK: - First-run guide
+
+@Suite struct OnboardingGateTests {
+    /// The case the guide exists for: a DMG opened on a Mac that has never run it.
+    @Test func aFreshInstallIsWalkedThroughSetup() {
+        #expect(OnboardingGate.shouldPresent(
+            completed: false, hasCredential: false, hasAccessibility: false
+        ))
+    }
+
+    /// And the case that matters more, because it is the one nobody asked for: somebody
+    /// who has been dictating for months updates into the build that added this window.
+    /// Their completion flag was written by nobody, so the only evidence that they are
+    /// set up is that they *are* set up — and a working install must never be stopped by
+    /// a setup wizard.
+    @Test func anAlreadyWorkingInstallIsNeverGreetedByTheGuide() {
+        #expect(!OnboardingGate.shouldPresent(
+            completed: false, hasCredential: true, hasAccessibility: true
+        ))
+    }
+
+    /// Half-configured is not configured: a credential with no Accessibility permission
+    /// cannot type a single character, and permission with no credential never connects.
+    @Test func eitherHalfMissingStillOwesTheGuide() {
+        #expect(OnboardingGate.shouldPresent(
+            completed: false, hasCredential: true, hasAccessibility: false
+        ))
+        #expect(OnboardingGate.shouldPresent(
+            completed: false, hasCredential: false, hasAccessibility: true
+        ))
+    }
+
+    /// Once finished it is finished, whatever the machine looks like afterwards. A
+    /// permission revoked months later is a menu-bar problem, not a reason to reopen a
+    /// welcome screen in the middle of somebody's working day.
+    @Test func aFinishedGuideNeverComesBack() {
+        #expect(!OnboardingGate.shouldPresent(
+            completed: true, hasCredential: false, hasAccessibility: false
+        ))
+    }
+
+    /// 试一下 asks the user to dictate at the guide's own window, which is exactly the
+    /// situation dictation otherwise refuses: no other app means nowhere to type. The
+    /// rehearsal is that refusal turned into a demo — and it has to stay pinned to the
+    /// guide, because "nowhere to type" also happens in ordinary use, when somebody
+    /// switches away while the transcript is still coming back. That sentence goes to
+    /// the clipboard; treating it as a rehearsal would silently destroy it.
+    @Test func onlyTheGuideTurnsAMissingTargetIntoARehearsal() {
+        #expect(DictationController.isRehearsal(hasTarget: false, isRehearsing: true))
+        #expect(!DictationController.isRehearsal(hasTarget: false, isRehearsing: false))
+        // And a real target is never a rehearsal, guide open or not: the user is typing
+        // into a document and expects the words to arrive.
+        #expect(!DictationController.isRehearsal(hasTarget: true, isRehearsing: true))
+        #expect(!DictationController.isRehearsal(hasTarget: true, isRehearsing: false))
+    }
+
+    /// 完成 lives on the last step, so the flow has to end where the button does.
+    @Test func theGuideStartsAtWelcomeAndEndsAtPractice() {
+        #expect(OnboardingStep.allCases.first == .welcome)
+        #expect(OnboardingStep.allCases.last == .practice)
+        #expect(OnboardingStep.practice.next == nil)
+        #expect(OnboardingStep.welcome.next == .connection)
+    }
+}
+
 // MARK: - Keychain input validation
 
 @Suite struct BundledTokenSeedingTests {
@@ -746,11 +830,11 @@ import Testing
         ))
     }
 
-    /// The identity a personalised build registers has to be the identity it uses, or
-    /// revocation quietly stops working: the ledger says "alice = B" while alice's Mac
-    /// authenticates with a token she was given earlier, so `revoke_token.sh alice`
-    /// removes a hash nobody is using and she keeps dictating. Applying this build's own
-    /// token once is what makes the two agree.
+    /// A personalised build is handed to one person and its token is the hash the relay
+    /// ledger records under their name. A stored token this app never applied an
+    /// issuance for — hand-typed, enrolled by invite, or seeded before the scheme —
+    /// loses to it, once. Refusing here is what makes revoking that person cut off a
+    /// hash nobody is using.
     @Test func aPersonalisedBuildAdoptsItsOwnIdentityOverAnUnknownStoredToken() {
         #expect(KeychainStore.shouldSeed(
             hasStoredToken: true, bundledIssuance: older, adoptedIssuance: nil

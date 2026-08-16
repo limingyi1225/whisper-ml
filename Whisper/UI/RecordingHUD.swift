@@ -134,8 +134,16 @@ final class RecordingHUDController {
     static func shouldShow(
         phase: DictationController.Phase,
         hasFocusedEditableInput: Bool,
-        isShowingSettledMark: Bool
+        isShowingSettledMark: Bool,
+        isRehearsing: Bool = false
     ) -> Bool {
+        // The first-run guide's 试一下 shows a copy of this pill in its own window and
+        // says that the bar at the bottom of the screen is the same thing. Nothing else
+        // would put it there while the user reads that: keyboard focus is inside
+        // Whisper's own window, which the focus monitor deliberately ignores.
+        if isRehearsing {
+            return true
+        }
         if phase != .idle || isShowingSettledMark {
             return true
         }

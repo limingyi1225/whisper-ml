@@ -81,6 +81,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("XCTest") }) {
             return
         }
+
+        // A measurement run against another app's accessibility behaviour. Starts
+        // nothing else, so it cannot disturb the copy the user has running.
+        if let delay = InjectionSelfTest.requestedDelay {
+            NSApp.setActivationPolicy(.accessory)
+            InjectionSelfTest.run(after: delay)
+            return
+        }
+
         updater.start()
         // Before `controller.start()`, which opens the socket: a personalised build
         // should come up already connected rather than showing 「还没有设置设备 Token」
@@ -118,14 +127,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = DictationController.shared
         controller.start()
 
-        // Ask for microphone access up front so the first dictation is not the thing
-        // that triggers a permission sheet mid-sentence.
-        if Permissions.microphoneStatus == .notDetermined {
-            Task { _ = await Permissions.requestMicrophone() }
-        }
+        // A fresh install is walked through activation, permissions and a first
+        // sentence instead of being left to discover the menu bar on its own.
+        let isOnboarding = OnboardingController.shared.presentIfNeeded(
+            controller: controller,
+            appDelegate: self
+        )
 
-        if !Permissions.hasAccessibility {
-            Permissions.promptForAccessibility()
+        // Ask for microphone access up front so the first dictation is not the thing
+        // that triggers a permission sheet mid-sentence. Both prompts belong to the
+        // guide's 权限 step while it is on screen: firing them here would put two
+        // system sheets in front of a user who has not yet read a single word, and the
+        // one they dismiss out of reflex is the one nothing works without.
+        if !isOnboarding {
+            if Permissions.microphoneStatus == .notDetermined {
+                Task { _ = await Permissions.requestMicrophone() }
+            }
+
+            if !Permissions.hasAccessibility {
+                Permissions.promptForAccessibility()
+            }
         }
 
         focusedInputMonitor.onChange = { [weak self, weak controller] _ in
@@ -187,13 +208,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func restorePreviousApplicationIfNeeded() {
+    func restorePreviousApplicationIfNeeded() {
         let previous = previousApplication
         previousApplication = nil
-        guard NSApp.isActive else { return }
 
         DispatchQueue.main.async {
-            guard NSApp.isActive else { return }
+            // During `NSWindow.willClose` AppKit can already report the accessory app
+            // inactive while WindowServer still considers it frontmost. The old
+            // `NSApp.isActive` guard then discarded the remembered app and left Whisper
+            // owning the menu bar with no window. Conversely, if the user has already
+            // switched elsewhere, never pull them back merely because a delayed close
+            // callback fired.
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == ProcessInfo.processInfo.processIdentifier else { return }
             guard let previous, !previous.isTerminated else {
                 NSApp.deactivate()
                 return
@@ -213,6 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             withObservationTracking {
                 _ = controller.phase
                 _ = controller.settledAt
+                _ = controller.isRehearsing
             } onChange: { [weak self] in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
@@ -230,7 +258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let shouldShow = RecordingHUDController.shouldShow(
             phase: controller.phase,
             hasFocusedEditableInput: focusedInputMonitor.hasFocusedEditableInput,
-            isShowingSettledMark: controller.settledAt != nil
+            isShowingSettledMark: controller.settledAt != nil,
+            isRehearsing: controller.isRehearsing
         )
         if shouldShow {
             RecordingHUDController.shared.show()

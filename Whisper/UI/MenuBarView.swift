@@ -4,8 +4,6 @@ import SwiftUI
 struct MenuBarLabel: View {
     let controller: DictationController
     @ObservedObject var updater: AppUpdater
-    @Environment(\.openSettings) private var openSettings
-    @AppStorage("didPresentInviteEnrollment") private var didPresentInviteEnrollment = false
 
     var body: some View {
         // `.bottomTrailing` is for the 5pt error dot. The slash has to sit in the
@@ -50,41 +48,6 @@ struct MenuBarLabel: View {
         }
         .frame(width: 19, height: 18)
         .accessibilityLabel(accessibilityLabel)
-        .task {
-            guard InviteEnrollmentOnboarding.shouldPresentInvite(
-                inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
-                hasRelayToken: KeychainStore.hasRelayToken(),
-                hasAPIKey: KeychainStore.hasAPIKey(),
-                connectionModeWasChosen: AppSettings.connectionModeWasChosen,
-                connectionMode: AppSettings.shared.connectionMode
-            ),
-                  !didPresentInviteEnrollment else { return }
-            (NSApp.delegate as? AppDelegate)?.rememberCurrentFrontmostApplication()
-            NSApp.activate(ignoringOtherApps: true)
-            openSettings()
-
-            // Settings creation is asynchronous. One dispatch to the next run-loop
-            // turn is usually enough but is not a contract; on a cold first launch it
-            // could miss the window and permanently set the "presented" marker. Give
-            // SwiftUI a short bounded interval and persist the marker only after the
-            // window actually exists.
-            for _ in 0..<10 {
-                try? await Task.sleep(for: .milliseconds(50))
-                guard !Task.isCancelled else { return }
-                NSApp.activate(ignoringOtherApps: true)
-                let settingsWindow = NSApp.windows.first {
-                    $0.identifier?.rawValue.hasPrefix("com_apple_SwiftUI_Settings") == true
-                } ?? NSApp.windows.first {
-                    !($0 is NSPanel) && $0.styleMask.contains(.titled) && $0.level == .normal
-                }
-                if let settingsWindow {
-                    settingsWindow.makeKeyAndOrderFront(nil)
-                    settingsWindow.orderFrontRegardless()
-                    didPresentInviteEnrollment = true
-                    return
-                }
-            }
-        }
     }
 
     private var iconOpacity: Double {
@@ -189,6 +152,17 @@ struct MenuBarView: View {
                     }
                 }
             }
+        }
+
+        Button("使用指南…") {
+            // The guide stops opening itself once the user closes it, so this is the
+            // way back — including for anyone who could not finish it, on a Mac where
+            // Accessibility is denied by policy.
+            // Reviewing a finished setup must not hand the install a fresh setup debt.
+            OnboardingController.shared.present(
+                controller: controller,
+                tracksCompletion: !OnboardingGate.isCompleted
+            )
         }
 
         Button("设置…") {
