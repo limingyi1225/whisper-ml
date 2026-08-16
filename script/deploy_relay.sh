@@ -13,6 +13,7 @@ BACKUPS=/opt/whisper-relay-backups
 TOKEN_FILE=/opt/whisper-relay/device-tokens
 REGISTRY_FILE=/var/lib/whisper-relay/registry.json
 ADMIN_SOCKET=/run/whisper-relay/admin.sock
+UNIT_FILE=/etc/systemd/system/whisper-relay.service
 BASE_PATH="${RELAY_BASE_PATH:-/whisper-relay}"
 PUBLIC_HEALTH="${RELAY_PUBLIC_HEALTH:-https://limingyi.com/whisper-relay/healthz}"
 DEPLOY_LOCK_FILE=/run/lock/whisper-relay-deploy.lock
@@ -69,15 +70,17 @@ remote_ssh() {
   fi
 }
 
+# Two callers with opposite needs, so they are two functions.
+#
+# The explicit call at the end of a verified deploy must report an unhealthy lease as a
+# non-zero exit: the work is done, but it was not confidently serialised and the
+# operator has to know. The EXIT trap must do the reverse — its return value *becomes*
+# the script's exit status, so it can neither invent a failure after a good deploy nor
+# mask a real one.
 release_remote_lock() {
-  # Runs as the EXIT trap, whose return value *becomes* the script's exit status —
-  # so a lease that ends untidily after a finished deploy would report the whole
-  # release as failed, and a `return 0` here would hide a real failure. Carry the
-  # pending status through untouched.
-  local incoming=$?
   if [ "$REMOTE_LOCK_HELD" -ne 1 ]; then
     cleanup_remote_lock_temp
-    return "$incoming"
+    return 0
   fi
   # Closing the only writer gives the remote `cat` EOF. Its process exits, fd 8 closes,
   # and the kernel releases flock — including after local interruption or power loss.
@@ -88,10 +91,15 @@ release_remote_lock() {
   cleanup_remote_lock_temp
   if [ "$status" -ne 0 ]; then
     echo "!! remote deploy-lock lease ended unexpectedly (ssh exit $status)" >&2
-    # The work itself is already done or already rolled back, and the kernel releases
-    # the flock when the connection dies either way. Report it, do not restate it as
-    # the outcome of the release.
+    return 1
   fi
+}
+
+# The EXIT-trap face of the same release: carry the pending exit status through
+# untouched, whatever the lease did.
+release_remote_lock_quietly() {
+  local incoming=$?
+  release_remote_lock || true
   return "$incoming"
 }
 
@@ -147,7 +155,7 @@ acquire_remote_lock() {
   exit 1
 }
 
-trap release_remote_lock EXIT
+trap release_remote_lock_quietly EXIT
 
 restore_backup() {
   # The unit file is part of the version too. This deploy adds ExecReload=kill -HUP to
@@ -162,17 +170,26 @@ restore_backup() {
     cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src
     cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts
     cp -a $BACKUPS/env-$STAMP $ENV_FILE
-    cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service
+    cp -a $BACKUPS/unit-$STAMP $UNIT_FILE
     cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
     if [ '$CREATED_TOKEN_FILE' = 1 ]; then rm -f $TOKEN_FILE; fi
     systemctl daemon-reload
-    cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
+    # Prefer the snapshot: it is already known to pair with the restored lockfile, and
+    # a rollback is exactly the moment not to depend on the registry being reachable.
+    if [ -d $BACKUPS/modules-$STAMP ]; then
+      rm -rf $REMOTE_DIR/node_modules
+      cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules
+    else
+      cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
+    fi
     systemctl restart whisper-relay"
 }
 
 on_failure() {
   local status=$?
   trap - ERR
+  # A second Ctrl-C must not cut the rollback in half.
+  trap '' INT TERM HUP
   if [ "$REMOTE_DIRTY" -eq 0 ]; then
     echo "!! failed before the remote tree was touched (exit $status); nothing to roll back" >&2
     exit "$status"
@@ -182,11 +199,16 @@ on_failure() {
     echo "!! rolled back to $STAMP" >&2
   else
     echo "!! ROLLBACK ALSO FAILED — the relay is down; restore by hand:" >&2
-    echo "   ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'" >&2
+    echo "   ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP $UNIT_FILE; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; if [ -d $BACKUPS/modules-$STAMP ]; then rm -rf $REMOTE_DIR/node_modules; cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules; else cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; fi; systemctl restart whisper-relay'" >&2
   fi
   exit 1
 }
 trap on_failure ERR
+# A terminal Ctrl-C reaches EXIT but never ERR. Without these the lock is released, the
+# half-installed tree is left standing, and the second release Mac this lock exists to
+# exclude is free to start — and to snapshot that corrupted tree as *its* rollback
+# target. Signals route to the same handler, which rolls back before EXIT releases.
+trap on_failure INT TERM HUP
 
 echo "==> running tests before shipping"
 npm test
@@ -284,23 +306,35 @@ acquire_remote_lock
 echo "==> backing up current deployment on $HOST"
 # The manifests are part of the version. Backing up only src/ makes a "rollback" that
 # pairs old code with whatever dependencies the failed deploy installed.
-STAMP=$(remote_ssh "set -e
-  STAMP=\$(date +%Y%m%d-%H%M%S)
-  mkdir -p $BACKUPS/manifests-\$STAMP
-  cp -a $REMOTE_DIR/src $BACKUPS/src-\$STAMP
-  cp -a $ENV_FILE $BACKUPS/env-\$STAMP
-  cp -a /etc/systemd/system/whisper-relay.service $BACKUPS/unit-\$STAMP
-  # Disaster copy only — deliberately NOT in restore_backup: the allowlist is live
-  # data, not part of the code version, and 'rolling it back' would resurrect tokens
-  # revoked since the stamp. It exists so a lost file is recoverable by hand.
-  if [ -f $TOKEN_FILE ]; then cp -a $TOKEN_FILE $BACKUPS/device-tokens-\$STAMP; fi
-  # Also a disaster copy only. Enrollment state is live data: restoring an older copy
-  # would make used invites reusable and revive devices revoked after this deployment.
-  if [ -f $REGISTRY_FILE ]; then cp -a $REGISTRY_FILE $BACKUPS/enrollment-registry-\$STAMP; fi
-  cp -a $REMOTE_DIR/scripts $BACKUPS/scripts-\$STAMP
-  cp -a $REMOTE_DIR/package.json $REMOTE_DIR/package-lock.json $REMOTE_DIR/.env.example \
-     $BACKUPS/manifests-\$STAMP/
-  printf '%s' \"\$STAMP\"")
+capture_backup() {
+  remote_ssh "set -e
+    STAMP=\$(date +%Y%m%d-%H%M%S)
+    mkdir -p $BACKUPS/manifests-\$STAMP
+    cp -a $REMOTE_DIR/src $BACKUPS/src-\$STAMP
+    cp -a $ENV_FILE $BACKUPS/env-\$STAMP
+    cp -a $UNIT_FILE $BACKUPS/unit-\$STAMP
+    # Disaster copy only — deliberately NOT in restore_backup: the allowlist is live
+    # data, not part of the code version, and 'rolling it back' would resurrect tokens
+    # revoked since the stamp. It exists so a lost file is recoverable by hand.
+    if [ -f $TOKEN_FILE ]; then cp -a $TOKEN_FILE $BACKUPS/device-tokens-\$STAMP; fi
+    # Also a disaster copy only. Enrollment state is live data: restoring an older copy
+    # would make used invites reusable and revive devices revoked after this deployment.
+    if [ -f $REGISTRY_FILE ]; then cp -a $REGISTRY_FILE $BACKUPS/enrollment-registry-\$STAMP; fi
+    cp -a $REMOTE_DIR/scripts $BACKUPS/scripts-\$STAMP
+    # npm ci *deletes* node_modules before it installs, so a forward install that dies
+    # halfway leaves the box with no dependencies at all — and the rollback's own npm ci
+    # then has to succeed over the same network that just failed. This copy makes the
+    # rollback local: the tree here matches the package-lock.json in manifests-\$STAMP
+    # exactly, because both are snapshots of the same moment. 212K a deploy, pruned with
+    # everything else. Absent on a first-ever deploy, which the restore handles.
+    if [ -d $REMOTE_DIR/node_modules ]; then
+      cp -a $REMOTE_DIR/node_modules $BACKUPS/modules-\$STAMP
+    fi
+    cp -a $REMOTE_DIR/package.json $REMOTE_DIR/package-lock.json $REMOTE_DIR/.env.example \
+       $BACKUPS/manifests-\$STAMP/
+    printf '%s' \"\$STAMP\""
+}
+STAMP=$(capture_backup)
 echo "    backup stamp: $STAMP"
 
 echo "==> uploading src/ and scripts/"
@@ -402,7 +436,7 @@ remote_ssh "set -e
   sed -i '/^RELAY_DEVICE_TOKEN_HASHES=/d' $ENV_FILE
   grep -q '^RELAY_DEVICE_TOKEN_FILE=' $ENV_FILE \
     || printf 'RELAY_DEVICE_TOKEN_FILE=%s\n' '$TOKEN_FILE' >> $ENV_FILE
-  UNIT=/etc/systemd/system/whisper-relay.service
+  UNIT=$UNIT_FILE
   # Reconcile each scalar directive, rather than appending a second value only when the
   # exact desired line is absent. An old later RuntimeDirectoryMode=0755 would otherwise
   # override the new 0700 line even though all of the grep checks below passed.
@@ -453,108 +487,205 @@ remote_ssh "set -e
   systemctl is-active --quiet whisper-relay
   echo '    loopback ok, service stable'"
 
+# ---- one rule for all three public probes ------------------------------------------
+# The three checks below (health, enrollment, polish) each ask the same question: is the
+# thing that was just deployed broken, or is the path between here and it having a bad
+# minute? They used to answer it three different ways, and two of them were two-state —
+# a single 502 from Cloudflare counted as proof the new build was bad and triggered a
+# rollback plus a second restart of a relay that was fine.
+#
+# $1 names a function that makes one attempt and echoes "<verdict>\t<reason>\t<body>".
+# The verdict is pass, rollback (the relay itself answered, and answered wrongly) or
+# inconclusive (nothing that can be attributed to this build). A rollback needs *two*
+# attempts naming the same reason: one attempt is not evidence, and reasons are
+# normalised so that genuine repeats collapse onto the same string.
+#
+# Sets PROBE_DECISION (pass|rollback|inconclusive), PROBE_REASON (the last reason seen),
+# PROBE_BODY (the last body seen) and PROBE_ROLLBACK_REASON (the deterministic reason,
+# if any attempt named one — reported even when it was not reproduced, because an
+# operator should hear about it).
+probe_with_retries() {
+  local classify=$1
+  local attempt classification rest verdict reason
+  local rollback_reason="" matches=0
+  PROBE_DECISION=""
+  PROBE_REASON=""
+  PROBE_BODY=""
+  PROBE_ROLLBACK_REASON=""
+  for attempt in 1 2 3; do
+    classification=$("$classify")
+    verdict=${classification%%$'\t'*}
+    rest=${classification#*$'\t'}
+    reason=${rest%%$'\t'*}
+    PROBE_REASON=$reason
+    PROBE_BODY=${rest#*$'\t'}
+    if [ "$verdict" = pass ]; then
+      PROBE_DECISION=pass
+      return 0
+    fi
+    if [ "$verdict" = rollback ]; then
+      if [ "$rollback_reason" = "$reason" ]; then
+        matches=$((matches + 1))
+      else
+        rollback_reason=$reason
+        matches=1
+      fi
+    fi
+    echo "    attempt $attempt: $reason" >&2
+    [ "$attempt" -lt 3 ] && sleep 3
+  done
+  PROBE_ROLLBACK_REASON=$rollback_reason
+  if [ "$matches" -ge 2 ]; then
+    PROBE_DECISION=rollback
+  else
+    PROBE_DECISION=inconclusive
+  fi
+}
+
+# Separates "the relay answered, wrongly" from "something else answered instead". Only
+# the first says anything about the code just uploaded. Cloudflare's own 429 (the edge
+# IP is shared), a 000 transport failure, a gateway 5xx and an HTML WAF page are all
+# the second kind, however deterministic they look from here.
+probe_attempt_verdict() {
+  local code=$1 body=$2
+  case "${code:-}" in
+    ''|000|408|425|429|502|503|504|520|521|522|523|524|525|526|530)
+      printf 'inconclusive\thttp-%s' "${code:-none}"
+      return 0
+      ;;
+  esac
+  # Everything this relay says, including its failures, is JSON with one of these keys.
+  # Anything else on the wire came from nginx or the edge, whatever the status line says.
+  case "$body" in
+    *'"ok":'*|*'"code":'*|*'"error":'*) ;;
+    *)
+      printf 'inconclusive\tnot-a-relay-body-http-%s' "$code"
+      return 0
+      ;;
+  esac
+  printf 'rollback\thttp-%s' "$code"
+}
+
+report_unreproduced_failure() {
+  [ -n "$PROBE_ROLLBACK_REASON" ] || return 0
+  echo "   one attempt did name a deterministic failure ($PROBE_ROLLBACK_REASON)," >&2
+  echo "   but no other attempt reproduced it. Worth a look by hand." >&2
+}
+
+classify_public_health() {
+  local out code body
+  out=$(curl -sS -m 20 -w '\n%{http_code}' "$PUBLIC_HEALTH" || true)
+  code=$(printf '%s' "$out" | tail -n1)
+  body=$(printf '%s' "$out" | sed '$d')
+  if [ "$code" = 200 ] \
+    && [[ "$body" == *'"ok":true'* ]] \
+    && [[ "$body" == *'"enrollment":true'* ]]; then
+    printf 'pass\thttp-200\t%s' "$body"
+    return 0
+  fi
+  printf '%s\t%s' "$(probe_attempt_verdict "$code" "$body")" "$body"
+}
+
+classify_public_enrollment() {
+  local out code body
+  out=$(curl -sS -m 20 -w '\n%{http_code}' \
+    -H 'content-type: application/json' --data-binary '{' \
+    "$PUBLIC_ENROLLMENT" || true)
+  code=$(printf '%s' "$out" | tail -n1)
+  body=$(printf '%s' "$out" | sed '$d')
+  if [ "$code" = 400 ] && [[ "$body" == *'"code":"enrollment_invalid_request"'* ]]; then
+    printf 'pass\thttp-400-as-designed\t%s' "$body"
+    return 0
+  fi
+  printf '%s\t%s' "$(probe_attempt_verdict "$code" "$body")" "$body"
+}
+
+classify_polish_smoke() {
+  local out code body
+  # No -f: the status code and the body are both evidence. Feed the credential through
+  # curl's stdin config; an Authorization `-H` exposes the token in the process list.
+  out=$(printf 'header = "authorization: Bearer %s"\n' "$SMOKE_TOKEN" \
+    | curl --config - -sS -m 30 -w '\n%{http_code}' \
+    -H 'content-type: application/json' \
+    -d "$SMOKE_BODY" "$SMOKE_URL" || true)
+  code=$(printf '%s' "$out" | tail -n1)
+  body=$(printf '%s' "$out" | sed '$d')
+  # A crashing classifier is not evidence about the deployment either, but it should say
+  # so by name rather than arriving as an empty verdict that happens to read as one.
+  local verdict
+  verdict=$(printf '%s' "$body" | node "$ROOT_DIR/script/relay_smoke_verdict.mjs" "$code") \
+    || verdict=$'inconclusive\tsmoke-classifier-failed'
+  printf '%s\t%s' "$verdict" "$body"
+}
+
 echo "==> health check (public)"
 # The loopback check says the process is fine; only this one says the thing the app
 # actually dials is fine. It used to be `curl ... && echo`, where curl sits on the left
 # of an `&&` — a position `set -e` deliberately exempts — so TLS, Cloudflare or nginx
 # could all be broken and the script would still print "done" and exit 0.
 #
-# Retried before giving up: a rollback triggered by one flaky hop through Cloudflare
-# would be a self-inflicted outage of a perfectly good build. The body is matched too,
-# because an edge that answers 200 with its own page is not the relay answering.
-#
-# Captured into a variable rather than piped into grep: `grep -q` exits on the first
-# match, which SIGPIPEs curl, which under `pipefail` fails the whole pipeline — a
-# healthy relay reported as dead, and with the rollback now wired up that would take a
-# good build down.
-public_health_ok() {
-  local body
-  for attempt in 1 2 3; do
-    if body=$(curl -fsS -m 20 "$PUBLIC_HEALTH") \
-      && [[ "$body" == *'"ok":true'* ]] \
-      && [[ "$body" == *'"enrollment":true'* ]]; then
-      echo "    public ok: $body"
-      return 0
-    fi
-    echo "    attempt $attempt failed" >&2
-    [ "$attempt" -lt 3 ] && sleep 3
-  done
-  return 1
-}
-public_health_ok
+# The body is matched too, because an edge that answers 200 with its own page is not the
+# relay answering. Captured into a variable rather than piped into grep: `grep -q` exits
+# on the first match, which SIGPIPEs curl, which under `pipefail` fails the whole
+# pipeline — a healthy relay reported as dead.
+probe_with_retries classify_public_health
+case "$PROBE_DECISION" in
+  pass) echo "    public ok: $PROBE_BODY" ;;
+  rollback)
+    echo "!! public health check repeatedly proved a bad deployment" >&2
+    echo "   ($PROBE_ROLLBACK_REASON): $PROBE_BODY" >&2
+    false
+    ;;
+  *)
+    echo "!! public health check inconclusive after retries ($PROBE_REASON);" >&2
+    report_unreproduced_failure
+    echo "   the loopback check passed, so the relay process is up and this is the path" >&2
+    echo "   between here and it. Rolling back would not fix that and would cost another" >&2
+    echo "   restart, so the deployment is kept. Verify by hand." >&2
+    ;;
+esac
 
 echo "==> enrollment check (public route, deliberately invalid request)"
 PUBLIC_ENROLLMENT="${PUBLIC_HEALTH%/healthz}/v1/enroll"
-ENROLLMENT_PROBE=$(curl -sS -m 20 -w '\n%{http_code}' \
-  -H 'content-type: application/json' --data-binary '{' \
-  "$PUBLIC_ENROLLMENT" || true)
-ENROLLMENT_CODE=$(printf '%s' "$ENROLLMENT_PROBE" | tail -n 1)
-ENROLLMENT_BODY=$(printf '%s' "$ENROLLMENT_PROBE" | sed '$d')
-if [ "$ENROLLMENT_CODE" != 400 ] \
-  || [[ "$ENROLLMENT_BODY" != *'"code":"enrollment_invalid_request"'* ]]; then
-  echo "!! public enrollment route failed (HTTP ${ENROLLMENT_CODE:-none})" >&2
-  false
-fi
-echo "    public enrollment route ok"
+probe_with_retries classify_public_enrollment
+case "$PROBE_DECISION" in
+  pass) echo "    public enrollment route ok" ;;
+  rollback)
+    echo "!! public enrollment route repeatedly proved a bad deployment" >&2
+    echo "   ($PROBE_ROLLBACK_REASON): $PROBE_BODY" >&2
+    false
+    ;;
+  *)
+    echo "!! enrollment probe inconclusive after retries ($PROBE_REASON);" >&2
+    report_unreproduced_failure
+    echo "   local health and the admin socket passed, so the deployment is kept." >&2
+    echo "   No rollback or second restart was performed." >&2
+    ;;
+esac
 
 if [ -n "$SMOKE_TOKEN" ]; then
   echo "==> smoke test (a real /v1/polish round trip)"
   SMOKE_URL="${PUBLIC_HEALTH%/healthz}/v1/polish"
   SMOKE_BODY=$(printf '{"model":"%s","messages":[{"role":"system","content":"只输出整理后的文本。"},{"role":"user","content":"<transcript>嗯 部署 冒烟 测试</transcript>"}],"reasoning_effort":"none"}' "$POLISH_MODEL")
-  # This check has three outcomes. A valid client body proves the whole round trip. A
-  # deterministic contract/config failure rolls the artifact back. OpenAI, network and
-  # edge failures are retried and then reported as inconclusive without causing a second
-  # restart of an otherwise healthy relay. That distinction prevents an upstream 429 or
-  # 502 from becoming a self-inflicted outage for every live dictation.
-  SMOKE_FINAL_VERDICT=""
-  SMOKE_FINAL_REASON=""
-  SMOKE_ROLLBACK_REASON=""
-  SMOKE_ALL_SAME_ROLLBACK=1
-  for SMOKE_ATTEMPT in 1 2 3; do
-    # No -f: the status code and body are both evidence. Feed the credential through
-    # curl's stdin config; an Authorization `-H` exposes the token in the process list.
-    SMOKE_OUT=$(printf 'header = "authorization: Bearer %s"\n' "$SMOKE_TOKEN" \
-      | curl --config - -sS -m 30 -w '\n%{http_code}' \
-      -H 'content-type: application/json' \
-      -d "$SMOKE_BODY" "$SMOKE_URL" || true)
-    SMOKE_CODE=$(printf '%s' "$SMOKE_OUT" | tail -n1)
-    SMOKE_TEXT=$(printf '%s' "$SMOKE_OUT" | sed '$d')
-    SMOKE_CLASSIFICATION=$(printf '%s' "$SMOKE_TEXT" \
-      | node "$ROOT_DIR/script/relay_smoke_verdict.mjs" "$SMOKE_CODE")
-    SMOKE_VERDICT=${SMOKE_CLASSIFICATION%%$'\t'*}
-    SMOKE_REASON=${SMOKE_CLASSIFICATION#*$'\t'}
-
-    if [ "$SMOKE_VERDICT" = pass ]; then
-      SMOKE_FINAL_VERDICT=pass
-      SMOKE_FINAL_REASON=$SMOKE_REASON
-      break
-    fi
-    if [ "$SMOKE_VERDICT" = rollback ]; then
-      if [ -z "$SMOKE_ROLLBACK_REASON" ]; then
-        SMOKE_ROLLBACK_REASON=$SMOKE_REASON
-      elif [ "$SMOKE_ROLLBACK_REASON" != "$SMOKE_REASON" ]; then
-        SMOKE_ALL_SAME_ROLLBACK=0
-      fi
-    else
-      SMOKE_ALL_SAME_ROLLBACK=0
-    fi
-    SMOKE_FINAL_VERDICT=$SMOKE_VERDICT
-    SMOKE_FINAL_REASON=$SMOKE_REASON
-    echo "    smoke attempt $SMOKE_ATTEMPT: HTTP ${SMOKE_CODE:-none} ($SMOKE_REASON)" >&2
-    [ "$SMOKE_ATTEMPT" -lt 3 ] && sleep 3
-  done
-
-  if [ "$SMOKE_FINAL_VERDICT" = pass ]; then
-    echo "    polish ok ($POLISH_MODEL)"
-  elif [ "$SMOKE_FINAL_VERDICT" = rollback ] \
-    && [ "$SMOKE_ALL_SAME_ROLLBACK" -eq 1 ]; then
-    echo "!! smoke test repeatedly proved a bad deployment ($SMOKE_FINAL_REASON): $SMOKE_TEXT" >&2
-    false
-  else
-    echo "!! polish smoke inconclusive after retries ($SMOKE_FINAL_REASON);" >&2
-    echo "   local/public health and enrollment passed, so the deployment is kept." >&2
-    echo "   No rollback or second restart was performed." >&2
-  fi
+  # A valid client body proves the whole round trip. A deterministic contract or config
+  # failure, named twice, rolls the artifact back. OpenAI, network and edge failures are
+  # reported without causing a second restart of an otherwise healthy relay — an
+  # upstream 429 must not become a self-inflicted outage for every live dictation.
+  probe_with_retries classify_polish_smoke
+  case "$PROBE_DECISION" in
+    pass) echo "    polish ok ($POLISH_MODEL)" ;;
+    rollback)
+      echo "!! smoke test repeatedly proved a bad deployment" >&2
+      echo "   ($PROBE_ROLLBACK_REASON): $PROBE_BODY" >&2
+      false
+      ;;
+    *)
+      echo "!! polish smoke inconclusive after retries ($PROBE_REASON);" >&2
+      report_unreproduced_failure
+      echo "   local/public health and enrollment passed, so the deployment is kept." >&2
+      echo "   No rollback or second restart was performed." >&2
+      ;;
+  esac
 fi
 
 echo "==> pruning old backups (keeping the 10 most recent)"
@@ -564,6 +695,7 @@ echo "==> pruning old backups (keeping the 10 most recent)"
 remote_ssh "cd $BACKUPS 2>/dev/null || exit 0
   ls -1d src-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d scripts-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
+  ls -1d modules-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d manifests-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1 env-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   ls -1 unit-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
@@ -579,4 +711,4 @@ trap - ERR
 trap - EXIT
 release_remote_lock
 echo "==> done. rollback if needed:"
-echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP /etc/systemd/system/whisper-relay.service; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; systemctl restart whisper-relay'"
+echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP $UNIT_FILE; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; if [ -d $BACKUPS/modules-$STAMP ]; then rm -rf $REMOTE_DIR/node_modules; cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules; else cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; fi; systemctl restart whisper-relay'"

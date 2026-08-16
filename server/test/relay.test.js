@@ -72,21 +72,107 @@ test("deploy mutations share the flock owner's SSH connection and fail closed", 
   assert.match(tokenProbe, /else[\s\S]*false/);
 });
 
-test("deploy polish smoke separates bad artifacts from transient upstream failures", () => {
-  const deployScript = readFileSync(
-    new URL("../../script/deploy_relay.sh", import.meta.url),
-    "utf8",
-  );
-  assert.match(deployScript, /SMOKE_ALL_SAME_ROLLBACK=1/);
-  assert.match(
-    deployScript,
-    /\[ "\$SMOKE_ROLLBACK_REASON" != "\$SMOKE_REASON" \][\s\S]*SMOKE_ALL_SAME_ROLLBACK=0/,
-  );
-  assert.match(
-    deployScript,
-    /\[ "\$SMOKE_FINAL_VERDICT" = rollback \][\s\S]*\[ "\$SMOKE_ALL_SAME_ROLLBACK" -eq 1 \][\s\S]*false/,
+// Feeds scripted inputs to the decision functions lifted out of script/deploy_relay.sh
+// and executed for real. See server/test/deploy_decisions.sh for why these are not
+// regexes over the script's source any more.
+const deployDecisions = new URL("./deploy_decisions.sh", import.meta.url).pathname;
+function decide(mode, args = [], input = "") {
+  return execFileSync(deployDecisions, [mode, ...args], { input, encoding: "utf8" })
+    .trimEnd()
+    .split("\n");
+}
+
+test("a deploy rolls back only on a failure two probes independently agree on", () => {
+  const cases = [
+    ["pass:ok pass:ok pass:ok", "pass"],
+    ["rollback:http-404 pass:ok pass:ok", "pass"],
+    ["inconclusive:http-429 inconclusive:http-502 pass:ok", "pass"],
+    ["rollback:http-404 rollback:http-404 rollback:http-404", "rollback http-404"],
+    ["inconclusive:http-429 rollback:http-404 rollback:http-404", "rollback http-404"],
+    ["rollback:http-404 inconclusive:http-429 rollback:http-404", "rollback http-404"],
+    ["rollback:http-404 rollback:http-404 inconclusive:http-429", "rollback http-404"],
+    // One deterministic failure among noise is not yet evidence, and two *different*
+    // deterministic failures never confirm each other.
+    ["rollback:http-404 inconclusive:http-429 inconclusive:http-502", "inconclusive"],
+    ["inconclusive:http-429 inconclusive:http-429 inconclusive:http-429", "inconclusive"],
+    ["rollback:http-404 rollback:http-401 inconclusive:http-429", "inconclusive"],
+    ["rollback:http-404 rollback:missing-choices rollback:http-401", "inconclusive"],
+    ["rollback:http-404 rollback:http-401 rollback:http-401", "rollback http-401"],
+  ];
+  assert.deepEqual(
+    decide("retry", [], cases.map(([sequence]) => sequence).join("\n") + "\n"),
+    cases.map(([, expected]) => expected),
   );
 
+  // The last body seen has to survive the command substitution the classifier runs in:
+  // the rollback message quotes it, and "rollback (http-502):" with nothing after the
+  // colon tells an operator nothing.
+  assert.deepEqual(decide("body"), ["<html>bad gateway</html>"]);
+});
+
+test("only the relay's own answer is evidence about the relay's own build", () => {
+  // nginx and Cloudflare answer on the same URL as the relay, and their 404 means
+  // something entirely different from the relay's, so a status line alone cannot
+  // separate "the build is broken" from "the path to it is having a bad minute".
+  const cases = [
+    ["", "", "inconclusive"],
+    ["000", "", "inconclusive"],
+    ["429", "<html>error code: 1015</html>", "inconclusive"],
+    ["502", "<html><head><title>502 Bad Gateway</title></head>", "inconclusive"],
+    ["524", "<html>origin timeout</html>", "inconclusive"],
+    ["400", "<html>WAF blocked the request</html>", "inconclusive"],
+    ["404", "<html><title>404 Not Found</title>", "inconclusive"],
+    ["200", "<html>just the edge saying hello</html>", "inconclusive"],
+    // The status codes carry weight of their own: this relay never emits a gateway 5xx,
+    // so one came from the edge however JSON-shaped the body looks. Its own 429 is real,
+    // and still says nothing about whether the build is good.
+    ["502", '{"error":{"code":"bad_gateway"}}', "inconclusive"],
+    ["503", '{"error":{"code":"unavailable"}}', "inconclusive"],
+    ["429", '{"error":{"code":"rate_limited"}}', "inconclusive"],
+    // ...and these are the relay itself, answering wrongly.
+    ["404", '{"error":{"code":"relay_not_found"}}', "rollback"],
+    ["401", '{"error":{"code":"relay_unauthorized"}}', "rollback"],
+    ["400", '{"code":"something_other_than_the_contract"}', "rollback"],
+    ["500", '{"error":{"code":"relay_internal_error"}}', "rollback"],
+    ["200", '{"ok":false}', "rollback"],
+  ];
+  assert.deepEqual(
+    decide("attempt", [], cases.map(([code, body]) => code + "\t" + body).join("\n") + "\n"),
+    cases.map(([, , expected]) => expected),
+  );
+});
+
+test("a rollback restores the dependencies it saved instead of reinstalling them", () => {
+  // npm ci deletes node_modules before it installs, so a forward install that died
+  // halfway leaves the box with no dependencies at all — and answering that by running
+  // npm ci again makes the rollback depend on the same registry that just failed. The
+  // snapshot is known to pair with the restored lockfile, because both were taken in
+  // the same instant.
+  assert.deepEqual(decide("rollback", ["with-modules"]), [
+    "src: old",
+    "unit: old unit",
+    "modules: from-the-backup",
+    "npm: not-run",
+  ]);
+  // A first-ever deploy has no snapshot to restore; that path still has to work.
+  assert.deepEqual(decide("rollback", ["without-modules"]), [
+    "src: old",
+    "unit: old unit",
+    "modules: from-npm",
+    "npm: ran",
+  ]);
+
+  // The two halves are written a few hundred lines apart and the rollback can only
+  // restore what the backup thought to save, so run both against one tree with the
+  // deploy's own destruction in between.
+  assert.deepEqual(decide("roundtrip"), [
+    "src: old",
+    "modules: from-before-the-deploy",
+    "npm: not-run",
+  ]);
+});
+
+test("deploy polish smoke separates bad artifacts from transient upstream failures", () => {
   const valid = JSON.stringify({
     choices: [{ message: { content: "部署冒烟测试" } }],
   });
