@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreFoundation
 import Foundation
@@ -92,19 +93,66 @@ import Testing
         #expect(TextInjector.checkedAXElement(from: application) != nil)
     }
 
-    @Test func liveDeltasUseExactFieldAndInputOrderNotImmediateCaretAck() {
+    /// The rule three separate shipped regressions broke: a control that publishes no
+    /// focused element has not denied anything. `nil` must read like `true` here and
+    /// unlike `false`, or every sentence in an Electron or WebView editor is abandoned
+    /// on its first delta and dumped to the clipboard.
+    @Test func liveDeltasTreatAnUnobservableFieldAsPermissionNotRefusal() {
+        #expect(DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: nil
+        ))
         #expect(DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: true
         ))
+        // Silence is permission; a positive contradiction is not.
         #expect(!DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: false
+        ))
+        // The anchor is the one input with no third state, and it still governs.
+        #expect(!DictationController.canContinueLiveInjection(
+            anchorUnchanged: false,
+            exactElementFocused: nil
         ))
         #expect(!DictationController.canContinueLiveInjection(
             anchorUnchanged: false,
             exactElementFocused: true
         ))
+    }
+
+    /// Same rule on the destructive side, where getting it wrong is what "整理功能全面
+    /// 坏了" looked like: the raw deltas stay on screen and the cleaned sentence lands
+    /// on the clipboard instead.
+    @Test func aRewriteDeletesWhenTheDocumentIsSilentButNotWhenItDisagrees() {
+        #expect(DictationController.rewriteMayDelete(typedTextStillBeforeCaret: nil))
+        #expect(DictationController.rewriteMayDelete(typedTextStillBeforeCaret: true))
+        #expect(!DictationController.rewriteMayDelete(typedTextStillBeforeCaret: false))
+    }
+
+    /// A paste with no AX target at all is still a paste. Requiring one sent whole
+    /// classes of editors' transcripts to the clipboard on every single sentence.
+    @Test func aPasteWithNoAccessibilityTargetStillGoesToTheApp() throws {
+        let frontmost = try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        #expect(TextInjector.targetIsUnmoved(nil, targetPID: frontmost))
+        // The app identity is the part that must hold.
+        #expect(!TextInjector.targetIsUnmoved(nil, targetPID: frontmost &+ 10_000))
+    }
+
+    /// `nil` and `false` are different answers and the distinction has to survive the
+    /// helper every caller reads it through.
+    @Test func aRangeNobodyPublishedIsNotARangeThatMoved() {
+        let here = CFRange(location: 4, length: 0)
+        #expect(TextInjector.selectionProof(
+            snapshot: nil, current: here, insertedUTF16Count: 0
+        ) == nil)
+        #expect(TextInjector.selectionProof(
+            snapshot: here, current: nil, insertedUTF16Count: 0
+        ) == false)
+        #expect(TextInjector.selectionProof(
+            snapshot: here, current: here, insertedUTF16Count: 0
+        ) == true)
     }
 
     @Test func shortChinesePromptCannotBecomeAnEnglishAnswer() {

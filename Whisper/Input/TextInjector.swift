@@ -9,8 +9,14 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "inject")
 ///
 /// PID alone is not an insertion target: two fields in the same app share it, and an
 /// asynchronous transcript can arrive after focus has moved between them. This snapshot
-/// is captured once per utterance and every later synthetic write must prove it is still
-/// current. Targets that do not expose enough AX state fail closed to the clipboard.
+/// is captured once per utterance and strengthens every later synthetic write that can
+/// be checked against it.
+///
+/// It is evidence, never a precondition. A control that publishes state and contradicts
+/// this snapshot fails closed to the clipboard; a control that publishes none has not
+/// contradicted anything, and treating its silence as denial is what sent every sentence
+/// in whole classes of real editors to the clipboard instead of the document — three
+/// times, in three different guards.
 struct TextInjectionTarget {
     let element: AXUIElement
     let processIdentifier: pid_t
@@ -425,8 +431,13 @@ enum TextInjector {
     }
 
     /// Captures the exact field a new utterance is addressing, plus its selection when
-    /// the control exposes one. Returning nil means even element identity cannot be
-    /// proven and is never an invitation to fall back to PID-only injection.
+    /// the control exposes one.
+    ///
+    /// `nil` is a normal answer, not a failure: the system-wide focused-element read
+    /// returns `kAXErrorNoValue` for Electron and WebView editors, which is a large
+    /// share of where people actually dictate. It means no element evidence exists in
+    /// either direction, so callers fall back to the app-identity check rather than
+    /// refusing to write.
     static func captureTarget(expectedPID: pid_t) -> TextInjectionTarget? {
         let system = systemWideElement()
         var focusedValue: CFTypeRef?

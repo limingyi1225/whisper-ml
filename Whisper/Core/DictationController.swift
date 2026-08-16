@@ -302,9 +302,26 @@ final class DictationController {
     /// app may still report the pre-delta caret when the next network delta arrives.
     static func canContinueLiveInjection(
         anchorUnchanged: Bool,
-        exactElementFocused: Bool
+        exactElementFocused: Bool?
     ) -> Bool {
-        anchorUnchanged && exactElementFocused
+        // `nil` is a control that publishes no focused element to compare — the answer
+        // Electron and WebView editors give — and it is deliberately not disproof. The
+        // optional is resolved here rather than at the call site so a test can pin it;
+        // the three times this rule was inverted, it was inverted at a call site no
+        // test could reach.
+        anchorUnchanged && exactElementFocused != false
+    }
+
+    /// Whether the destructive half of a cleanup rewrite may post its backspaces.
+    ///
+    /// `false` is a control that answered and contradicted us: our keystrokes are no
+    /// longer what sits before the caret, so backspacing by our own count would cross
+    /// into the user's text. `nil` is a control that exposes no text range to answer
+    /// with, which is not the same thing — refusing on it leaves the raw deltas on
+    /// screen and strands the corrected sentence on the clipboard, which is what the
+    /// whole cleanup feature looks like when it is broken.
+    static func rewriteMayDelete(typedTextStillBeforeCaret: Bool?) -> Bool {
+        typedTextStillBeforeCaret != false
     }
 
     /// Ownership, not the previous utterance's presentation phase, decides whether a
@@ -805,7 +822,7 @@ final class DictationController {
               let current = currentAnchor(),
               Self.canContinueLiveInjection(
                 anchorUnchanged: injectionAnchor == current,
-                exactElementFocused: injectionTarget.map(TextInjector.targetIsStillFocused) ?? true
+                exactElementFocused: injectionTarget.map(TextInjector.targetIsStillFocused)
               ) else {
             injectionAbandoned = true
             log.info("the frozen field moved or foreign input arrived; stopping injection")
@@ -1322,27 +1339,22 @@ final class DictationController {
                 TextInjector.copyToClipboard(final)
                 return
             }
-            switch TextInjector.matchesTextImmediatelyBeforeCaret(
+            let typedTextProof = TextInjector.matchesTextImmediatelyBeforeCaret(
                 typed,
                 expectedProcessIdentifier: targetPID
-            ) {
-            case false:
+            )
+            guard Self.rewriteMayDelete(typedTextStillBeforeCaret: typedTextProof) else {
                 // The target app transformed our keystrokes (smart quotes/dashes,
                 // autocorrect, input-method composition). Backspacing by our original
                 // count could cross into the user's pre-existing text.
                 log.warning("typed text no longer matches the document; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
-            case nil:
-                // Some Electron/WebView controls do not expose text ranges through AX.
-                // That is silence, not denial, and it is the answer a large share of
-                // real editors give. Requiring a positive answer here strands every
-                // cleaned-up sentence on the clipboard while the raw deltas stay on
-                // screen — the whole cleanup feature reads as broken. The focus and
-                // foreign-input guards above are what protect this path there.
+            }
+            if typedTextProof == nil {
+                // The focus and foreign-input guards above are what protect this path
+                // for controls that expose no range at all.
                 log.info("target does not expose AX text ranges; reconciling with anchor checks only")
-            case true:
-                break
             }
             // The AX text query above can block for its full messaging timeout.
             // Confirm the field did not move while it did, immediately before posting
