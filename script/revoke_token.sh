@@ -224,6 +224,23 @@ for HASH in $HASHES; do
     exit 1
   fi
 done
+
+# Nothing matched. Say that, instead of reloading an unchanged file and reporting
+# "revoked and live … their socket dropped, nobody else disturbed" — every clause of
+# which would be true and none of which would mean what the operator came here for.
+#
+# Non-zero, because the two ways to get here are a mistyped name and a device that is
+# not in this list at all, and both are cases where believing the revoke worked is
+# worse than being told twice. Invite-enrolled devices live in a separate registry that
+# this script does not touch; healthz reports them as enrolledTokens.
+if [ "$BEFORE" -eq "$EXPECTED" ]; then
+  printf "    no hash for '%s' in the allowlist; nothing was revoked\n" "$NAME" >&2
+  printf '    (%s hashes left, unchanged. If this device enrolled by invite it is in\n' "$EXPECTED" >&2
+  printf '     the enrollment registry instead, which this script does not manage.)\n' >&2
+  abandon_candidate
+  exit 1
+fi
+
 if [ "$EXPECTED" -eq 0 ]; then
   # A genuinely blank/truncated file remains invalid. The exact marker is the only
   # explicit revoke-all representation, and the server accepts it only while invite
