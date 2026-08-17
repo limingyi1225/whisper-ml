@@ -121,7 +121,9 @@ test("only the relay's own answer is evidence about the relay's own build", () =
     ["502", "<html><head><title>502 Bad Gateway</title></head>", "inconclusive"],
     ["524", "<html>origin timeout</html>", "inconclusive"],
     ["400", "<html>WAF blocked the request</html>", "inconclusive"],
-    ["404", "<html><title>404 Not Found</title>", "inconclusive"],
+    // A lost route is attributable to the deploy that changed the routing, whichever
+    // hop answers it — and the smoke classifier says the same, which is the point.
+    ["404", "<html><title>404 Not Found</title>", "rollback"],
     ["200", "<html>just the edge saying hello</html>", "inconclusive"],
     // The status codes carry weight of their own: this relay never emits a gateway 5xx,
     // so one came from the edge however JSON-shaped the body looks. Its own 429 is real,
@@ -129,6 +131,13 @@ test("only the relay's own answer is evidence about the relay's own build", () =
     ["502", '{"error":{"code":"bad_gateway"}}', "inconclusive"],
     ["503", '{"error":{"code":"unavailable"}}', "inconclusive"],
     ["429", '{"error":{"code":"rate_limited"}}', "inconclusive"],
+    // The status the two classifiers used to disagree about: an edge 403 on the
+    // deliberately-malformed enrollment probe is a WAF rule, not a broken build.
+    ["403", '{"error":{"code":"relay_forbidden"}}', "inconclusive"],
+    ["403", '{"success":false,"error":"access denied"}', "inconclusive"],
+    ["409", '{"error":{"code":"conflict"}}', "inconclusive"],
+    ["301", '{"error":{"code":"moved"}}', "inconclusive"],
+    ["not-a-status", '{"error":{"code":"relay_internal_error"}}', "inconclusive"],
     // ...and these are the relay itself, answering wrongly.
     ["404", '{"error":{"code":"relay_not_found"}}', "rollback"],
     ["401", '{"error":{"code":"relay_unauthorized"}}', "rollback"],
@@ -170,6 +179,56 @@ test("a rollback restores the dependencies it saved instead of reinstalling them
     "modules: from-before-the-deploy",
     "npm: not-run",
   ]);
+});
+
+test("an interrupted rollback still leaves a tree to serve from", () => {
+  // Copy beside the live tree, then swap. The copy is the step that runs out of disk or
+  // gets cut off, and deleting first meant an interrupted rollback left no src/ at all.
+  assert.deepEqual(decide("interrupted"), [
+    "restore: failed",
+    "live src survived: new",
+  ]);
+  // And a rollback whose script came out empty must refuse rather than run nothing
+  // remotely and report success.
+  assert.deepEqual(decide("emptyscript"), [
+    "failing generator: refused",
+    "empty output: refused",
+  ]);
+});
+
+test("values spliced into a remote shell are checked before they get there", () => {
+  // Over there a quote or a semicolon runs as root, and two of these are extracted from
+  // Swift source by a regex that excludes double quotes but not single ones.
+  const cases = [
+    ["base-path", "/whisper-relay", "accept"],
+    ["base-path", "", "accept"],
+    ["base-path", "/a/b-c_d.e", "accept"],
+    ["base-path", "/x'; rm -rf /; echo '", "REJECT"],
+    ["base-path", "/bad;whoami", "REJECT"],
+    ["base-path", "/$(id)", "REJECT"],
+    ["base-path", "/a b", "REJECT"],
+    ["base-path", "no-leading-slash", "REJECT"],
+    // A traversal segment is shell-safe but collapses the two-path-form loopback check
+    // onto one URL, so the check that proves base-path routing works proves nothing.
+    ["base-path", "/..", "REJECT"],
+    ["base-path", "/../../etc/passwd", "REJECT"],
+    ["base-path", "/.", "REJECT"],
+    ["model", "gpt-5.6-luna", "accept"],
+    ["model", "gpt-4o-transcribe,whisper-1", "accept"],
+    ["model", "gpt-5.6'; id > /tmp/OWNED; echo '", "REJECT"],
+    ["model", "gpt-5.6 luna", "REJECT"],
+    ["model", "", "REJECT"],
+    // Captured from a remote shell's whole stdout, so a stray echo in a login file
+    // lands in it and then word-splits through every rollback command.
+    ["stamp", "20260816-120000", "accept"],
+    ["stamp", "warning: something on stdout", "REJECT"],
+    ["stamp", "", "REJECT"],
+    ["stamp", "20260816-120000 extra", "REJECT"],
+  ];
+  assert.deepEqual(
+    decide("validate", [], cases.map(([which, value]) => which + "\t" + value).join("\n") + "\n"),
+    cases.map(([, , expected]) => expected),
+  );
 });
 
 test("deploy polish smoke separates bad artifacts from transient upstream failures", () => {

@@ -13,6 +13,9 @@
 #   deploy_decisions.sh attempt    < lines of "code<TAB>body"
 #   deploy_decisions.sh rollback   with-modules | without-modules
 #   deploy_decisions.sh roundtrip
+#   deploy_decisions.sh validate   < lines of "which<TAB>value"
+#   deploy_decisions.sh interrupted
+#   deploy_decisions.sh emptyscript
 set -Eeuo pipefail
 
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/script/deploy_relay.sh"
@@ -26,7 +29,8 @@ lift() {
   ' "$SCRIPT"
 }
 
-for fn in probe_with_retries probe_attempt_verdict capture_backup restore_script restore_backup; do
+for fn in probe_with_retries probe_attempt_verdict valid_base_path valid_model_list \
+          valid_stamp capture_backup restore_script restore_backup; do
   eval "$(lift "$fn")"
   [ "$(type -t "$fn")" = function ] || { echo "could not lift $fn" >&2; exit 1; }
 done
@@ -171,8 +175,57 @@ case "${1:-}" in
     report_npm
     ;;
 
+  validate)
+    # Everything spliced into command text a remote shell re-parses. Over there a quote
+    # or a semicolon is root, so these guards are the whole defence and they are only
+    # worth having if a change that removes one fails something.
+    while IFS=$'\t' read -r which value; do
+      case "$which" in
+        base-path) if valid_base_path "$value"; then echo accept; else echo REJECT; fi ;;
+        model)     if valid_model_list "$value"; then echo accept; else echo REJECT; fi ;;
+        stamp)     if valid_stamp "$value"; then echo accept; else echo REJECT; fi ;;
+        *)         echo "unknown validator: $which" >&2; exit 2 ;;
+      esac
+    done
+    ;;
+
+  interrupted)
+    # The rollback copies beside the live tree and swaps, so a copy that dies partway
+    # must leave the live tree whole. Deleting first — which is what this did before —
+    # left no src/ at all: not the old version, not the new one, nothing to serve.
+    # Removing a backup makes the staging copy fail the same way a full disk would.
+    setup_fake_remote
+    STAMP=20260816-120000
+    printf 'new\n' > "$REMOTE_DIR/src/index.js"
+    mkdir -p "$BACKUPS/manifests-$STAMP" "$BACKUPS/scripts-$STAMP"
+    printf 'old env\n' > "$BACKUPS/env-$STAMP"
+    printf 'old unit\n' > "$BACKUPS/unit-$STAMP"
+    # ...and deliberately no src-$STAMP for the copy to read.
+    if restore_backup 2>/dev/null; then echo "restore: unexpectedly succeeded"; else echo "restore: failed"; fi
+    if [ -f "$REMOTE_DIR/src/index.js" ]; then
+      printf 'live src survived: %s\n' "$(cat "$REMOTE_DIR/src/index.js")"
+    else
+      echo "live src: GONE"
+    fi
+    ;;
+
+  emptyscript)
+    # A command substitution that fails expands to the empty string, and an empty remote
+    # script succeeds — a rollback that does nothing and reports that it worked.
+    setup_fake_remote
+    STAMP=20260816-120000
+    # Two ways to end up with no script, and they are caught by different guards. A
+    # failing generator is caught by the `|| return 1`; one that succeeds and prints
+    # nothing is caught only by the emptiness test, and that is the case that turns a
+    # rollback into a remote no-op reporting success.
+    restore_script() { return 1; }
+    if restore_backup 2>/dev/null; then echo "failing generator: reported success"; else echo "failing generator: refused"; fi
+    restore_script() { :; }
+    if restore_backup 2>/dev/null; then echo "empty output: reported success"; else echo "empty output: refused"; fi
+    ;;
+
   *)
-    echo "usage: $0 retry|body|attempt|rollback|roundtrip" >&2
+    echo "usage: $0 retry|body|attempt|rollback|roundtrip|validate|interrupted|emptyscript" >&2
     exit 2
     ;;
 esac

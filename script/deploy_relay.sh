@@ -39,6 +39,33 @@ REMOTE_LOCK_HELD=0
 REMOTE_LOCK_PID=""
 REMOTE_LOCK_TEMP=""
 
+# Anything spliced into command text that a *remote* shell re-parses has to be checked
+# here, because over there a quote or a semicolon is root. These are functions rather
+# than inline conditions so the test harness can lift and exercise them.
+#
+# `.` and `-` are legal inside a segment but a segment may not be `.` or `..`: the
+# loopback check curls both `/healthz` and `$BASE_PATH/healthz` to prove base-path
+# routing works, and a traversal segment collapses those two URLs into one, so the
+# check would pass without testing anything.
+valid_base_path() {
+  local candidate=$1
+  [[ "$candidate" =~ ^(/[A-Za-z0-9_.-]+)*$ ]] || return 1
+  [[ "$candidate" =~ (^|/)\.\.?(/|$) ]] && return 1
+  return 0
+}
+
+valid_model_list() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]
+}
+
+# `date +%Y%m%d-%H%M%S` on a host we already trust, but it is captured from a remote
+# shell's entire stdout — a stray `echo` in a login file lands in it — and it is then
+# interpolated bare into every rollback path, the one place that has to work when
+# things are already wrong.
+valid_stamp() {
+  [[ "$1" =~ ^[0-9]{8}-[0-9]{6}$ ]]
+}
+
 cleanup_remote_lock_temp() {
   [ -n "$REMOTE_LOCK_TEMP" ] || return 0
   rm -f "$REMOTE_LOCK_TEMP/hold" "$REMOTE_LOCK_TEMP/status" "$REMOTE_LOCK_TEMP/control"
@@ -111,7 +138,15 @@ acquire_remote_lock() {
   # The ssh process lives for the whole deploy. fd 8 owns the remote flock while `cat`
   # keeps the connection attached to our FIFO; there is no directory owner record that
   # can survive kill -9 and block every later deploy forever.
-  ssh -M -S "$REMOTE_LOCK_TEMP/control" \
+  # In a subshell that ignores the signals first, because `exec` keeps a SIG_IGN
+  # disposition and bash only sets SIGINT and SIGQUIT to SIG_IGN in asynchronous
+  # children when job control is off. SIGTERM and SIGHUP got the default, so a closed
+  # terminal or a `kill` on the process group killed the lock owner outright — measured
+  # — and every remote_ssh after that refuses on its own `kill -0` guard. The rollback
+  # that the INT/TERM/HUP trap exists to run could not run, which is the one moment the
+  # connection matters most.
+  ( trap '' INT QUIT TERM HUP
+    exec ssh -M -S "$REMOTE_LOCK_TEMP/control" \
     -o ControlMaster=yes -o ControlPersist=no \
     -o BatchMode=yes -o ConnectTimeout=10 \
     -o ServerAliveInterval=10 -o ServerAliveCountMax=2 \
@@ -119,7 +154,7 @@ acquire_remote_lock() {
     exec 8>$DEPLOY_LOCK_FILE
     if ! flock -n 8; then printf 'BUSY\n'; exit 73; fi
     printf 'LOCKED\n'
-    cat >/dev/null" \
+    cat >/dev/null" ) \
     < "$REMOTE_LOCK_TEMP/hold" > "$REMOTE_LOCK_TEMP/status" &
   REMOTE_LOCK_PID=$!
   # Bash 3.2 has no dynamic-fd syntax. fd 9 is intentionally reserved for this lease;
@@ -185,6 +220,10 @@ cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts.restoring
 # reachable. Absent only for a first-ever deploy.
 if [ -d $BACKUPS/modules-$STAMP ]; then
   cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules.restoring
+else
+  # Nothing to restore, and what is here belongs to the deploy that just failed —
+  # possibly half-installed, and in any case matched to the lockfile being replaced.
+  rm -rf $REMOTE_DIR/node_modules
 fi
 
 rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts
@@ -193,20 +232,40 @@ mv $REMOTE_DIR/scripts.restoring $REMOTE_DIR/scripts
 if [ -d $REMOTE_DIR/node_modules.restoring ]; then
   rm -rf $REMOTE_DIR/node_modules
   mv $REMOTE_DIR/node_modules.restoring $REMOTE_DIR/node_modules
-else
-  # No snapshot to restore, so the tree still standing here is whatever the failed
-  # deploy left — possibly half-installed, and in any case matched to the *new*
-  # lockfile rather than the one being restored. Reinstall from the restored one.
-  cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
 fi
 
+# Every cheap local restore happens before the one step that can block on the network.
+# Both orderings of that were wrong before: the fallback npm ci ran while
+# package-lock.json was still the *new* one, so a rollback of a dependency bump
+# installed the bumped tree under the old source and then overwrote the lockfile it had
+# just installed from; and when that npm ci failed — which it does for the same reason
+# the deploy did, a box that lost its network — `set -e` abandoned the rollback with the
+# new env file still in place. That env file has had RELAY_DEVICE_TOKEN_HASHES stripped
+# from it by this very deploy, so the restored old code, which reads exactly that
+# variable, comes back up rejecting every device.
 cp -a $BACKUPS/env-$STAMP $ENV_FILE
 cp -a $BACKUPS/unit-$STAMP $UNIT_FILE
 cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/
 if [ '$CREATED_TOKEN_FILE' = 1 ]; then rm -f $TOKEN_FILE; fi
 systemctl daemon-reload
+
+if [ ! -d $REMOTE_DIR/node_modules ]; then
+  # No snapshot existed, so whatever the failed deploy left has to go and be rebuilt
+  # from the lockfile restored just above.
+  cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund
+fi
 systemctl restart whisper-relay
 REMOTE
+}
+
+# Puts the rollback on the box as a runnable file. The by-hand instructions then point
+# at it instead of restating it: the previous arrangement kept three copies of the
+# sequence in step by hand, and both echoes had already drifted back to the delete-first
+# ordering that was removed for being unsafe, with no mention of the allowlist file at
+# all. Rewritten whenever CREATED_TOKEN_FILE can have changed, because that flag is
+# baked into the text.
+publish_restore_script() {
+  restore_script | remote_ssh "cat > $BACKUPS/restore-$STAMP.sh"
 }
 
 restore_backup() {
@@ -233,7 +292,7 @@ on_failure() {
     echo "!! rolled back to $STAMP" >&2
   else
     echo "!! ROLLBACK ALSO FAILED — the relay is down; restore by hand:" >&2
-    echo "   ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP $UNIT_FILE; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; if [ -d $BACKUPS/modules-$STAMP ]; then rm -rf $REMOTE_DIR/node_modules; cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules; else cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; fi; systemctl restart whisper-relay'" >&2
+    echo "   ssh $HOST bash $BACKUPS/restore-$STAMP.sh" >&2
   fi
   exit 1
 }
@@ -336,8 +395,20 @@ fi
 # semicolon in it would run as root on the relay host. Every other operator-settable
 # value either stays local (RELAY_PUBLIC_HEALTH) or is passed as a single argv entry
 # that ssh never re-parses (RELAY_SSH_HOST).
-if [[ ! "$BASE_PATH" =~ ^(/[A-Za-z0-9_.-]+)*$ ]]; then
+if ! valid_base_path "$BASE_PATH"; then
   echo "!! RELAY_BASE_PATH must be empty or /-separated path segments: $BASE_PATH" >&2
+  exit 2
+fi
+# Two lines below the env-file write this guard was written for, the same construct
+# interpolates these — and they come out of Swift source by regex, which excludes `"`
+# but not `'`. A model name carrying a quote closes the shell quoting and runs as root
+# on the relay at the next deploy.
+if ! valid_model_list "$POLISH_MODEL"; then
+  echo "!! the polish model name is not a plain model identifier: $POLISH_MODEL" >&2
+  exit 2
+fi
+if ! valid_model_list "$TRANSCRIPTION_MODELS"; then
+  echo "!! the transcription model list is not plain model identifiers: $TRANSCRIPTION_MODELS" >&2
   exit 2
 fi
 [ -n "$SMOKE_TOKEN" ] || echo "    RELAY_SKIP_SMOKE=1 — the smoke test will not run"
@@ -379,12 +450,26 @@ capture_backup() {
     printf '%s' \"\$STAMP\""
 }
 STAMP=$(capture_backup)
+if ! valid_stamp "$STAMP"; then
+  echo "!! the remote backup stamp is not a timestamp: ${STAMP:-<empty>}" >&2
+  echo "   (something on the relay writes to stdout for non-interactive shells)" >&2
+  exit 1
+fi
 echo "    backup stamp: $STAMP"
+publish_restore_script
 
 echo "==> uploading src/ and scripts/"
 REMOTE_DIRTY=1
 COPYFILE_DISABLE=1 tar czf - src scripts package.json package-lock.json .env.example \
-  | remote_ssh "set -e; mkdir -p $REMOTE_DIR; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; tar xzf - -C $REMOTE_DIR"
+  | remote_ssh "set -e
+  mkdir -p $REMOTE_DIR
+  # A rollback that was interrupted mid-copy leaves these behind, and nothing on the
+  # success path removed them — so a full spare copy of src, scripts and node_modules
+  # could sit here indefinitely, which is its own problem when the interruption was a
+  # full disk in the first place.
+  rm -rf $REMOTE_DIR/src.restoring $REMOTE_DIR/scripts.restoring $REMOTE_DIR/node_modules.restoring
+  rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts
+  tar xzf - -C $REMOTE_DIR"
 
 echo "==> installing dependencies from the uploaded lockfile"
 # Without this the box keeps whatever node_modules it already had, so a new or upgraded
@@ -424,6 +509,8 @@ else
   if [ "$TOKEN_FILE_STATUS" -eq 1 ]; then
     CREATED_TOKEN_FILE=1
     echo "    no allowlist file yet — this run creates it (and a rollback removes it)"
+    # The flag is interpolated into the published rollback, so it has to be republished.
+    publish_restore_script
   else
     echo "!! could not determine whether the live allowlist exists (exit $TOKEN_FILE_STATUS)" >&2
     false
@@ -592,14 +679,25 @@ probe_with_retries() {
 # the second kind, however deterministic they look from here.
 probe_attempt_verdict() {
   local code=$1 body=$2
-  case "${code:-}" in
-    ''|000|408|425|429|502|503|504|520|521|522|523|524|525|526|530)
-      printf 'inconclusive\thttp-%s' "${code:-none}"
-      return 0
-      ;;
-  esac
-  # Everything this relay says, including its failures, is JSON with one of these keys.
-  # Anything else on the wire came from nginx or the edge, whatever the status line says.
+  # An allowlist, like the smoke classifier next door. This one used to be a denylist —
+  # any status not named as transient, with a body merely containing a JSON-ish key,
+  # counted as deterministic — and the two therefore disagreed about the same response.
+  # The enrollment probe deliberately POSTs malformed JSON to a public route, which is
+  # exactly the shape a WAF rule flags, so a Cloudflare 403 reproduced on the second
+  # attempt and rolled back a relay that was fine.
+  [[ "$code" =~ ^[0-9]{3}$ ]] || {
+    printf 'inconclusive\thttp-%s' "${code:-none}"
+    return 0
+  }
+  # The route is gone. Whichever hop lost it, a deploy is what changed the routing, so
+  # this is attributable without needing the body to prove it.
+  if [ "$code" = 404 ]; then
+    printf 'rollback\thttp-404'
+    return 0
+  fi
+  # Everything else has to be the relay's own voice: a JSON body, on a status this
+  # relay actually answers these two routes with. An edge announces its own trouble
+  # with 403, 409, 3xx and the gateway 5xx range, and does it in HTML.
   case "$body" in
     *'"ok":'*|*'"code":'*|*'"error":'*) ;;
     *)
@@ -607,7 +705,10 @@ probe_attempt_verdict() {
       return 0
       ;;
   esac
-  printf 'rollback\thttp-%s' "$code"
+  case "$code" in
+    200|400|401|500) printf 'rollback\thttp-%s' "$code" ;;
+    *) printf 'inconclusive\thttp-%s' "$code" ;;
+  esac
 }
 
 report_unreproduced_failure() {
@@ -740,6 +841,7 @@ remote_ssh "cd $BACKUPS 2>/dev/null || exit 0
   ls -1d src-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d scripts-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1d modules-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
+  ls -1 restore-*.sh 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   ls -1d manifests-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf
   ls -1 env-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
   ls -1 unit-* 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
@@ -753,6 +855,9 @@ remote_ssh "cd $BACKUPS 2>/dev/null || exit 0
 # healthy verified service back. Disable both traps, then release explicitly.
 trap - ERR
 trap - EXIT
-release_remote_lock
+# Before the release, not after: the release can fail on its own, and `set -e` then took
+# the script out without ever telling the operator that the deploy they were watching
+# had in fact succeeded, or how to undo it.
 echo "==> done. rollback if needed:"
-echo "    ssh $HOST 'set -e; rm -rf $REMOTE_DIR/src $REMOTE_DIR/scripts; cp -a $BACKUPS/src-$STAMP $REMOTE_DIR/src; cp -a $BACKUPS/scripts-$STAMP $REMOTE_DIR/scripts; cp -a $BACKUPS/env-$STAMP $ENV_FILE; cp -a $BACKUPS/unit-$STAMP $UNIT_FILE; cp -a $BACKUPS/manifests-$STAMP/. $REMOTE_DIR/; systemctl daemon-reload; if [ -d $BACKUPS/modules-$STAMP ]; then rm -rf $REMOTE_DIR/node_modules; cp -a $BACKUPS/modules-$STAMP $REMOTE_DIR/node_modules; else cd $REMOTE_DIR && npm ci --omit=dev --no-audit --no-fund; fi; systemctl restart whisper-relay'"
+echo "    ssh $HOST bash $BACKUPS/restore-$STAMP.sh"
+release_remote_lock
