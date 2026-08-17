@@ -1372,11 +1372,18 @@ final class DictationController {
                 // controls that expose no range at all.
                 log.info("target does not expose AX text ranges; reconciling with anchor checks only")
             }
-            // The AX text query above can block for its full messaging timeout. Confirm
-            // the field did not move while it did, immediately before posting the
-            // destructive key events.
+            // The AX text query above can block for its full messaging timeout, so the
+            // verdict is re-taken immediately before the destructive key events. It has
+            // to re-read the *text*, not just the focus: the text is the dominant term,
+            // so once it says yes, re-reading only the focus confirms nothing and this
+            // second guard would be decorative. Reading it again is what the old
+            // identity re-check cost, and it is the same live control the backspaces
+            // will land in.
             guard Self.rewriteMayDelete(
-                typedTextStillBeforeCaret: typedTextProof,
+                typedTextStillBeforeCaret: TextInjector.matchesTextImmediatelyBeforeCaret(
+                    typed,
+                    expectedProcessIdentifier: targetPID
+                ),
                 sameElementStillFocused: injectionTarget.flatMap {
                     TextInjector.focusedElementMatches($0.element)
                 }

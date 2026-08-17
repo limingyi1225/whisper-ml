@@ -536,32 +536,35 @@ public enum KeychainStore {
         adoptedHighWater: Int?
     ) -> Bool {
         let previousToken = loadRelayToken()
-        let previousProvenance = load(account: relayTokenProvenanceAccount)
 
         guard save(token, account: relayTokenAccount) else { return false }
         guard saveRelayTokenProvenance(provenance, token: token, issuance: issuance) else {
+            // A failed `save` leaves its own item untouched: SecItemUpdate is atomic,
+            // and a SecItemAdd that fails adds nothing. So the provenance item still
+            // holds exactly what it held on entry. The item that may now be wrong is
+            // the token.
             let tokenRestored: Bool
             if let previousToken {
                 tokenRestored = save(previousToken, account: relayTokenAccount)
             } else {
                 tokenRestored = delete(account: relayTokenAccount)
             }
-            // The invariant worth protecting is that provenance never describes a token
-            // that is not the stored one. Putting the old record back is right only if
-            // the old token went back with it; if that second write failed too — the
-            // same transient condition that broke the first one, a locked login
-            // keychain — then the *new* token is live and the old record would misname
-            // it. A record bound to the wrong token fails its digest check and reads as
-            // unprovenanced, which quietly forfeits the protection an explicitly
-            // entered credential is supposed to have. Absent is the honest answer.
-            if tokenRestored, let previousProvenance {
-                _ = save(previousProvenance, account: relayTokenProvenanceAccount)
-            } else {
-                _ = delete(account: relayTokenProvenanceAccount)
+            if tokenRestored {
+                // Back to the credential we started with, still described by the record
+                // that was never overwritten. Nothing to repair — and nothing to clear
+                // either: a record this function could not read is not a record it
+                // knows to be wrong, and clearing one that still matches would demote a
+                // deliberately entered credential to unprovenanced, which is exactly
+                // what makes it eligible for silent replacement by a bundled token.
+                return false
             }
-            if !tokenRestored {
-                log.error("credential rollback failed; the new token is live but unprovenanced")
-            }
+            // The new token is live in spite of the failure. Describe *it*, rather than
+            // leaving a record about the token that is no longer stored. Deleting that
+            // record instead would buy nothing: every read digest-checks against the
+            // stored token, so a record about some other token already reads as no
+            // record at all.
+            log.error("credential rollback failed; repairing provenance for the live token")
+            _ = saveRelayTokenProvenance(provenance, token: token, issuance: issuance)
             return false
         }
 
