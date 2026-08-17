@@ -158,6 +158,44 @@ import Testing
         ))
     }
 
+    /// The re-read added before the backspaces must not be able to *withdraw* a proof.
+    /// A control that answered "yes, our text is before the caret" and then timed out
+    /// on the second look reports `nil`, and falling back to element identity there
+    /// refuses every app that rebuilds its accessibility tree — which is nearly all of
+    /// them, and is the outage this whole path exists to prevent.
+    @Test func aSlowSecondLookCannotWithdrawAProofAlreadyGiven() {
+        // Timed out, or never asked: the earlier `true` still stands, even against an
+        // element the system now says is a different one.
+        for element in [nil, true, false] as [Bool?] {
+            #expect(DictationController.rewriteMayStillDelete(
+                firstTextProof: true, recheckedTextProof: nil, sameElementStillFocused: element
+            ))
+        }
+        // But a re-read that actually answers is why the re-read is there.
+        #expect(!DictationController.rewriteMayStillDelete(
+            firstTextProof: true, recheckedTextProof: false, sameElementStillFocused: true
+        ))
+        // With no text evidence at any point, the element term decides, and only its
+        // explicit "some other element" refuses.
+        #expect(DictationController.rewriteMayStillDelete(
+            firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: nil
+        ))
+        #expect(!DictationController.rewriteMayStillDelete(
+            firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: false
+        ))
+
+        // And the element term is not to be evaluated when the text has already
+        // answered: obtaining it costs a blocking cross-process message on the main run
+        // loop, long enough that the system can disable the event tap underneath us.
+        var elementReads = 0
+        _ = DictationController.rewriteMayStillDelete(
+            firstTextProof: true,
+            recheckedTextProof: nil,
+            sameElementStillFocused: { elementReads += 1; return false }()
+        )
+        #expect(elementReads == 0)
+    }
+
     /// `elementIsStillFocused` answers one question with two very different failures
     /// folded together, and the destructive path used to consume it that way. An
     /// Electron or WebView target publishes no focused element at all — that is the
@@ -167,21 +205,38 @@ import Testing
         let unrelated = AXUIElementCreateApplication(
             try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier) &+ 10_000
         )
-        // The decision itself, where "nothing published" is reachable. A test cannot
-        // make the live system stop publishing a focused element on demand.
-        #expect(TextInjector.focusedElementVerdict(focused: nil, expected: unrelated) == nil)
-        #expect(TextInjector.focusedElementVerdict(focused: unrelated, expected: unrelated) == true)
-        let other = AXUIElementCreateApplication(
-            try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier) &+ 20_000
-        )
+        let pid = try #require(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        let other = AXUIElementCreateApplication(pid &+ 20_000)
+
+        // The comparison. A *separately created* element for the same target is the
+        // case that matters: the live query always hands back a fresh object, never the
+        // pointer captured at the start of the utterance, so comparing by pointer
+        // identity instead of CFEqual would answer false for the correct field every
+        // single time. Passing one object as both arguments cannot tell those apart.
+        let sameTargetAgain = AXUIElementCreateApplication(pid &+ 10_000)
+        #expect(TextInjector.focusedElementVerdict(focused: sameTargetAgain, expected: unrelated) == true)
         #expect(TextInjector.focusedElementVerdict(focused: other, expected: unrelated) == false)
+        #expect(TextInjector.focusedElementVerdict(focused: nil, expected: unrelated) == nil)
+
+        // And the branch that decides what an AX *failure* means, which is the one this
+        // rule keeps getting inverted on. No test can make the running system stop
+        // publishing a focused element, so the query's own failure handling has to be
+        // reachable separately or it goes unchecked — a mutant returning `false` here
+        // breaks cleanup in every Electron target and passes everything else.
+        #expect(TextInjector.focusedElementResult(
+            status: .cannotComplete, value: nil, expected: unrelated) == nil)
+        #expect(TextInjector.focusedElementResult(
+            status: .noValue, value: nil, expected: unrelated) == nil)
+        #expect(TextInjector.focusedElementResult(
+            status: .success, value: nil, expected: unrelated) == nil)
+        #expect(TextInjector.focusedElementResult(
+            status: .success, value: sameTargetAgain, expected: unrelated) == true)
+        #expect(TextInjector.focusedElementResult(
+            status: .success, value: other, expected: unrelated) == false)
 
         // An application element is never the focused *text* element, so the live query
-        // is either nil or false — never true — and the collapsing wrapper must agree
-        // with the tri-state source it is built on.
+        // is either nil or false — never true.
         #expect(TextInjector.focusedElementMatches(unrelated) != true)
-        #expect(TextInjector.elementIsStillFocused(unrelated)
-                == (TextInjector.focusedElementMatches(unrelated) == true))
     }
 
     /// A paste with no AX target at all is still a paste. Requiring one sent whole

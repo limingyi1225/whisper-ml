@@ -332,12 +332,38 @@ final class DictationController {
     /// nothing, which is not the same thing; refusing on it leaves the raw deltas on
     /// screen and strands the corrected sentence on the clipboard, which is what the
     /// whole cleanup feature looks like when it is broken.
+    /// The element term is an autoclosure because obtaining it costs a blocking
+    /// cross-process AX message on the main run loop, and whenever the text answered at
+    /// all it cannot change the outcome. Evaluating it anyway held the run loop — and
+    /// with it the event tap — for a fifth of a second to compute something unused.
     static func rewriteMayDelete(
         typedTextStillBeforeCaret: Bool?,
-        sameElementStillFocused: Bool?
+        sameElementStillFocused: @autoclosure () -> Bool?
     ) -> Bool {
         if let typedTextStillBeforeCaret { return typedTextStillBeforeCaret }
-        return sameElementStillFocused != false
+        return sameElementStillFocused() != false
+    }
+
+    /// The second guard's verdict, taken between two blocking AX reads where no test
+    /// can reach it — which is why it is here and not inline.
+    ///
+    /// `recheckedTextProof` is `nil` in two situations that look identical from here:
+    /// the control was never asked again, because one that published no range will not
+    /// publish one 200 ms later; or it was asked and timed out. Neither is a reason to
+    /// overturn a proof already in hand. Letting `nil` fall through to the element term
+    /// would refuse every app that rebuilds its accessibility tree around the text just
+    /// typed into it — a control that answered `true` a moment ago, refused because the
+    /// second look was slow. An explicit `false` from the re-read still refuses, which
+    /// is the whole reason the re-read exists.
+    static func rewriteMayStillDelete(
+        firstTextProof: Bool?,
+        recheckedTextProof: Bool?,
+        sameElementStillFocused: @autoclosure () -> Bool?
+    ) -> Bool {
+        rewriteMayDelete(
+            typedTextStillBeforeCaret: recheckedTextProof ?? firstTextProof,
+            sameElementStillFocused: sameElementStillFocused()
+        )
     }
 
     /// Ownership, not the previous utterance's presentation phase, decides whether a
@@ -1373,17 +1399,26 @@ final class DictationController {
                 log.info("target does not expose AX text ranges; reconciling with anchor checks only")
             }
             // The AX text query above can block for its full messaging timeout, so the
-            // verdict is re-taken immediately before the destructive key events. It has
-            // to re-read the *text*, not just the focus: the text is the dominant term,
-            // so once it says yes, re-reading only the focus confirms nothing and this
-            // second guard would be decorative. Reading it again is what the old
-            // identity re-check cost, and it is the same live control the backspaces
-            // will land in.
-            guard Self.rewriteMayDelete(
-                typedTextStillBeforeCaret: TextInjector.matchesTextImmediatelyBeforeCaret(
+            // verdict is re-taken immediately before the destructive key events, and it
+            // re-reads the *text*: with a text proof in hand the focus term cannot
+            // change the answer, so re-reading only the focus would confirm nothing.
+            //
+            // Two things keep that re-read from costing more than it is worth. A
+            // control that published no range the first time will not publish one 200 ms
+            // later, so it is not asked again. And a re-read that times out answers
+            // `nil`, which must not be allowed to overturn the `true` already in hand —
+            // falling back to identity there would refuse every app that rebuilds its
+            // accessibility tree, which is the failure this whole path exists to avoid.
+            // An explicit `false` from the re-read still refuses, which is the point.
+            let recheckedTextProof = typedTextProof == nil
+                ? nil
+                : TextInjector.matchesTextImmediatelyBeforeCaret(
                     typed,
                     expectedProcessIdentifier: targetPID
-                ),
+                )
+            guard Self.rewriteMayStillDelete(
+                firstTextProof: typedTextProof,
+                recheckedTextProof: recheckedTextProof,
                 sameElementStillFocused: injectionTarget.flatMap {
                     TextInjector.focusedElementMatches($0.element)
                 }

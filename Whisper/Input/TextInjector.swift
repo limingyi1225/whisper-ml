@@ -626,26 +626,32 @@ enum TextInjector {
     /// is a real focus move. Callers that can obtain text evidence should prefer it and
     /// consult this only when the control offers none.
     static func focusedElementMatches(_ element: AXUIElement) -> Bool? {
-        let system = systemWideElement()
         var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            system,
+        let status = AXUIElementCopyAttributeValue(
+            systemWideElement(),
             kAXFocusedUIElementAttribute as CFString,
             &focusedValue
-        ) == .success, let focusedValue,
-              CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
-            return focusedElementVerdict(focused: nil, expected: element)
-        }
-        return focusedElementVerdict(
-            focused: (focusedValue as! AXUIElement),
-            expected: element
         )
+        return focusedElementResult(status: status, value: focusedValue, expected: element)
     }
 
-    /// The `nil`-vs-`false` decision on its own, away from the AX call that produces it.
-    /// A test cannot make the running system publish no focused element on demand, so
-    /// the branch that matters most is unreachable while it stays welded to the query —
-    /// and an unreachable branch is exactly where this rule got inverted before.
+    /// Everything the query decides, including which verdict an AX *failure* produces,
+    /// in one place a test can steer. Splitting only the comparison out was not enough:
+    /// it left the branch that has actually been inverted three times — the one that
+    /// runs when the system answers nothing — welded to a call no test can make fail,
+    /// and a mutant that returned `false` there passed the whole suite while breaking
+    /// cleanup in every Electron target.
+    static func focusedElementResult(
+        status: AXError,
+        value: CFTypeRef?,
+        expected: AXUIElement
+    ) -> Bool? {
+        guard status == .success else { return nil }
+        return focusedElementVerdict(focused: checkedAXElement(from: value), expected: expected)
+    }
+
+    /// The `nil`-vs-`false` comparison on its own. `nil` in means the system named
+    /// nothing, which is not a statement about focus.
     static func focusedElementVerdict(focused: AXUIElement?, expected: AXUIElement) -> Bool? {
         guard let focused else { return nil }
         return CFEqual(focused, expected)
