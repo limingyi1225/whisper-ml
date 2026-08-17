@@ -141,15 +141,30 @@ public final class TranscriptPolisher {
         // in between — the plausibility check below is sized against this same one.
         let vocabulary = DictationEnvironment.settings.vocabularyTerms
 
-        // The gpt-5 family will otherwise spend reasoning tokens on what is a purely
-        // mechanical edit, which multiplies the wait. The second attempt drops the
-        // parameter. Both attempts share one deadline so a dead network cannot keep
-        // an obsolete utterance alive for two full URLSession timeouts.
+        // `low`, and pinned rather than left to the server's default. 210 interleaved
+        // calls over 21 cases (2026-08-17) say it is free: median 932ms against 922ms
+        // for `none`, p90 1250ms against 1144ms, and the only call in either arm to
+        // pass 4s was a `none` one. It is free because luna mostly declines to reason
+        // on an utterance this short — 4 of 105 calls spent any reasoning tokens at
+        // all. But all four landed on the one case neither arm could otherwise repair
+        // (日子 for 日志, 0/5 under `none`, which twice invented 例子 instead), and all
+        // four repaired it. So the parameter buys a rare, targeted rescue of exactly
+        // the misheard-homophone case cleanup is worst at, for no measurable latency.
+        //
+        // Those cases were all short, 10–20 characters. A long utterance is likelier to
+        // trigger reasoning, so treat that p90 as a floor rather than a ceiling.
+        //
+        // Leaving the field off entirely is not the same thing: that hands the request
+        // to the server's default effort, which is what the original `none` existed to
+        // avoid. Only an outright rejection is allowed to fall back to it.
+        //
+        // Both attempts share one deadline so a dead network cannot keep an obsolete
+        // utterance alive for two full URLSession timeouts.
         let first = await request(
             raw,
             vocabulary: vocabulary,
             route: route,
-            suppressReasoning: true,
+            constrainsReasoning: true,
             deadline: deadline,
             timeout: Self.firstAttemptTimeout
         )
@@ -162,9 +177,10 @@ public final class TranscriptPolisher {
         case .reasoningParameterRejected, .retryableFailure:
             guard deadline.timeIntervalSinceNow > 0.1 else { return .unchanged(notice: nil) }
             // Drop the reasoning parameter only when the server actually rejected
-            // it. A plain transient failure (5xx/429/timeout) keeps suppression:
-            // paying full reasoning latency on the retry usually blows what is
-            // left of the shared deadline, defeating the retry entirely.
+            // it. A plain transient failure (5xx/429/timeout) keeps the effort
+            // pinned: falling back to the server's default on the retry usually
+            // blows what is left of the shared deadline, defeating the retry
+            // entirely.
             let parameterWasRejected =
                 if case .reasoningParameterRejected = first { true } else { false }
             // No cap on the retry: it has the rest of the deadline, and by here it is
@@ -173,7 +189,7 @@ public final class TranscriptPolisher {
                 raw,
                 vocabulary: vocabulary,
                 route: route,
-                suppressReasoning: !parameterWasRejected,
+                constrainsReasoning: !parameterWasRejected,
                 deadline: deadline
             )
             switch second {
@@ -206,7 +222,7 @@ public final class TranscriptPolisher {
         _ raw: String,
         vocabulary: [String],
         route: ServiceRoute,
-        suppressReasoning: Bool,
+        constrainsReasoning: Bool,
         deadline: Date,
         timeout: TimeInterval = .infinity
     ) async -> RequestResult {
@@ -228,8 +244,8 @@ public final class TranscriptPolisher {
                 ["role": "user", "content": "<transcript>\n\(raw)\n</transcript>"],
             ],
         ]
-        if suppressReasoning {
-            body["reasoning_effort"] = "none"
+        if constrainsReasoning {
+            body["reasoning_effort"] = "low"
         }
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -243,7 +259,7 @@ public final class TranscriptPolisher {
             guard http.statusCode == 200 else {
                 let detail = String(data: data, encoding: .utf8) ?? ""
                 log.error("polish HTTP failure: \(detail.prefix(300), privacy: .public)")
-                if suppressReasoning,
+                if constrainsReasoning,
                    http.statusCode == 400,
                    detail.localizedCaseInsensitiveContains("reasoning_effort") {
                     return .reasoningParameterRejected
