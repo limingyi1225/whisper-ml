@@ -192,7 +192,6 @@ final class RecordingHUDController {
 
 struct RecordingHUDView: View {
     let controller: DictationController
-    @Environment(\.colorScheme) private var colorScheme
     @State private var shellExpansion: CGFloat = 0
     @State private var waveformVisible = false
 
@@ -307,8 +306,9 @@ struct RecordingHUDView: View {
         }
     }
 
+    /// The pill is dark in both appearances, so the line that rims it is the same line
+    /// in both: white, at the same strength. It used to be gated to dark mode.
     private var restingOutlineOpacity: Double {
-        guard colorScheme == .dark else { return 0 }
         switch state {
         case .idle, .arming, .listening, .transcribing:
             let restingAmount = min(max(1 - shellExpansion, 0), 1)
