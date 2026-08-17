@@ -530,6 +530,21 @@ test("polish requests are restricted to the allowlisted shape", () => {
     validatePolishBody({ ...valid, model: "gpt-5.6-sol" }, config),
     /not allowed/,
   );
+  // Both live app generations have to get through: shipped copies send `none` until
+  // they update themselves, current ones send `low`. Anything above that is refused,
+  // which is the whole point of pinning the field at all.
+  assert.equal(validatePolishBody({ ...valid, reasoning_effort: "low" }, config), null);
+  assert.equal(
+    validatePolishBody({ ...valid, reasoning_effort: undefined }, config),
+    null,
+  );
+  for (const effort of ["medium", "high", "minimal", ""]) {
+    assert.match(
+      validatePolishBody({ ...valid, reasoning_effort: effort }, config),
+      /reasoning_effort/,
+      `reasoning_effort ${JSON.stringify(effort)} must be refused`,
+    );
+  }
 });
 
 test("Realtime validation permits transcription but rejects arbitrary sessions", () => {

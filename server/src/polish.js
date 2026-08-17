@@ -2,6 +2,15 @@ import { errorBody, readBody, writeJSON } from "./http.js";
 
 const ALLOWED_BODY_KEYS = new Set(["model", "messages", "reasoning_effort"]);
 
+/// Both values are live, and both have to stay live. The app moved from `none` to
+/// `low` (measured: no latency cost, and it repairs misheard homophones `none`
+/// leaves alone), but every already-installed copy keeps sending `none` until it
+/// updates itself — narrowing this to one value would break cleanup on exactly the
+/// versions that have not picked up the change yet. The set stays closed regardless:
+/// `medium` and `high` are what turn a 1s cleanup into a wait the user feels, on a
+/// key that is not theirs.
+const ALLOWED_REASONING_EFFORT = new Set(["none", "low"]);
+
 /// Chinese lead, English detail in parentheses — same reasoning as `REJECT` in
 /// realtime.js: the app surfaces `error.message` verbatim as the cleanup notice.
 /// `reasoning_effort` must stay spelled out in that message: the app probes for it in
@@ -32,7 +41,8 @@ export function validatePolishBody(body, config) {
   if (typeof body.model !== "string" || !config.allowedPolishModels.has(body.model)) {
     return REJECT.model;
   }
-  if (body.reasoning_effort !== undefined && body.reasoning_effort !== "none") {
+  if (body.reasoning_effort !== undefined
+      && !ALLOWED_REASONING_EFFORT.has(body.reasoning_effort)) {
     return REJECT.reasoning;
   }
   if (!Array.isArray(body.messages) || body.messages.length !== 2) {
