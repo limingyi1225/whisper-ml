@@ -9,6 +9,23 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.8</title>
+            <pubDate>Mon, 17 Aug 2026 11:14:27 +0800</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.8</link>
+            <sparkle:version>9</sparkle:version>
+            <sparkle:shortVersionString>1.8</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[改进：文字整理现在能多修一些语音识别听错的同音字。
+
+以前它主要在错得离谱、句子明显讲不通的时候才动手（「这个借口返回的是一个数组」会改成「接口」）。但听错之后句子照样通顺的那种，它多半就照抄过去了——比如你说的是「看一下日志里有没有报错」，转写成「日子」，读着不别扭，就留下了。
+
+现在整理这一步会多花一点判断力在这类词上。实测速度没有变化，中位数仍然是 0.9 秒。
+
+这是小幅改善，不是全解决。整理仍然只在有把握时才改字，拿不准的会保持原样。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.8/Whisper-1.8-9.dmg" length="3286413" type="application/octet-stream" sparkle:edSignature="qDa9cODULjjVpcf4k37Zmj3GLPvbuEMLHgnfyRtUQo6+FKnG62m6vPmv37PYgwaPDlz0NOcM36Yg9zgWqM5ODA=="/>
+        </item>
+        <item>
             <title>1.7</title>
             <pubDate>Fri, 14 Aug 2026 22:19:18 +0800</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.7</link>
@@ -80,6 +97,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: zQuDaOAaymFwZvRVUmQeI13ZpCc7xyt+q7yvIFp/NzNbD+IK55prK1HpmkZAPtvod5EzbQoLdnvamlgJzlQJBA==
-length: 5965
+edSignature: CPUHDmVLNwvkQQ+c54Njv3yCZRcPYXzHPQ/s+uAcwl89h2hss7/CDoI3wzGK8WfYGG/uWlKO0IbMqW0eKnRbDg==
+length: 7380
 -->
