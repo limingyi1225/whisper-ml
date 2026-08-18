@@ -321,7 +321,7 @@ struct RecordingHUDView: View {
     private var width: CGFloat {
         switch state {
         case .idle, .arming, .listening, .transcribing:
-            return 46 + 38 * shellExpansion
+            return 54 + 30 * shellExpansion
         case .polishing, .settled:
             return 84
         // Sized against the longest message the app can actually produce, measured
@@ -334,7 +334,7 @@ struct RecordingHUDView: View {
     private var height: CGFloat {
         switch state {
         case .idle, .arming, .listening, .transcribing:
-            return 4 + 8 * shellExpansion
+            return 5 + 7 * shellExpansion
         case .polishing, .settled:
             return 12
         case .failed: return 18
@@ -412,9 +412,11 @@ private struct PolishPill: View {
 
     private static let expandedWidth: CGFloat = 84
     private static let expandedHeight: CGFloat = 12
-    private static let restingWidth: CGFloat = 46
-    private static let restingHeight: CGFloat = 4
-    private static let track: CGFloat = 52
+    private static let restingWidth: CGFloat = 54
+    private static let restingHeight: CGFloat = 5
+    // Never narrower than the resting line it releases into, or the spread is clipped
+    // by the track's own capsule on the last frames before the shell takes over.
+    private static let track: CGFloat = 54
     private static let hair: CGFloat = 2
     private static let light: CGFloat = 22
     private static let point: CGFloat = 8
