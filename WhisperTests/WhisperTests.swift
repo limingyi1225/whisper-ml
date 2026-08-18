@@ -265,6 +265,69 @@ import Testing
         #expect(!FocusedInputMonitor.usesAppWideInputFallback(bundleIdentifier: nil))
     }
 
+    @Test func spotlightPanelsCountAsAnInputSurfaceOfTheirOwn() {
+        // Spotlight is never the frontmost application, so the only way its search
+        // field is ever seen is by asking the process that draws the panel.
+        #expect(FocusedInputMonitor.isOverlayInputSurface(
+            bundleIdentifier: "com.apple.campo"
+        ))
+        #expect(FocusedInputMonitor.isOverlayInputSurface(
+            bundleIdentifier: "com.apple.Spotlight"
+        ))
+        // Voice Siri lives in a process of its own and publishes no text field; the
+        // dictation pill has nothing to offer it.
+        #expect(!FocusedInputMonitor.isOverlayInputSurface(
+            bundleIdentifier: "com.apple.Siri"
+        ))
+        #expect(!FocusedInputMonitor.isOverlayInputSurface(bundleIdentifier: nil))
+    }
+
+    @Test func spotlightSearchFieldReadsAsEditable() {
+        // What Spotlight's panel actually reports when it is up.
+        #expect(FocusedInputMonitor.isEditableText(
+            role: kAXTextFieldRole as String,
+            subrole: "AXSearchField",
+            enabled: true,
+            valueIsSettable: true,
+            selectionIsSettable: true
+        ))
+    }
+
+    @Test func onlyAnAnsweredEmptyFocusAsksForAnAccessibilityTree() {
+        // What Chrome replies before its page tree exists: it answers, and the answer
+        // is that nothing is focused.
+        #expect(FocusedInputMonitor.publishesNoFocus(axError: .noValue))
+        // An app that does not implement the attribute has no lazy tree to wake, so
+        // declaring to it could only ever be noise.
+        #expect(!FocusedInputMonitor.publishesNoFocus(axError: .attributeUnsupported))
+        // A timeout is not an answer. Reading one as "this app publishes no tree"
+        // would declare an assistive client to any app that was merely busy for a
+        // moment — Word mid-save, Xcode mid-index — and that declaration is not
+        // withdrawn for the rest of the app's life.
+        #expect(!FocusedInputMonitor.publishesNoFocus(axError: .cannotComplete))
+        #expect(!FocusedInputMonitor.publishesNoFocus(axError: .failure))
+        #expect(!FocusedInputMonitor.publishesNoFocus(axError: .apiDisabled))
+    }
+
+    @Test func accessibilityRequestsAreRateLimitedOnOneClockNotPerApp() {
+        let start = Date()
+        #expect(FocusedInputMonitor.shouldSendAccessibilityRequest(
+            lastSentAt: nil,
+            now: start
+        ))
+        #expect(!FocusedInputMonitor.shouldSendAccessibilityRequest(
+            lastSentAt: start,
+            now: start.addingTimeInterval(0.5)
+        ))
+        // Switching apps must not reset the interval: a per-app timestamp let a
+        // ⌘-Tab between two apps that both publish nothing send the blocking
+        // main-thread call on every single switch.
+        #expect(FocusedInputMonitor.shouldSendAccessibilityRequest(
+            lastSentAt: start,
+            now: start.addingTimeInterval(2)
+        ))
+    }
+
     @Test func notificationObserversStillReceivePeriodicHealthProbes() {
         #expect(FocusedInputMonitor.shouldRunHealthProbe(
             receivesFocusNotifications: false,

@@ -1,9 +1,21 @@
 import AppKit
 import ApplicationServices
 
+/// A focused input, no focused input, and an app that has not published a focused
+/// element at all are three different answers. Chromium builds the tree for page
+/// content only once a client declares itself, and until then it gives the third —
+/// which is why a text box on a web page and a video playing full screen used to look
+/// identical from out here.
+private enum FocusedInputVerdict: Sendable {
+    case editable
+    case notEditable
+    case noFocusPublished
+}
+
 private struct FocusedInputProbeRequest: Sendable {
     let processIdentifier: pid_t
     let bundleIdentifier: String?
+    let overlayProcessIdentifiers: [pid_t]
     let epoch: Int
 }
 
@@ -29,6 +41,9 @@ final class FocusedInputMonitor {
     private var probeEpoch = 0
     private var pendingProbe: FocusedInputProbeRequest?
     private var probeIsInFlight = false
+    private var cachedOverlayProcessIdentifiers: [pid_t] = []
+    private var overlayLookupAt: Date?
+    private var lastAccessibilityRequestAt: Date?
     private let probeQueue = DispatchQueue(
         label: "com.mingyili.Whisper.focused-input-probe",
         qos: .userInteractive
@@ -155,9 +170,10 @@ final class FocusedInputMonitor {
         probeIsInFlight = true
 
         probeQueue.async { [weak self] in
-            let isEditable = Self.probeFocusedInput(
+            let verdict = Self.probeFocusedInput(
                 processIdentifier: request.processIdentifier,
-                bundleIdentifier: request.bundleIdentifier
+                bundleIdentifier: request.bundleIdentifier,
+                overlayProcessIdentifiers: request.overlayProcessIdentifiers
             )
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -168,7 +184,12 @@ final class FocusedInputMonitor {
                        self.observedProcessIdentifier == request.processIdentifier,
                        self.eligibleFrontmostProcessIdentifier() == request.processIdentifier,
                        !Permissions.isSecureInputEnabled {
-                        self.publish(isEditable)
+                        self.publish(verdict == .editable)
+                        if case .noFocusPublished = verdict {
+                            self.requestAccessibilityTree(
+                                from: request.processIdentifier
+                            )
+                        }
                     }
                     // Requests arriving while AX was busy overwrite one pending slot;
                     // stale work never forms an unbounded serial queue.
@@ -195,6 +216,7 @@ final class FocusedInputMonitor {
         pendingProbe = FocusedInputProbeRequest(
             processIdentifier: observedProcessIdentifier,
             bundleIdentifier: frontmostApplication.bundleIdentifier,
+            overlayProcessIdentifiers: overlayInputProcessIdentifiers(),
             epoch: probeEpoch
         )
         beginNextProbeIfNeeded()
@@ -275,6 +297,107 @@ final class FocusedInputMonitor {
         receivesFocusNotifications = false
     }
 
+    /// Asks an app to publish its accessibility tree.
+    ///
+    /// Chrome answers `AXFocusedUIElement` with nothing at all until a client
+    /// identifies itself as assistive software — not "the focused thing is not
+    /// editable" but "there is no focused thing" — so every text box on every web page
+    /// gave the same answer as a video playing full screen, and the pill stayed dark
+    /// for both. Setting this is what turns the page tree on; the tree appears about
+    /// two seconds later and ordinary probing picks it up from there. Chrome reports
+    /// the attribute as unsupported while acting on it anyway, so the result is worth
+    /// nothing and is not read.
+    ///
+    /// Asked again while the app keeps coming back empty, rather than once per
+    /// process. A browser that has only just launched is not yet listening: measured
+    /// against Chrome, the first ask went out 0.4 s after the process appeared and was
+    /// dropped on the floor, so latching "already asked" left the pill dark for that
+    /// entire run of the browser. Repeating stops on its own the moment the tree
+    /// exists, because the app then answers the focus question and never reaches here.
+    ///
+    /// Unlike every other Accessibility call in this file, this one runs on the main
+    /// thread, and has to. Sent from the probe queue it is simply ignored — Chrome
+    /// went on publishing nothing through fourteen consecutive asks, and woke on the
+    /// first identical call made from the main thread. It is affordable there because
+    /// it does not wait for an answer: the call returns immediately, the messaging
+    /// timeout caps a hung app at 0.15 s, and the interval keeps even that worst case
+    /// rare.
+    ///
+    /// Deliberately not a list of browsers. The declaration is simply true — Whisper
+    /// is an Accessibility client, and holds the permission to prove it — and an app
+    /// that builds its tree eagerly never reaches this path, because it answered the
+    /// focus question in the first place.
+    private func requestAccessibilityTree(from processIdentifier: pid_t) {
+        let now = Date()
+        guard Self.shouldSendAccessibilityRequest(
+            lastSentAt: lastAccessibilityRequestAt,
+            now: now
+        ) else {
+            return
+        }
+        lastAccessibilityRequestAt = now
+
+        let application = AXUIElementCreateApplication(processIdentifier)
+        _ = AXUIElementSetMessagingTimeout(application, 0.15)
+        _ = AXUIElementSetAttributeValue(
+            application,
+            "AXEnhancedUserInterface" as CFString,
+            kCFBooleanTrue
+        )
+    }
+
+    /// Deliberately not keyed on the process. Keeping a per-app timestamp meant that
+    /// alternating between two apps that both publish nothing reset the interval on
+    /// every switch, so the main-thread call this rate limit exists to bound went out
+    /// on every ⌘-Tab. A single clock costs a cold app at most one extra interval.
+    nonisolated static func shouldSendAccessibilityRequest(
+        lastSentAt: Date?,
+        now: Date
+    ) -> Bool {
+        guard let lastSentAt else { return true }
+        return now.timeIntervalSince(lastSentAt) >= accessibilityRequestInterval
+    }
+
+    /// Chrome publishes its tree about two seconds after being asked, so asking more
+    /// often than this only repeats work the browser is already doing.
+    private static let accessibilityRequestInterval: TimeInterval = 2
+
+    /// The processes that draw a text field over the top of whatever is in front,
+    /// resolved on the main actor so the probe queue never touches `NSWorkspace`.
+    ///
+    /// An empty answer is cached like any other. Caching only non-empty results meant
+    /// that a system where the list matches nothing — a macOS that has renamed the
+    /// Spotlight host process again, as it already did once — enumerated every running
+    /// application on the main thread once a second, forever, with no symptom beyond
+    /// a Spotlight pill that quietly never appeared.
+    private func overlayInputProcessIdentifiers() -> [pid_t] {
+        // Liveness alone is not enough: a pid outlives nothing, and the kernel hands
+        // it on. An entry whose process has been replaced by an unrelated app would
+        // otherwise survive the whole interval, and its focused element would be read
+        // as a Spotlight panel — lighting the pill from an app that is not even in
+        // front. Asking for the bundle identifier costs the same lookup.
+        let hasStaleEntry = cachedOverlayProcessIdentifiers.contains {
+            !Self.isOverlayInputSurface(
+                bundleIdentifier: NSRunningApplication(processIdentifier: $0)?.bundleIdentifier
+            )
+        }
+        if !hasStaleEntry,
+           let resolvedAt = overlayLookupAt,
+           Date().timeIntervalSince(resolvedAt) < Self.overlayLookupInterval {
+            return cachedOverlayProcessIdentifiers
+        }
+
+        overlayLookupAt = Date()
+        cachedOverlayProcessIdentifiers = NSWorkspace.shared.runningApplications
+            .filter { Self.isOverlayInputSurface(bundleIdentifier: $0.bundleIdentifier) }
+            .map(\.processIdentifier)
+        return cachedOverlayProcessIdentifiers
+    }
+
+    /// Long enough that the scan is not a per-probe cost, short enough that Spotlight
+    /// works again within half a minute of its process being replaced.
+    private static let overlayLookupInterval: TimeInterval = 30
+
     private func eligibleFrontmostProcessIdentifier() -> pid_t? {
         guard let processIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier,
               processIdentifier != ProcessInfo.processInfo.processIdentifier else {
@@ -311,30 +434,68 @@ final class FocusedInputMonitor {
     /// times, and must not stall the hotkey's main-run-loop event tap while doing so.
     private nonisolated static func probeFocusedInput(
         processIdentifier: pid_t,
-        bundleIdentifier: String?
+        bundleIdentifier: String?,
+        overlayProcessIdentifiers: [pid_t]
+    ) -> FocusedInputVerdict {
+        let verdict = probeFrontmostInput(
+            processIdentifier: processIdentifier,
+            bundleIdentifier: bundleIdentifier
+        )
+        if case .editable = verdict {
+            return .editable
+        }
+        if probeOverlayInput(overlayProcessIdentifiers) {
+            return .editable
+        }
+        return verdict
+    }
+
+    /// One AX round-trip per overlay process, taken only once the frontmost app has
+    /// already answered no. A process with no panel up reports no focused element at
+    /// all, so this cannot light the pill while Spotlight is closed.
+    private nonisolated static func probeOverlayInput(
+        _ processIdentifiers: [pid_t]
     ) -> Bool {
+        for processIdentifier in processIdentifiers {
+            let application = AXUIElementCreateApplication(processIdentifier)
+            _ = AXUIElementSetMessagingTimeout(application, 0.15)
+            guard case .element(let focusedElement) =
+                    copyFocusedElement(of: application) else {
+                continue
+            }
+            if isEditableTextElement(focusedElement) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private nonisolated static func probeFrontmostInput(
+        processIdentifier: pid_t,
+        bundleIdentifier: String?
+    ) -> FocusedInputVerdict {
         let application = AXUIElementCreateApplication(processIdentifier)
         _ = AXUIElementSetMessagingTimeout(application, 0.15)
         if usesAppWideInputFallback(bundleIdentifier: bundleIdentifier) {
             // These frontmost apps expose their editors inconsistently or not at all.
             // The explicit product policy is to prefer a harmless extra idle HUD over
             // missing the affordance while the user is preparing to type.
-            return true
+            return .editable
         }
 
-        var focusedValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            application,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedValue
-        ) == .success,
-              let focusedElement = checkedAXElement(from: focusedValue) else {
-            return false
+        let focusedElement: AXUIElement
+        switch copyFocusedElement(of: application) {
+        case .element(let element):
+            focusedElement = element
+        case .nothingFocused:
+            return .noFocusPublished
+        case .unavailable:
+            return .notEditable
         }
 
         _ = AXUIElementSetMessagingTimeout(focusedElement, 0.15)
         if isEditableTextElement(focusedElement) {
-            return true
+            return .editable
         }
         for attribute in ["AXEditableAncestor", "AXHighestEditableAncestor"] {
             var ancestorValue: CFTypeRef?
@@ -345,10 +506,49 @@ final class FocusedInputMonitor {
             ) == .success,
                let ancestorElement = checkedAXElement(from: ancestorValue),
                isEditableTextElement(ancestorElement) {
-                return true
+                return .editable
             }
         }
-        return containsEditableTextDescendant(of: focusedElement)
+        return containsEditableTextDescendant(of: focusedElement) ? .editable : .notEditable
+    }
+
+    /// Reading a focused element has three outcomes, and the difference between the
+    /// last two decides whether an app gets told an assistive client is attached.
+    private enum FocusedElementLookup {
+        case element(AXUIElement)
+        /// The app replied, and the reply was that nothing is focused. This is what
+        /// a lazily-built tree says before anything has asked it to exist.
+        case nothingFocused
+        /// The app did not reply at all — busy, hung, or gone. It has made no
+        /// statement about its tree, and must not be treated as if it had.
+        case unavailable
+    }
+
+    private nonisolated static func copyFocusedElement(
+        of application: AXUIElement
+    ) -> FocusedElementLookup {
+        var focusedValue: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            application,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        )
+        if result == .success, let element = checkedAXElement(from: focusedValue) {
+            return .element(element)
+        }
+        return publishesNoFocus(axError: result) ? .nothingFocused : .unavailable
+    }
+
+    /// Which reply counts as "there is nothing focused" rather than "no reply".
+    ///
+    /// Exactly one, and it is the one Chrome was measured to give. `.cannotComplete`
+    /// is the timeout a hung app produces — the very error this file elsewhere uses to
+    /// recognise one — so a merely slow app must not be read as an app whose tree does
+    /// not exist. `.attributeUnsupported` is excluded for the opposite reason: an app
+    /// that does not implement the attribute at all has no lazily-built tree to wake,
+    /// so declaring to it every two seconds could only ever be noise.
+    nonisolated static func publishesNoFocus(axError: AXError) -> Bool {
+        axError == .noValue
     }
 
     private nonisolated static func isEditableTextElement(_ element: AXUIElement) -> Bool {
@@ -434,6 +634,18 @@ final class FocusedInputMonitor {
             || bundleIdentifier == "com.anthropic.claudefordesktop"
             || bundleIdentifier == "com.openai.codex"
             || bundleIdentifier == "com.apple.Safari"
+    }
+
+    /// Spotlight never becomes the frontmost application. Its panel is drawn by a
+    /// background process — `com.apple.campo` from macOS 26 on, `com.apple.Spotlight`
+    /// before that — while `NSWorkspace.frontmostApplication` goes on naming whatever
+    /// was already there. Probing the frontmost app alone therefore answers a question
+    /// about the wrong window: the resting pill appeared or not according to what
+    /// happened to be sitting behind Spotlight, even though the caret was in a search
+    /// field the whole time.
+    nonisolated static func isOverlayInputSurface(bundleIdentifier: String?) -> Bool {
+        bundleIdentifier == "com.apple.campo"
+            || bundleIdentifier == "com.apple.Spotlight"
     }
 
     nonisolated static func checkedAXElement(from value: CFTypeRef?) -> AXUIElement? {
