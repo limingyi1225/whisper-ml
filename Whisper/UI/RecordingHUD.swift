@@ -28,7 +28,10 @@ final class RecordingHUDController {
     private static let wakeSettleDelay: TimeInterval = 1.5
     /// Rebuilding replaces the panel outright, which restarts whatever it was
     /// animating. A check that keeps failing must not be able to do that once a second.
-    private static let rebuildCooldown: TimeInterval = 5
+    ///
+    /// `nonisolated` because `placementRepair` is, and reading a `let` from one is only
+    /// a warning today — it is an error under the Swift 6 language mode.
+    nonisolated private static let rebuildCooldown: TimeInterval = 5
 
     /// The pill belongs to every desktop, sits above full-screen apps, and never joins
     /// Exposé or the window cycle.
@@ -44,8 +47,12 @@ final class RecordingHUDController {
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var wakeObservers: [NSObjectProtocol] = []
+    private var unlockObserver: NSObjectProtocol?
     private var isVisibilityRequested = false
     private var placementEpoch = 0
+    /// When the check that is already scheduled will run, so that a later event cannot
+    /// quietly pull it forward — see `verifyPlacement(after:)`.
+    private var placementDeadline: Date?
     private var lastRebuiltAt: Date?
 
     private init() {
@@ -84,6 +91,23 @@ final class RecordingHUDController {
                 }
             }
         }
+
+        // Waking is not the moment the desktops come back. On a Mac that asks for a
+        // password — which is the machine this was written for — the login window is
+        // still up when `didWake` arrives, every window of ours is legitimately absent
+        // from it, and the check correctly declines to act. So the wake trigger on its
+        // own does nothing here: what actually repaired the pill was unlocking, and
+        // only because unlocking happens to change the active desktop too. Observe the
+        // unlock itself rather than lean on that side effect.
+        unlockObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                RecordingHUDController.shared.verifyPlacement(after: Self.wakeSettleDelay)
+            }
+        }
     }
 
     func show() {
@@ -103,6 +127,10 @@ final class RecordingHUDController {
     func hide() {
         isVisibilityRequested = false
         placementEpoch &+= 1
+        // The epoch bump abandons the scheduled check, so the deadline it was holding
+        // has to go with it. Leaving it behind would make the next `show()` decline to
+        // schedule anything, on the strength of a check that is never going to run.
+        placementDeadline = nil
         panel?.orderOut(nil)
     }
 
@@ -112,15 +140,39 @@ final class RecordingHUDController {
     /// desktop was in front when the lid closed — the app still believes it is showing
     /// the HUD, and it is, just not where the user is. So every desktop switch, every
     /// wake and every time the pill is asked for re-checks and repairs.
+    ///
+    /// The delays are not interchangeable: a desktop switch settles in 0.4s, a wake or
+    /// unlock takes 1.5s because the login window comes and goes and the desktops are
+    /// rebuilt behind it. Both arrive together — unlocking changes the active desktop —
+    /// so scheduling unconditionally, each call invalidating the last whatever it was
+    /// waiting for, let the 0.4s replace the 1.5s and ran the check while the window
+    /// server was still moving windows around. A pending check due to run later than
+    /// this one therefore stands; only a later deadline supersedes it.
     private func verifyPlacement(after delay: TimeInterval) {
+        let deadline = Date().addingTimeInterval(delay)
+        guard Self.shouldReschedule(pendingDeadline: placementDeadline, to: deadline) else {
+            return
+        }
         placementEpoch &+= 1
         let epoch = placementEpoch
+        placementDeadline = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.placementEpoch == epoch else { return }
+                self.placementDeadline = nil
                 self.restorePlacementIfMissing()
             }
         }
+    }
+
+    /// Whether a newly requested check should replace the one already scheduled. Kept
+    /// separate from the scheduling so the rule can be tested without a real timer.
+    nonisolated static func shouldReschedule(
+        pendingDeadline: Date?,
+        to deadline: Date
+    ) -> Bool {
+        guard let pendingDeadline else { return true }
+        return deadline > pendingDeadline
     }
 
     private func restorePlacementIfMissing() {

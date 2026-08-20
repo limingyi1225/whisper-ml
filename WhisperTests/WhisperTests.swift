@@ -457,6 +457,31 @@ import Testing
         ) == .rebuild)
     }
 
+    /// The wake delay is longer than the desktop-switch delay for a reason — the login
+    /// window comes and goes and the desktops are rebuilt behind it — and unlocking
+    /// fires both events at once. Scheduling that let every new request cancel the last
+    /// therefore threw away the 1.5s wait chosen for the wake and ran the check 0.4s in,
+    /// while the window server was still moving windows around.
+    @Test func aLaterPlacementCheckIsNotPulledForwardByAnEarlierOne() {
+        let now = Date()
+        let wake = now.addingTimeInterval(1.5)
+        let spaceSwitch = now.addingTimeInterval(0.4)
+
+        // Nothing pending: whatever is asked for is scheduled.
+        #expect(RecordingHUDController.shouldReschedule(pendingDeadline: nil, to: spaceSwitch))
+
+        // The real sequence — wake, then the desktop change it brings with it. The
+        // desktop switch must not displace the wake's longer wait.
+        #expect(!RecordingHUDController.shouldReschedule(pendingDeadline: wake, to: spaceSwitch))
+
+        // The other order still works: a wake arriving while a desktop switch is pending
+        // pushes the check out, because the slower event is the one to wait for.
+        #expect(RecordingHUDController.shouldReschedule(pendingDeadline: spaceSwitch, to: wake))
+
+        // An identical deadline is not a reason to rearm and start the wait over.
+        #expect(!RecordingHUDController.shouldReschedule(pendingDeadline: wake, to: wake))
+    }
+
     /// 试一下 tells the user that the bar at the bottom of their screen is the pill in
     /// the guide's window. Focus is inside Whisper itself while they read that, which is
     /// exactly the case the focus rule hides the pill for — so without this the sentence
