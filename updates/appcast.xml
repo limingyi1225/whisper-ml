@@ -9,6 +9,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.10</title>
+            <pubDate>Thu, 20 Aug 2026 14:36:53 +0800</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.10</link>
+            <sparkle:version>11</sparkle:version>
+            <sparkle:shortVersionString>1.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.10/Whisper-1.10-11.dmg" length="3297165" type="application/octet-stream" sparkle:edSignature="S7IfKZIMCASizKPTuZdTy93A/Ju6XXCHHg7pgx6DCkzZPS+gkE14/NqyLPBxVz8Pibv8WAdRggyXTRa/UjtHCw=="/>
+        </item>
+        <item>
             <title>1.9</title>
             <pubDate>Tue, 18 Aug 2026 21:32:04 +0800</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.9</link>
@@ -106,6 +115,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: O5IXjhVHwIvBVzyeAfaCbfFraE1V93rMd8b3pko8K87cn1NjVFI83v9ZMCDm7V9beDp1K5WtHGAptiNMWLOBCw==
-length: 8068
+edSignature: jBG+mbMdNwQuqy8ot5B4NJyd5eoORxPKUE9Pht0RA/o+pjI8EOM+PBL01CJdzinKMIY+kwCI0MW/7fsCHSUXCQ==
+length: 8761
 -->
