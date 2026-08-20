@@ -27,7 +27,7 @@ public final class TranscriptPolisher {
     private enum RequestResult {
         case success(String)
         case retryableFailure
-        case reasoningParameterRejected
+        case tuningParametersRejected
         case terminalFailure(String)
         case cancelled
     }
@@ -163,11 +163,23 @@ public final class TranscriptPolisher {
         // valid text and only the audio distinguishes them, so that class has to be
         // caught upstream by `keywords`, not repaired here.
         //
-        // `service_tier` is deliberately absent. Fast mode (the tier formerly called
-        // priority) is real but costs double: 40 paired calls put it 140ms ahead at the
-        // median with p90 barely moved, 2102ms to 1955ms. These requests are small
-        // enough that the wait is network and queueing, not throughput, so the tier's
-        // headline speedup does not materialise — and this key is shared.
+        // `service_tier` buys the tail, which is the part a person actually feels.
+        // Fast mode — renamed from priority on 2026-07-30, and `"fast"` is accepted as
+        // an alias that the server echoes back as `"priority"`, so the older value is
+        // the stabler one to send. 50 paired calls under this exact configuration:
+        // median 1062ms → 931ms, p90 1990ms → 1566ms, p95 2371ms → 1750ms, slowest of
+        // all 3242ms → 1856ms. Standard had four calls over 2s and one over 3s; fast
+        // had none over 2s. The median barely matters — nobody notices 130ms — but the
+        // occasional three-second stall after releasing the key is exactly what makes
+        // cleanup feel broken, and this removes it.
+        //
+        // An earlier run said the tail did not move. That run sent an abbreviated
+        // prompt, a third the size of the real one, and measured a request too small
+        // for the tier to have anything to work on. Measure the shipping request.
+        //
+        // It costs double — $0.40/$2.40 per 1M against $0.20/$1.20 — which on a 456-in,
+        // 70-out request is $0.00035 a call: roughly a dollar a month each at a hundred
+        // dictations a day. `auto` is not a cheaper way in; it is served as `default`.
         //
         // Leaving the field off entirely is not the same thing: that hands the request
         // to the server's default effort, which is what the original `none` existed to
@@ -179,7 +191,7 @@ public final class TranscriptPolisher {
             raw,
             vocabulary: vocabulary,
             route: route,
-            constrainsReasoning: true,
+            sendsTuning: true,
             deadline: deadline,
             timeout: Self.firstAttemptTimeout
         )
@@ -189,22 +201,22 @@ public final class TranscriptPolisher {
         switch first {
         case .success(let text):
             cleaned = text
-        case .reasoningParameterRejected, .retryableFailure:
+        case .tuningParametersRejected, .retryableFailure:
             guard deadline.timeIntervalSinceNow > 0.1 else { return .unchanged(notice: nil) }
             // Drop the reasoning parameter only when the server actually rejected
             // it. A plain transient failure (5xx/429/timeout) keeps the effort
             // pinned: falling back to the server's default on the retry usually
             // blows what is left of the shared deadline, defeating the retry
             // entirely.
-            let parameterWasRejected =
-                if case .reasoningParameterRejected = first { true } else { false }
+            let parametersWereRejected =
+                if case .tuningParametersRejected = first { true } else { false }
             // No cap on the retry: it has the rest of the deadline, and by here it is
             // running on a connection that was either proven good or just replaced.
             let second = await request(
                 raw,
                 vocabulary: vocabulary,
                 route: route,
-                constrainsReasoning: !parameterWasRejected,
+                sendsTuning: !parametersWereRejected,
                 deadline: deadline
             )
             switch second {
@@ -212,7 +224,7 @@ public final class TranscriptPolisher {
                 cleaned = text
             case .terminalFailure(let message):
                 return .unchanged(notice: message)
-            case .reasoningParameterRejected, .retryableFailure, .cancelled:
+            case .tuningParametersRejected, .retryableFailure, .cancelled:
                 return .unchanged(notice: nil)
             }
         case .terminalFailure(let message):
@@ -237,7 +249,7 @@ public final class TranscriptPolisher {
         _ raw: String,
         vocabulary: [String],
         route: ServiceRoute,
-        constrainsReasoning: Bool,
+        sendsTuning: Bool,
         deadline: Date,
         timeout: TimeInterval = .infinity
     ) async -> RequestResult {
@@ -259,8 +271,9 @@ public final class TranscriptPolisher {
                 ["role": "user", "content": "<transcript>\n\(raw)\n</transcript>"],
             ],
         ]
-        if constrainsReasoning {
+        if sendsTuning {
             body["reasoning_effort"] = "medium"
+            body["service_tier"] = "priority"
         }
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -274,10 +287,8 @@ public final class TranscriptPolisher {
             guard http.statusCode == 200 else {
                 let detail = String(data: data, encoding: .utf8) ?? ""
                 log.error("polish HTTP failure: \(detail.prefix(300), privacy: .public)")
-                if constrainsReasoning,
-                   http.statusCode == 400,
-                   detail.localizedCaseInsensitiveContains("reasoning_effort") {
-                    return .reasoningParameterRejected
+                if sendsTuning, http.statusCode == 400, Self.rejectsTuning(detail) {
+                    return .tuningParametersRejected
                 }
                 if http.statusCode == 408
                     || http.statusCode == 409
@@ -318,6 +329,20 @@ public final class TranscriptPolisher {
             renewSession()
             return .retryableFailure
         }
+    }
+
+    /// Whether a 400 is the peer saying it does not know the tuning fields.
+    ///
+    /// Naming the fields is not enough. The relay refuses an unknown key with a
+    /// message that names no field at all ("整理请求含有不支持的字段"), so a copy of
+    /// the app that sends `service_tier` to a relay deployed before that key was
+    /// allowlisted would read a plain terminal failure, stop cleaning up, and put a
+    /// notice on screen — a worse outcome than the silent degradation this path
+    /// exists to provide. Matching the relay's own wording as well keeps the
+    /// deploy-order mistake recoverable instead of user-visible.
+    private static func rejectsTuning(_ detail: String) -> Bool {
+        ["reasoning_effort", "service_tier", "unsupported field", "不支持的字段"]
+            .contains { detail.localizedCaseInsensitiveContains($0) }
     }
 
     /// Digs the human-readable half out of an OpenAI error body.
