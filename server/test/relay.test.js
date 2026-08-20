@@ -551,6 +551,21 @@ test("polish requests are restricted to the allowlisted shape", () => {
       `reasoning_effort ${JSON.stringify(effort)} must be refused`,
     );
   }
+  // Fast mode is the double-priced tier, so the value is allowlisted rather than
+  // passed through. Both of its names are live; flex is refused because a 12s
+  // cleanup is worse than no cleanup on a key-release path.
+  for (const tier of ["default", "auto", "priority", "fast"]) {
+    assert.equal(validatePolishBody({ ...valid, service_tier: tier }, config), null,
+      `service_tier ${tier} must pass`);
+  }
+  for (const tier of ["flex", "scale", ""]) {
+    assert.match(
+      validatePolishBody({ ...valid, service_tier: tier }, config),
+      /service_tier/,
+      `service_tier ${JSON.stringify(tier)} must be refused`,
+    );
+  }
+  assert.equal(validatePolishBody({ ...valid, service_tier: undefined }, config), null);
 });
 
 test("Realtime validation permits transcription but rejects arbitrary sessions", () => {

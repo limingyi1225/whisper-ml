@@ -1,6 +1,15 @@
 import { errorBody, readBody, writeJSON } from "./http.js";
 
-const ALLOWED_BODY_KEYS = new Set(["model", "messages", "reasoning_effort"]);
+const ALLOWED_BODY_KEYS = new Set([
+  "model", "messages", "reasoning_effort", "service_tier",
+]);
+
+/// Fast mode costs double, so the caller does not get to pick it freely — the same
+/// reason the effort list is closed. `"fast"` is the current name and `"priority"`
+/// the older alias for one tier; the API accepts both and echoes `"priority"`, so
+/// both are allowed here and neither is rewritten. `"flex"` is refused outright:
+/// it measured 12s on a probe, and this endpoint is on a person's key-release path.
+const ALLOWED_SERVICE_TIER = new Set(["default", "auto", "priority", "fast"]);
 
 /// Every value here is live somewhere, and has to stay live. The app has shipped
 /// `none` (<=1.7), then `low` (1.8+), and is moving to `medium`; an installed copy
@@ -28,6 +37,9 @@ const REJECT = Object.freeze({
   reasoning:
     "转发服务器不允许这个 reasoning_effort 取值"
     + "（reasoning_effort is not allowed）",
+  serviceTier:
+    "转发服务器不允许这个 service_tier 取值"
+    + "（service_tier is not allowed）",
   messages:
     "转发服务器：messages 必须正好是 system 和 user 两条"
     + "（messages must contain exactly system and user entries）",
@@ -48,6 +60,10 @@ export function validatePolishBody(body, config) {
   if (body.reasoning_effort !== undefined
       && !ALLOWED_REASONING_EFFORT.has(body.reasoning_effort)) {
     return REJECT.reasoning;
+  }
+  if (body.service_tier !== undefined
+      && !ALLOWED_SERVICE_TIER.has(body.service_tier)) {
+    return REJECT.serviceTier;
   }
   if (!Array.isArray(body.messages) || body.messages.length !== 2) {
     return REJECT.messages;
