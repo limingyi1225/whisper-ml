@@ -141,18 +141,33 @@ public final class TranscriptPolisher {
         // in between — the plausibility check below is sized against this same one.
         let vocabulary = DictationEnvironment.settings.vocabularyTerms
 
-        // `low`, and pinned rather than left to the server's default. 210 interleaved
-        // calls over 21 cases (2026-08-17) say it is free: median 932ms against 922ms
-        // for `none`, p90 1250ms against 1144ms, and the only call in either arm to
-        // pass 4s was a `none` one. It is free because luna mostly declines to reason
-        // on an utterance this short — 4 of 105 calls spent any reasoning tokens at
-        // all. But all four landed on the one case neither arm could otherwise repair
-        // (日子 for 日志, 0/5 under `none`, which twice invented 例子 instead), and all
-        // four repaired it. So the parameter buys a rare, targeted rescue of exactly
-        // the misheard-homophone case cleanup is worst at, for no measurable latency.
+        // `medium`, pinned rather than left to the server's default. The ladder was
+        // walked one rung at a time and each rung was measured: `none` → `low` bought
+        // a homophone repair for no latency, and `low` → `medium` buys more of them
+        // for a little. On the three unstable homophone cases, 10 of 15 under `low`
+        // against 14 of 15 under `medium`, at median 1011ms against 1046ms, p90 1887ms
+        // against 1558ms, max 2619ms — still comfortably inside the 4s this attempt
+        // gets. `medium` actually reasons where `low` mostly does not: 14 of 40 calls
+        // spent reasoning tokens against 3 of 40.
         //
-        // Those cases were all short, 10–20 characters. A long utterance is likelier to
-        // trigger reasoning, so treat that p90 as a floor rather than a ceiling.
+        // Weak on its own — 5 runs per case — and deliberately shipped anyway, because
+        // the controls held everywhere (a correct 山重复, 四氢呋喃, a spoken 你帮我看看,
+        // and ordinary filler removal were all untouched in every arm) so the downside
+        // of being wrong is latency, not damaged text.
+        //
+        // What `medium` does *not* buy, and no effort or model does: a mishearing whose
+        // wrong reading is an ordinary sentence. 脂蛋白 heard as 吃蛋白质 survived 40
+        // attempts across luna and terra at low and medium, and the medium arms made it
+        // worse — they smoothed 吃蛋白质 into 吃的蛋白质, repairing the grammar of the
+        // error and cementing it. Nothing here is a thinking problem: both readings are
+        // valid text and only the audio distinguishes them, so that class has to be
+        // caught upstream by `keywords`, not repaired here.
+        //
+        // `service_tier` is deliberately absent. Fast mode (the tier formerly called
+        // priority) is real but costs double: 40 paired calls put it 140ms ahead at the
+        // median with p90 barely moved, 2102ms to 1955ms. These requests are small
+        // enough that the wait is network and queueing, not throughput, so the tier's
+        // headline speedup does not materialise — and this key is shared.
         //
         // Leaving the field off entirely is not the same thing: that hands the request
         // to the server's default effort, which is what the original `none` existed to
@@ -245,7 +260,7 @@ public final class TranscriptPolisher {
             ],
         ]
         if constrainsReasoning {
-            body["reasoning_effort"] = "low"
+            body["reasoning_effort"] = "medium"
         }
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
