@@ -533,12 +533,18 @@ test("polish requests are restricted to the allowlisted shape", () => {
   // Both live app generations have to get through: shipped copies send `none` until
   // they update themselves, current ones send `low`. Anything above that is refused,
   // which is the whole point of pinning the field at all.
-  assert.equal(validatePolishBody({ ...valid, reasoning_effort: "low" }, config), null);
+  for (const effort of ["none", "low", "medium"]) {
+    assert.equal(
+      validatePolishBody({ ...valid, reasoning_effort: effort }, config),
+      null,
+      `reasoning_effort ${effort} is shipped in some app version and must pass`,
+    );
+  }
   assert.equal(
     validatePolishBody({ ...valid, reasoning_effort: undefined }, config),
     null,
   );
-  for (const effort of ["medium", "high", "minimal", ""]) {
+  for (const effort of ["high", "minimal", ""]) {
     assert.match(
       validatePolishBody({ ...valid, reasoning_effort: effort }, config),
       /reasoning_effort/,

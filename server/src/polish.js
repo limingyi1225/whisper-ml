@@ -2,14 +2,18 @@ import { errorBody, readBody, writeJSON } from "./http.js";
 
 const ALLOWED_BODY_KEYS = new Set(["model", "messages", "reasoning_effort"]);
 
-/// Both values are live, and both have to stay live. The app moved from `none` to
-/// `low` (measured: no latency cost, and it repairs misheard homophones `none`
-/// leaves alone), but every already-installed copy keeps sending `none` until it
-/// updates itself — narrowing this to one value would break cleanup on exactly the
-/// versions that have not picked up the change yet. The set stays closed regardless:
-/// `medium` and `high` are what turn a 1s cleanup into a wait the user feels, on a
-/// key that is not theirs.
-const ALLOWED_REASONING_EFFORT = new Set(["none", "low"]);
+/// Every value here is live somewhere, and has to stay live. The app has shipped
+/// `none` (<=1.7), then `low` (1.8+), and is moving to `medium`; an installed copy
+/// keeps sending its own until it updates itself, so narrowing this set breaks
+/// cleanup on exactly the versions that have not caught up. Deploy a widening here
+/// *before* publishing the app that needs it — the app's fallback for a rejected
+/// parameter is a request with no parameter at all, which runs at the server's
+/// default effort, the thing pinning the field exists to avoid.
+///
+/// `high` stays out. Measured on the app's own cases, `medium` already sits at a
+/// p90 of 1.9s against the 4s the app allows its first attempt; `high` is where a
+/// cleanup becomes a wait the user feels, on a key that is not the caller's.
+const ALLOWED_REASONING_EFFORT = new Set(["none", "low", "medium"]);
 
 /// Chinese lead, English detail in parentheses — same reasoning as `REJECT` in
 /// realtime.js: the app surfaces `error.message` verbatim as the cleanup notice.
