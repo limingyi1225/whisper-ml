@@ -388,10 +388,20 @@ private struct SetupSettingsTab: View {
         }
     }
 
+    /// The saved row is not decoration, and it is not safe to drop once the device is
+    /// activated. `relayTokenStored` only asks whether the keychain holds an item, not
+    /// whether the relay still honours it, and a token can be revoked from the server
+    /// (`script/revoke_token.sh`). A revoked device therefore still counts as stored,
+    /// so the enrollment field never comes back on its own — "更换…" is the only way
+    /// back to the invite field. Without it that Mac has no route to re-activate at
+    /// all, while transcription and cleanup both fail. It is also the only place in
+    /// relay mode that says the device is set up; removing it leaves the section blank.
     @ViewBuilder
     private var relayCredentialEditor: some View {
         if relayTokenStored && !isEditingRelayToken {
-            savedCredentialRow(title: "设备") {
+            // "设备" alone left the noun hanging — the row read "设备 ⟨更换…⟩ ✓" beside
+            // "辅助功能" and "麦克风", which name what they are reporting on.
+            savedCredentialRow(title: "设备授权") {
                 inviteCodeField = ""
                 legacyRelayTokenField = ""
                 relayTokenError = nil
