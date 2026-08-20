@@ -23,6 +23,12 @@ final class RecordingHUDController {
     /// A desktop switch is animated; the window server settles the new Space's window
     /// list only once it has finished.
     private static let spaceSettleDelay: TimeInterval = 0.4
+    /// Waking takes longer to settle than a desktop switch: the login window comes and
+    /// goes, and the desktops are rebuilt behind it.
+    private static let wakeSettleDelay: TimeInterval = 1.5
+    /// Rebuilding replaces the panel outright, which restarts whatever it was
+    /// animating. A check that keeps failing must not be able to do that once a second.
+    private static let rebuildCooldown: TimeInterval = 5
 
     /// The pill belongs to every desktop, sits above full-screen apps, and never joins
     /// Exposé or the window cycle.
@@ -37,8 +43,10 @@ final class RecordingHUDController {
     private var panel: NSPanel?
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
+    private var wakeObservers: [NSObjectProtocol] = []
     private var isVisibilityRequested = false
     private var placementEpoch = 0
+    private var lastRebuiltAt: Date?
 
     private init() {
         screenObserver = NotificationCenter.default.addObserver(
@@ -55,7 +63,25 @@ final class RecordingHUDController {
             queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                RecordingHUDController.shared.verifyPlacementAfterSpaceSettles()
+                RecordingHUDController.shared.verifyPlacement(after: Self.spaceSettleDelay)
+            }
+        }
+
+        // Coming back from sleep — the machine's or just the screen's — is what
+        // actually strands the pill, and waiting for the next time the user happens
+        // to put their cursor in a text field to notice is waiting too long.
+        wakeObservers = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+        ].map { name in
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    RecordingHUDController.shared.verifyPlacement(after: Self.wakeSettleDelay)
+                }
             }
         }
     }
@@ -71,7 +97,7 @@ final class RecordingHUDController {
             reposition()
         }
         panel?.orderFrontRegardless()
-        verifyPlacementAfterSpaceSettles()
+        verifyPlacement(after: Self.spaceSettleDelay)
     }
 
     func hide() {
@@ -82,15 +108,14 @@ final class RecordingHUDController {
 
     /// The pill is created once and then only ordered in and out, which is normally
     /// enough because it belongs to every desktop. It does not always stay that way:
-    /// after hours of use the window server can drop the membership, and the pill
-    /// then exists only on the desktop it was last placed on — the app still believes
-    /// it is showing the HUD while whole apps on another desktop (微信, Word) never
-    /// see it. Ordering the window out and back in does not undo that; re-assigning
-    /// the collection behaviour does, so every desktop switch re-checks and repairs.
-    private func verifyPlacementAfterSpaceSettles() {
+    /// a lock and wake can cost it that membership, and it is then left on whichever
+    /// desktop was in front when the lid closed — the app still believes it is showing
+    /// the HUD, and it is, just not where the user is. So every desktop switch, every
+    /// wake and every time the pill is asked for re-checks and repairs.
+    private func verifyPlacement(after delay: TimeInterval) {
         placementEpoch &+= 1
         let epoch = placementEpoch
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.spaceSettleDelay) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.placementEpoch == epoch else { return }
                 self.restorePlacementIfMissing()
@@ -100,20 +125,99 @@ final class RecordingHUDController {
 
     private func restorePlacementIfMissing() {
         guard isVisibilityRequested, let panel else { return }
-        let windows = Self.onScreenWindows()
-        // An empty list means the query failed rather than that the pill is gone.
-        guard !windows.isEmpty,
-              !Self.containsWindow(number: panel.windowNumber, in: windows) else {
+        let now = Date()
+        switch Self.placementRepair(
+            screenIsLocked: Self.screenIsLocked(),
+            onScreenWindows: Self.onScreenWindows(),
+            panelWindowNumber: panel.windowNumber,
+            lastRebuiltAt: lastRebuiltAt,
+            now: now
+        ) {
+        case .none:
             return
+        case .reassertDesktops:
+            log.warning("HUD still missing shortly after a rebuild; re-asserting its desktops")
+            // The assignment has to be a change for AppKit to forward it, so the
+            // single-desktop value goes on first — for the fraction of a frame before
+            // the real one replaces it, the pill is where it already was.
+            panel.collectionBehavior = Self.collectionBehavior.subtracting(.canJoinAllSpaces)
+            panel.collectionBehavior = Self.collectionBehavior
+            panel.orderFrontRegardless()
+        case .rebuild:
+            log.warning("HUD lost its place on the active desktop; rebuilding it")
+            lastRebuiltAt = now
+            rebuildPanel()
+        }
+    }
+
+    enum PlacementRepair: Equatable {
+        case none
+        case reassertDesktops
+        case rebuild
+    }
+
+    /// What to do about a pill the window server does not list on the active desktop.
+    /// Separate from the doing, because the two answers that would make things worse —
+    /// putting a brand new pill onto the lock screen, and replacing the panel over and
+    /// over while some other cause keeps the check failing — are worth pinning down.
+    nonisolated static func placementRepair(
+        screenIsLocked: Bool,
+        onScreenWindows: [[String: Any]],
+        panelWindowNumber: Int,
+        lastRebuiltAt: Date?,
+        now: Date
+    ) -> PlacementRepair {
+        guard !screenIsLocked else { return .none }
+        // An empty list means the query failed rather than that the pill is gone.
+        guard !onScreenWindows.isEmpty,
+              !containsWindow(number: panelWindowNumber, in: onScreenWindows) else {
+            return .none
+        }
+        // A fresh panel has only just been put up and is already reported missing.
+        // Taking it away again this soon would restart its animation for nothing, so
+        // try the cheap nudge instead and leave the next check to decide.
+        if let lastRebuiltAt, now.timeIntervalSince(lastRebuiltAt) < rebuildCooldown {
+            return .reassertDesktops
+        }
+        return .rebuild
+    }
+
+    /// Re-assigning the collection behaviour does not bring a stranded pill back: the
+    /// window server has already decided which desktop that window lives on, and it
+    /// keeps it there however the flags are set afterwards. A window it has never seen
+    /// carries no such history, so the repair is to build a new one — it opens on the
+    /// desktop in front of the user, which is the whole point.
+    private func rebuildPanel() {
+        let previousFrame = panel?.frame
+        if let panel {
+            panel.orderOut(nil)
+            // The old panel's SwiftUI view observes the dictation controller. Detach it
+            // rather than leave it rendering into a window nobody can see.
+            panel.contentView = nil
+            panel.close()
         }
 
-        log.warning("HUD lost its place on the active desktop; re-placing it")
-        // The assignment has to be a change for AppKit to forward it, so the
-        // single-desktop value goes on first — for the fraction of a frame before the
-        // real one replaces it, the pill is where it already was.
-        panel.collectionBehavior = Self.collectionBehavior.subtracting(.canJoinAllSpaces)
-        panel.collectionBehavior = Self.collectionBehavior
-        panel.orderFrontRegardless()
+        let replacement = makePanel()
+        panel = replacement
+        // Keep the pill where it was, which mid-utterance is where the user was told to
+        // look. A frame left behind by a display that has since been unplugged is the
+        // one case where starting over is better.
+        if let previousFrame, NSScreen.screens.contains(where: { $0.frame.intersects(previousFrame) }) {
+            replacement.setFrameOrigin(previousFrame.origin)
+        } else {
+            reposition()
+        }
+        replacement.orderFrontRegardless()
+    }
+
+    /// A locked screen is its own desktop, and none of our windows belong to it. Asking
+    /// where the pill is while the login window is up would answer "nowhere" every time,
+    /// and rebuilding on that answer would put a brand new pill onto the lock screen.
+    private nonisolated static func screenIsLocked() -> Bool {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+            return false
+        }
+        return (session["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue ?? false
     }
 
     /// The windows the window server currently draws on the active desktop.

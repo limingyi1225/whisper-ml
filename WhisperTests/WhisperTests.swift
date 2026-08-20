@@ -389,6 +389,74 @@ import Testing
         #expect(!RecordingHUDController.containsWindow(number: 4002, in: []))
     }
 
+    /// A lock and wake can strand the pill on whichever desktop was in front when the
+    /// lid closed, and re-asserting the collection behaviour does not bring it back —
+    /// the repair is a new window. Which is also the repair that can do damage: while
+    /// the login window is up every window of ours is legitimately absent, and building
+    /// one then would hand the lock screen a pill of its own.
+    @Test func aStrandedPillIsRebuiltButNeverOntoTheLockScreen() {
+        let now = Date()
+        let elsewhere: [[String: Any]] = [
+            [kCGWindowNumber as String: 4001, kCGWindowOwnerName as String: "Dock"],
+        ]
+
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: false,
+            onScreenWindows: elsewhere,
+            panelWindowNumber: 4002,
+            lastRebuiltAt: nil,
+            now: now
+        ) == .rebuild)
+
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: true,
+            onScreenWindows: elsewhere,
+            panelWindowNumber: 4002,
+            lastRebuiltAt: nil,
+            now: now
+        ) == .none)
+
+        // A pill that is where it should be, and a window list that failed to answer,
+        // are both left alone.
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: false,
+            onScreenWindows: elsewhere + [[kCGWindowNumber as String: 4002]],
+            panelWindowNumber: 4002,
+            lastRebuiltAt: nil,
+            now: now
+        ) == .none)
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: false,
+            onScreenWindows: [],
+            panelWindowNumber: 4002,
+            lastRebuiltAt: nil,
+            now: now
+        ) == .none)
+    }
+
+    /// Whatever else is true, the pill must not be torn down and rebuilt once a second:
+    /// the check runs every time focus moves into a text field, and a cause we have not
+    /// thought of would otherwise restart the animation for as long as it lasted.
+    @Test func aRebuildThatDidNotTakeFallsBackToTheCheapNudge() {
+        let now = Date()
+
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: false,
+            onScreenWindows: [[kCGWindowNumber as String: 4001]],
+            panelWindowNumber: 4002,
+            lastRebuiltAt: now.addingTimeInterval(-1),
+            now: now
+        ) == .reassertDesktops)
+
+        #expect(RecordingHUDController.placementRepair(
+            screenIsLocked: false,
+            onScreenWindows: [[kCGWindowNumber as String: 4001]],
+            panelWindowNumber: 4002,
+            lastRebuiltAt: now.addingTimeInterval(-60),
+            now: now
+        ) == .rebuild)
+    }
+
     /// 试一下 tells the user that the bar at the bottom of their screen is the pill in
     /// the guide's window. Focus is inside Whisper itself while they read that, which is
     /// exactly the case the focus rule hides the pill for — so without this the sentence
