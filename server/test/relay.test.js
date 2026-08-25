@@ -7,6 +7,11 @@ import test from "node:test";
 
 import { authenticateRequest, tokenDigest } from "../src/auth.js";
 import {
+  auditConnectionEnd,
+  auditDeviceID,
+  connectionMetadata,
+} from "../src/connection-audit.js";
+import {
   allowlistDigest,
   CLIENT_MAX_TURN_AUDIO_BYTES,
   EMPTY_LEGACY_ALLOWLIST_SENTINEL,
@@ -70,6 +75,40 @@ test("deploy mutations share the flock owner's SSH connection and fail closed", 
   assert.match(tokenProbe, /if \[ "\$TOKEN_FILE_STATUS" -eq 1 \]/);
   assert.ok(tokenProbe.indexOf("-eq 1") < tokenProbe.indexOf("CREATED_TOKEN_FILE=1"));
   assert.match(tokenProbe, /else[\s\S]*false/);
+
+  // Production must not retain an older explicit value in .env after the source
+  // default changes; deploy reconciliation is the authoritative live setting.
+  assert.match(script, /\/\^MAX_CONNECTIONS_PER_DEVICE=\/d/);
+  assert.match(script, /MAX_CONNECTIONS_PER_DEVICE=5/);
+});
+
+test("connection audit metadata is bounded and never logs credentials", () => {
+  const connectionID = "123e4567-e89b-42d3-a456-426614174000";
+  assert.deepEqual(connectionMetadata({
+    "x-whisper-client": "Wink",
+    "x-whisper-version": "0.1+5",
+    "x-whisper-connection-id": connectionID,
+    authorization: "Bearer must-not-escape",
+  }), {
+    client: "wink",
+    version: "0.1+5",
+    connectionID,
+  });
+  assert.deepEqual(connectionMetadata({
+    "x-whisper-client": "wink\nforged=true",
+    "x-whisper-version": "version with spaces",
+    "x-whisper-connection-id": "not-a-uuid",
+  }), {
+    client: "unknown",
+    version: "unknown",
+    connectionID: "unknown",
+  });
+
+  const digest = tokenDigest("a credential that must stay private");
+  assert.equal(auditDeviceID(digest), digest.slice(0, 12));
+  assert.equal(auditDeviceID("raw-token"), "unknown");
+  assert.equal(auditConnectionEnd("client went away"), "client-went-away");
+  assert.equal(auditConnectionEnd("client closed\nforged=true"), "unknown");
 });
 
 // Feeds scripted inputs to the decision functions lifted out of script/deploy_relay.sh
@@ -823,18 +862,17 @@ test("a reload revokes the right sockets and leaves the rest connected", () => {
   assert.deepEqual(droppedByIssue, []);
 });
 
-test("ten people each hold their own slots, but not the whole box", () => {
+test("shared app identity has reconnect headroom but not unlimited slots", () => {
   const config = loadConfig(baseEnv);
-  // One warm socket per person, plus one transient during a reconnect. This is what
-  // makes a token each the right shape: ten people sharing one token would be ten
-  // connections on one device, and the third of them would be refused.
-  assert.equal(config.maxConnectionsPerDevice, 2);
-  assert.equal(admitConnection({ openForDevice: 1, openTotal: 9, config }), null);
-  assert.equal(admitConnection({ openForDevice: 2, openTotal: 9, config }), "device");
+  // Whisper and Wink share one identity: two warm sockets, two reconnect overlaps,
+  // and one bounded diagnostic margin. The next connection is still refused.
+  assert.equal(config.maxConnectionsPerDevice, 5);
+  assert.equal(admitConnection({ openForDevice: 4, openTotal: 9, config }), null);
+  assert.equal(admitConnection({ openForDevice: 5, openTotal: 9, config }), "device");
 
-  // The per-device cap alone cannot protect a 1 vCPU box: ten distinct devices all
-  // pass it. Headroom for ten people at two slots each, and a wall after that.
-  assert.ok(config.maxTotalConnections >= 10 * config.maxConnectionsPerDevice);
+  // The per-device cap alone cannot protect a 1 vCPU box: distinct devices all pass
+  // it. Keep room for several honest devices, and a separate global wall after that.
+  assert.ok(config.maxTotalConnections >= 4 * config.maxConnectionsPerDevice);
   assert.equal(
     admitConnection({ openForDevice: 0, openTotal: config.maxTotalConnections, config }),
     "total",

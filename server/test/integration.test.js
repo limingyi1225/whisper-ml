@@ -900,11 +900,14 @@ test("a client that stops answering pings is terminated and releases its upstrea
 
   const relayServer = http.createServer();
   const relayWSS = new WebSocketServer({ server: relayServer });
+  let auditEnd;
   relayWSS.on("connection", (downstream) => {
     bridgeRealtime(downstream, {
       ...baseConfig,
       openAIRealtimeURL: `ws://127.0.0.1:${upstreamPort}/v1/realtime`,
       clientHeartbeatIntervalMs: 60,
+    }, {
+      onEnd: (reason) => { auditEnd = reason; },
     });
   });
   const relayPort = await listen(relayServer);
@@ -931,6 +934,7 @@ test("a client that stops answering pings is terminated and releases its upstrea
 
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(upstreamClosed, true, "the paid upstream session must go with it");
+    assert.equal(auditEnd, "client went away");
   } finally {
     client.terminate();
     for (const socket of relayWSS.clients) socket.terminate();

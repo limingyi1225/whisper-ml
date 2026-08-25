@@ -10,9 +10,9 @@
 #       two permissions, and it works. No pasting.
 #
 # One build per person on purpose. Handing the same token to ten people would make them
-# share one identity on the relay: MAX_CONNECTIONS_PER_DEVICE=2 means the third person
-# to open the app gets 429'd, the 30/min cleanup budget is shared, and removing one
-# person means rotating everyone. A token each costs one command and none of that.
+# share one identity on the relay: their apps consume the same connection allowance,
+# the 30/min cleanup budget is shared, and removing one person means rotating everyone.
+# A token each costs one command and none of that.
 #
 # One-time setup (only you can do this part — it needs an Apple ID credential):
 #

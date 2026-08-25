@@ -276,7 +276,11 @@ function pauseUntilDrained(source, target, config, isSettled, {
   timer.unref();
 }
 
-export function bridgeRealtime(downstream, config, { consumeAudio = null } = {}) {
+export function bridgeRealtime(
+  downstream,
+  config,
+  { consumeAudio = null, onEnd = null } = {},
+) {
   const upstream = new WebSocket(config.openAIRealtimeURL, {
     headers: { authorization: `Bearer ${config.openAIAPIKey}` },
     handshakeTimeout: 10_000,
@@ -297,6 +301,9 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
   // only at `isPaused` covers the first case and falsely reaps the second one.
   let downstreamTargetBackpressured = false;
   let upstreamTargetBackpressured = false;
+  const publishEnd = (reason) => {
+    try { onEnd?.(reason); } catch { /* diagnostics must never own transport teardown */ }
+  };
   const markDownstreamAlive = () => { downstreamAlive = true; };
   const markUpstreamAlive = () => { upstreamAlive = true; };
   const pauseForUpstream = () => pauseUntilDrained(
@@ -311,7 +318,7 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
         markDownstreamAlive();
         markUpstreamAlive();
       },
-      onStall: () => terminateBoth(),
+      onStall: () => terminateBoth("upstream backpressure stalled"),
     },
   );
   const pauseForDownstream = () => pauseUntilDrained(
@@ -326,13 +333,14 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
         markUpstreamAlive();
         markDownstreamAlive();
       },
-      onStall: () => terminateBoth(),
+      onStall: () => terminateBoth("downstream backpressure stalled"),
     },
   );
 
   const closeBoth = (code = 1011, reason = "relay closed") => {
     if (settled) return;
     settled = true;
+    publishEnd(reason);
     if (downstream.readyState === WebSocket.OPEN) downstream.close(code, reason);
     if (upstream.readyState === WebSocket.OPEN
         || upstream.readyState === WebSocket.CONNECTING) {
@@ -344,9 +352,10 @@ export function bridgeRealtime(downstream, config, { consumeAudio = null } = {})
   // is paused and may itself have a large outbound queue, so a graceful close frame can
   // sit behind that queue until ws's 30-second close timer. Force both TCP connections
   // down to release the paid upstream and the relay slot at the watchdog deadline.
-  const terminateBoth = () => {
+  const terminateBoth = (reason = "backpressure stalled") => {
     if (settled) return;
     settled = true;
+    publishEnd(reason);
     if (downstream.readyState === WebSocket.OPEN
         || downstream.readyState === WebSocket.CONNECTING) downstream.terminate();
     if (upstream.readyState === WebSocket.OPEN

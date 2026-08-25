@@ -12,6 +12,16 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "realtime"
 /// flushed the moment the session is ready — nothing is lost, it just lands late.
 @Observable
 public final class RealtimeClient {
+    public struct ClientAuditIdentity: Equatable, Sendable {
+        public let client: String
+        public let version: String
+
+        public nonisolated init(client: String, version: String) {
+            self.client = client
+            self.version = version
+        }
+    }
+
     public init() {}
     public enum Status: Equatable {
         case disconnected
@@ -156,6 +166,32 @@ public final class RealtimeClient {
 
     // MARK: - Connection lifecycle
 
+    /// A controlled label for Relay lifecycle diagnostics. It is deliberately derived
+    /// from the signed app's bundle rather than supplied by settings, and the server
+    /// independently allowlists it before logging. Unknown package/test hosts stay
+    /// useful without gaining a path to write arbitrary values into journald.
+    public nonisolated static func clientAuditIdentity(
+        bundleIdentifier: String?,
+        version: String?
+    ) -> ClientAuditIdentity {
+        let client = switch bundleIdentifier {
+        case "com.mingyili.Whisper": "whisper"
+        case "com.wink.Wink": "wink"
+        default: "unknown"
+        }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-")
+        let safeVersion: String
+        if let version,
+           !version.isEmpty,
+           version.utf8.count <= 32,
+           version.unicodeScalars.allSatisfy({ allowed.contains($0) }) {
+            safeVersion = version
+        } else {
+            safeVersion = "unknown"
+        }
+        return ClientAuditIdentity(client: client, version: safeVersion)
+    }
+
     /// Opens the socket if it is not already up. Safe to call repeatedly.
     public func connectIfNeeded(resetRetryBudget: Bool = false) {
         if resetRetryBudget { reconnectAttempt = 0 }
@@ -185,6 +221,18 @@ public final class RealtimeClient {
 
         var request = URLRequest(url: route.realtimeURL)
         request.setValue("Bearer \(route.credential)", forHTTPHeaderField: "Authorization")
+        if route.mode == .relay {
+            let identity = Self.clientAuditIdentity(
+                bundleIdentifier: Bundle.main.bundleIdentifier,
+                version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            )
+            request.setValue(identity.client, forHTTPHeaderField: "X-Whisper-Client")
+            request.setValue(identity.version, forHTTPHeaderField: "X-Whisper-Version")
+            request.setValue(
+                UUID().uuidString.lowercased(),
+                forHTTPHeaderField: "X-Whisper-Connection-ID"
+            )
+        }
 
         let task = urlSession.webSocketTask(with: request)
         socket = task

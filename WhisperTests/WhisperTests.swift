@@ -1323,3 +1323,35 @@ import Testing
         #expect(AudioCapture.bytesPerSecond == 24_000 * 2)
     }
 }
+
+@Suite struct RealtimeClientAuditIdentityTests {
+    @Test func knownHostsProduceControlledRelayAuditLabels() {
+        #expect(
+            RealtimeClient.clientAuditIdentity(
+                bundleIdentifier: "com.mingyili.Whisper",
+                version: "1.10"
+            ) == .init(client: "whisper", version: "1.10")
+        )
+        #expect(
+            RealtimeClient.clientAuditIdentity(
+                bundleIdentifier: "com.wink.Wink",
+                version: "0.1+5"
+            ) == .init(client: "wink", version: "0.1+5")
+        )
+    }
+
+    @Test func unknownOrUnsafeHostMetadataCannotReachRelayLogs() {
+        #expect(
+            RealtimeClient.clientAuditIdentity(
+                bundleIdentifier: "com.example.Other",
+                version: "1.0\nforged=true"
+            ) == .init(client: "unknown", version: "unknown")
+        )
+        #expect(
+            RealtimeClient.clientAuditIdentity(
+                bundleIdentifier: nil,
+                version: String(repeating: "1", count: 33)
+            ) == .init(client: "unknown", version: "unknown")
+        )
+    }
+}

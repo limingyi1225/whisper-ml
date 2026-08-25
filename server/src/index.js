@@ -4,6 +4,11 @@ import { dirname } from "node:path";
 import { WebSocketServer } from "ws";
 
 import { authenticateRequest } from "./auth.js";
+import {
+  auditConnectionEnd,
+  auditDeviceID,
+  connectionMetadata,
+} from "./connection-audit.js";
 import { allowlistDigest, loadConfig, loadDeviceTokenHashes } from "./config.js";
 import {
   EnrollmentRegistry,
@@ -248,6 +253,8 @@ server.on("upgrade", (request, socket, head) => {
   }
 
   const active = activeConnections.get(deviceID) || 0;
+  const metadata = connectionMetadata(request.headers);
+  const auditID = auditDeviceID(deviceID);
   // `downstreamSockets.size`, not a sum over the per-device map: it is the set the
   // close handlers maintain, so it cannot drift out of step with what is really open.
   const refusal = admitConnection({
@@ -256,11 +263,18 @@ server.on("upgrade", (request, socket, head) => {
     config,
   });
   if (refusal) {
-    if (refusal === "total") {
-      process.stderr.write(
-        `refusing connection: ${downstreamSockets.size} already open\n`,
-      );
-    }
+    process.stderr.write(
+      "realtime connection rejected"
+      + ` reason=${refusal}`
+      + ` device=${auditID}`
+      + ` client=${metadata.client}`
+      + ` version=${metadata.version}`
+      + ` connection=${metadata.connectionID}`
+      + ` device_open=${active}`
+      + ` device_limit=${config.maxConnectionsPerDevice}`
+      + ` total_open=${downstreamSockets.size}`
+      + ` total_limit=${config.maxTotalConnections}\n`,
+    );
     socket.end("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
     return;
   }
@@ -270,16 +284,44 @@ server.on("upgrade", (request, socket, head) => {
     // upgrade never reaches this callback; counting it earlier would permanently use
     // one of the device's slots because there is no downstream close event to release.
     activeConnections.set(deviceID, active + 1);
-    const session = { deviceID, upstream: null };
+    const connectedAt = Date.now();
+    const session = {
+      deviceID,
+      upstream: null,
+      ...metadata,
+      connectedAt,
+      end: "unsettled",
+    };
     downstreamSockets.set(downstream, session);
+    process.stdout.write(
+      "realtime connection admitted"
+      + ` device=${auditID}`
+      + ` client=${metadata.client}`
+      + ` version=${metadata.version}`
+      + ` connection=${metadata.connectionID}`
+      + ` device_open=${active + 1}`
+      + ` total_open=${downstreamSockets.size}\n`,
+    );
     let counted = true;
-    const release = () => {
+    const release = (closeCode = 1011, end = session.end) => {
       downstreamSockets.delete(downstream);
       if (!counted) return;
       counted = false;
       const count = activeConnections.get(deviceID) || 1;
       if (count <= 1) activeConnections.delete(deviceID);
       else activeConnections.set(deviceID, count - 1);
+      process.stdout.write(
+        "realtime connection released"
+        + ` device=${auditID}`
+        + ` client=${metadata.client}`
+        + ` version=${metadata.version}`
+        + ` connection=${metadata.connectionID}`
+        + ` close_code=${Number.isInteger(closeCode) ? closeCode : 1011}`
+        + ` end=${end}`
+        + ` age_ms=${Math.max(0, Date.now() - connectedAt)}`
+        + ` device_open=${Math.max(0, count - 1)}`
+        + ` total_open=${downstreamSockets.size}\n`,
+      );
     };
     // Only `close` releases the slot, because only `close` means the socket is gone.
     //
@@ -292,7 +334,6 @@ server.on("upgrade", (request, socket, head) => {
     // much alive, and "connect, send one illegal frame, never answer" in a loop walked
     // straight past both the per-device and the total ceiling. Measured with ten such
     // rounds: releasing on `error` left 10 live uncounted sockets, this leaves 0.
-    downstream.once("close", release);
     downstream.once("error", () => downstream.terminate());
     // Belt and braces behind the URL validation in config: anything thrown here would
     // otherwise be an uncaught exception inside an event handler, i.e. the whole relay
@@ -301,11 +342,16 @@ server.on("upgrade", (request, socket, head) => {
     try {
       session.upstream = bridgeRealtime(downstream, config, {
         consumeAudio: (bytes) => transcriptionDailyUsage.take(deviceID, bytes),
+        onEnd: (reason) => { session.end = auditConnectionEnd(reason); },
       });
+      // Register after the bridge's own close listener. It assigns the controlled
+      // internal reason first; this listener then releases the counted slot and logs
+      // that reason instead of the peer's arbitrary close-frame text.
+      downstream.once("close", (code) => release(code));
     } catch (error) {
       process.stderr.write(`bridge failed to start: ${error.message}\n`);
       downstream.close(1011, "relay could not reach OpenAI");
-      release();
+      release(1011, "bridge-start-failed");
     }
   });
 });

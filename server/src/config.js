@@ -40,7 +40,11 @@ const DEFAULTS = Object.freeze({
   // transcribes to well under this, so hitting it means something is wrong rather
   // than that a real sentence was too long.
   maxPolishCompletionTokens: 8192,
-  maxConnectionsPerDevice: 2,
+  // Whisper and Wink deliberately share one device credential. Each may keep one warm
+  // socket, and either may briefly overlap its old socket while reconnecting. A fifth
+  // slot leaves one bounded diagnostic margin without turning a client lifecycle leak
+  // into an unlimited number of paid upstream sessions.
+  maxConnectionsPerDevice: 5,
   // Per-device caps bound one leaked token; they do nothing about ten honest people
   // all dictating at once. Each bridge can hold `maxForwardBufferBytes` queued in each
   // direction, so the arithmetic that matters is buffers × bridges against a 1 vCPU /
