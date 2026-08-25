@@ -824,7 +824,7 @@ public final class RealtimeClient {
 
     private func startKeepAlive() {
         keepAliveTimer?.invalidate()
-        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        keepAliveTimer = CommonRunLoopTimer.schedule(after: 20, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self,
                       let socket = self.socket,
@@ -874,7 +874,10 @@ public final class RealtimeClient {
     /// `connectIfNeeded` until the process is relaunched.
     private func startConnectionTimeout(generation: Int) {
         connectionTimeoutTimer?.invalidate()
-        let timer = Timer(timeInterval: Self.connectionSetupTimeout, repeats: false) { [weak self] _ in
+        connectionTimeoutTimer = CommonRunLoopTimer.schedule(
+            after: Self.connectionSetupTimeout,
+            repeats: false
+        ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self,
                       generation == self.generation,
@@ -883,15 +886,16 @@ public final class RealtimeClient {
                 self.recoverFromUnresponsiveTransport(reason: "连接超时")
             }
         }
-        connectionTimeoutTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Detects the half-open case where `sendPing` itself never calls back. Only one
     /// ping may be in flight, so a wedged task cannot accumulate callbacks every 20 s.
     private func startKeepAliveTimeout(generation: Int, pingSequence: Int) {
         keepAliveTimeoutTimer?.invalidate()
-        let timer = Timer(timeInterval: Self.keepAliveResponseTimeout, repeats: false) { [weak self] _ in
+        keepAliveTimeoutTimer = CommonRunLoopTimer.schedule(
+            after: Self.keepAliveResponseTimeout,
+            repeats: false
+        ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self,
                       generation == self.generation,
@@ -907,8 +911,6 @@ public final class RealtimeClient {
                 self.recoverFromUnresponsiveTransport(reason: "连接失去响应")
             }
         }
-        keepAliveTimeoutTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func clearKeepAliveProbe() {
@@ -934,7 +936,7 @@ public final class RealtimeClient {
         // Floor at seconds, not half a minute — flooring at 30 could schedule the
         // refresh *after* a short-lived session's expiry.
         let delay = max(5, sessionExpiry.timeIntervalSinceNow - lead)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+        refreshTimer = CommonRunLoopTimer.schedule(after: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshWhenIdle() }
         }
     }
@@ -1089,7 +1091,7 @@ public final class RealtimeClient {
             // trigger; this timer is only a backstop for paths that never reach
             // one, e.g. an utterance dissolved without any callback.
             pendingSettingsRefresh = true
-            refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+            refreshTimer = CommonRunLoopTimer.schedule(after: 3, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshWhenIdle() }
             }
             return
@@ -1150,7 +1152,10 @@ public final class RealtimeClient {
     private func scheduleResponseTimeout(after interval: TimeInterval) {
         clearResponseTimeout()
         responseTimeoutDeadline = Date().addingTimeInterval(interval)
-        responseTimeoutTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+        responseTimeoutTimer = CommonRunLoopTimer.schedule(
+            after: interval,
+            repeats: false
+        ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.utteranceActive else { return }
                 self.utteranceActive = false

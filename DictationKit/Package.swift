@@ -39,6 +39,10 @@ let package = Package(
                 .enableUpcomingFeature("MemberImportVisibility"),
                 .enableUpcomingFeature("NonisolatedNonsendingByDefault")
             ]
+        ),
+        .testTarget(
+            name: "DictationKitTests",
+            dependencies: ["DictationKit"]
         )
     ]
 )
