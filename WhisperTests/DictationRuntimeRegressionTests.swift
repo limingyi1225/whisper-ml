@@ -119,6 +119,174 @@ import Testing
         ))
     }
 
+    /// A cold AX tree may answer nil on the first utterance after relaunch. That answer
+    /// delays live typing; it must not become a permanent per-utterance latch while no
+    /// text has been emitted. The retry remains bounded and loses authority immediately
+    /// after any mutation or anchor change.
+    @Test func unpublishedFirstFieldCanRetryOnlyBeforeAnyMutation() {
+        let firstReadUptime: TimeInterval = 1_000
+        let retryDeadlineUptime = firstReadUptime + 0.35
+
+        #expect(DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: firstReadUptime,
+            retryNotBeforeUptime: nil,
+            recoveryAttempts: 0
+        ))
+        #expect(!DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: firstReadUptime + 0.34,
+            retryNotBeforeUptime: retryDeadlineUptime,
+            recoveryAttempts: 1
+        ))
+        #expect(DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: retryDeadlineUptime,
+            recoveryAttempts: 1
+        ))
+        #expect(!DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: true,
+            anchorUnchanged: true,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: nil,
+            recoveryAttempts: 0
+        ))
+        #expect(!DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: false,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: nil,
+            recoveryAttempts: 0
+        ))
+        #expect(DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: retryDeadlineUptime,
+            recoveryAttempts: DictationController.maximumLiveInjectionRecoveryAttempts - 1
+        ))
+        #expect(!DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: retryDeadlineUptime,
+            recoveryAttempts: DictationController.maximumLiveInjectionRecoveryAttempts
+        ))
+        #expect(DictationController.shouldConfirmStagedLiveInjectionTarget(
+            hasStagedTarget: true,
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: retryDeadlineUptime
+        ))
+        #expect(!DictationController.shouldConfirmStagedLiveInjectionTarget(
+            hasStagedTarget: true,
+            hasLiveMutation: false,
+            anchorUnchanged: false,
+            nowUptime: retryDeadlineUptime,
+            retryNotBeforeUptime: retryDeadlineUptime
+        ))
+
+        // A slow AX probe must not consume its own cooldown. The deadline is measured
+        // from completion, so another interim immediately after a 700 ms probe waits.
+        let slowProbeFinishedUptime = firstReadUptime + 0.7
+        let postProbeDeadline = DictationController.liveInjectionRetryDeadline(
+            afterProbeAt: slowProbeFinishedUptime
+        )
+        #expect(postProbeDeadline == slowProbeFinishedUptime + 0.35)
+        #expect(!DictationController.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            nowUptime: slowProbeFinishedUptime + 0.01,
+            retryNotBeforeUptime: postProbeDeadline,
+            recoveryAttempts: 1
+        ))
+
+        // A candidate found during the current blocking AX probe is only staged. It
+        // becomes writable after a later probe proves the same saved object still owns
+        // focus and the frozen input anchor has not observed foreign input.
+        #expect(!DictationController.mayAdoptRecoveredLiveInjectionTarget(
+            wasStagedBeforeCurrentProbe: false,
+            anchorUnchanged: true,
+            exactElementFocused: true
+        ))
+        #expect(DictationController.mayAdoptRecoveredLiveInjectionTarget(
+            wasStagedBeforeCurrentProbe: true,
+            anchorUnchanged: true,
+            exactElementFocused: true
+        ))
+        #expect(!DictationController.mayAdoptRecoveredLiveInjectionTarget(
+            wasStagedBeforeCurrentProbe: true,
+            anchorUnchanged: false,
+            exactElementFocused: true
+        ))
+        #expect(!DictationController.mayAdoptRecoveredLiveInjectionTarget(
+            wasStagedBeforeCurrentProbe: true,
+            anchorUnchanged: true,
+            exactElementFocused: nil
+        ))
+
+        let unchangedInput = DictationController.LiveInjectionInputEpoch(
+            keyDown: 10,
+            leftMouseDown: 20,
+            rightMouseDown: 30,
+            otherMouseDown: 40
+        )
+        #expect(DictationController.liveInjectionInputStayedUnchanged(
+            before: unchangedInput,
+            after: unchangedInput
+        ))
+        #expect(!DictationController.liveInjectionInputStayedUnchanged(
+            before: unchangedInput,
+            after: .init(
+                keyDown: 10,
+                leftMouseDown: 21,
+                rightMouseDown: 30,
+                otherMouseDown: 40
+            )
+        ))
+        // A `CFEqual` mismatch before any synthetic text, with the app and the input
+        // counters both unmoved, stops live typing but must never revoke the final
+        // paste: that is the difference between the sentence arriving and the user
+        // being handed a clipboard to paste by hand. Whether the gesture-start capture
+        // happened to succeed does not change that.
+        #expect(DictationController.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            inputEpochUnchanged: true,
+            exactElementFocused: false
+        ))
+        #expect(!DictationController.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: true,
+            anchorUnchanged: true,
+            inputEpochUnchanged: true,
+            exactElementFocused: false
+        ))
+        #expect(!DictationController.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            inputEpochUnchanged: false,
+            exactElementFocused: false
+        ))
+        #expect(!DictationController.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: false,
+            anchorUnchanged: false,
+            inputEpochUnchanged: true,
+            exactElementFocused: false
+        ))
+        // Absence still means "look again later", not "focus moved".
+        #expect(!DictationController.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: false,
+            anchorUnchanged: true,
+            inputEpochUnchanged: true,
+            exactElementFocused: nil
+        ))
+    }
+
     /// Focus identity cannot prove which text Backspace will consume. Only a positive
     /// document read can authorize a destructive rewrite.
     @Test func aRewriteDeletesOnlyWithPositiveTextProof() {

@@ -1,6 +1,7 @@
 import DictationKit
 import AVFoundation
 import AppKit
+import CoreGraphics
 import OSLog
 
 private let log = Logger(subsystem: "com.mingyili.Whisper", category: "dictation")
@@ -69,10 +70,24 @@ final class DictationController {
 
     /// What we have actually typed into the target app this utterance.
     @ObservationIgnored private var injectedText = ""
-    /// The target does not publish enough exact AX identity for safe live typing.
-    /// This is not the same as losing ownership after a write: no text has been sent,
-    /// so the authoritative final may still use the ordinary PID-checked paste path.
+    /// Exact AX identity disappeared after this utterance had already typed something.
+    /// Retrying then could resume in another same-app control, so live typing stays off
+    /// until the authoritative final reconciles the text already emitted.
     @ObservationIgnored private var liveInjectionSuppressed = false
+    /// A cold Electron/WebView accessibility tree can publish no focused element for the
+    /// first query after Whisper relaunches, then answer normally a moment later. Before
+    /// this utterance has mutated anything, retry that optional evidence at a bounded
+    /// cadence instead of permanently turning a transient `nil` into paste-only mode.
+    @ObservationIgnored private var liveInjectionRetryNotBeforeUptime: TimeInterval?
+    /// Recovery probes are deliberately scarce: a persistently opaque editor must not
+    /// block the main actor on cross-process AX calls every 350 ms for a 120-second hold.
+    @ObservationIgnored private var liveInjectionRecoveryAttempts = 0
+    /// A field discovered after the utterance started is never trusted in the same main-
+    /// actor turn. Holding it across the cooldown gives the event tap time to publish a
+    /// click/key that happened during the blocking AX query, then lets a later partial
+    /// prove that this exact element — rather than another field in the same app — stayed
+    /// focused before any text is emitted.
+    @ObservationIgnored private var pendingLiveInjectionTarget: TextInjectionTarget?
     /// The previous interim hypothesis, kept so that only the part two of them
     /// agree on is typed. See `stablePartialPrefix`.
     @ObservationIgnored private var previousPartialSnapshot = ""
@@ -161,6 +176,13 @@ final class DictationController {
     struct InjectionAnchor: Equatable {
         let processIdentifier: pid_t?
         let lastForeignInputAt: Date?
+    }
+
+    struct LiveInjectionInputEpoch: Equatable {
+        let keyDown: UInt32
+        let leftMouseDown: UInt32
+        let rightMouseDown: UInt32
+        let otherMouseDown: UInt32
     }
 
     struct QueuedGestureIdentity {
@@ -330,6 +352,98 @@ final class DictationController {
         guard anchorUnchanged else { return .abandonTarget }
         guard let exactElementFocused else { return .deferToFinalPaste }
         return exactElementFocused ? .continueTyping : .abandonTarget
+    }
+
+    /// Whether an inconclusive exact-field read may be retried for this utterance now.
+    ///
+    /// Recovery is intentionally narrower than ordinary live injection: it exists only
+    /// while no synthetic mutation has happened and the frozen app/input anchor still
+    /// agrees. Once either changes, a newly captured field could be a different control
+    /// and positive evidence about *that* control would not prove ownership of the one
+    /// where the user began speaking.
+    static func shouldRetryLiveInjectionEvidence(
+        hasLiveMutation: Bool,
+        anchorUnchanged: Bool,
+        nowUptime: TimeInterval,
+        retryNotBeforeUptime: TimeInterval?,
+        recoveryAttempts: Int
+    ) -> Bool {
+        guard !hasLiveMutation,
+              anchorUnchanged,
+              recoveryAttempts < maximumLiveInjectionRecoveryAttempts else {
+            return false
+        }
+        return retryNotBeforeUptime.map { nowUptime >= $0 } ?? true
+    }
+
+    private static let liveInjectionRetryInterval: TimeInterval = 0.35
+    static let maximumLiveInjectionRecoveryAttempts = 3
+
+    static func liveInjectionRetryDeadline(afterProbeAt uptime: TimeInterval) -> TimeInterval {
+        uptime + liveInjectionRetryInterval
+    }
+
+    static func shouldConfirmStagedLiveInjectionTarget(
+        hasStagedTarget: Bool,
+        hasLiveMutation: Bool,
+        anchorUnchanged: Bool,
+        nowUptime: TimeInterval,
+        retryNotBeforeUptime: TimeInterval?
+    ) -> Bool {
+        hasStagedTarget
+            && !hasLiveMutation
+            && anchorUnchanged
+            && (retryNotBeforeUptime.map { nowUptime >= $0 } ?? true)
+    }
+
+    static func mayAdoptRecoveredLiveInjectionTarget(
+        wasStagedBeforeCurrentProbe: Bool,
+        anchorUnchanged: Bool,
+        exactElementFocused: Bool?
+    ) -> Bool {
+        wasStagedBeforeCurrentProbe && anchorUnchanged && exactElementFocused == true
+    }
+
+    static func liveInjectionInputStayedUnchanged(
+        before: LiveInjectionInputEpoch,
+        after: LiveInjectionInputEpoch
+    ) -> Bool {
+        before == after
+    }
+
+    /// Whether an element-identity mismatch may stop live typing without also
+    /// forfeiting the final paste.
+    ///
+    /// `focusedElementMatches` documents its own `false` as weak evidence: apps rebuild
+    /// their accessibility tree around text just typed into them, so a `CFEqual`
+    /// mismatch names a fresh proxy for the same field at least as often as it names a
+    /// real focus move. Before any synthetic text exists, with the app anchor and the
+    /// WindowServer input counters both unmoved, nothing says the user went anywhere.
+    ///
+    /// Abandoning the utterance here does not merely stop typing: it also revokes the
+    /// final delivery, and the sentence lands on the clipboard for the user to paste by
+    /// hand — while `TextInjector.paste`, which deliberately compares only the app,
+    /// would have delivered it. Give up the identity-dependent half only.
+    static func focusMismatchMayDeferToFinalPaste(
+        hasLiveMutation: Bool,
+        anchorUnchanged: Bool,
+        inputEpochUnchanged: Bool,
+        exactElementFocused: Bool?
+    ) -> Bool {
+        !hasLiveMutation
+            && anchorUnchanged
+            && inputEpochUnchanged
+            && exactElementFocused == false
+    }
+
+    private static func currentLiveInjectionInputEpoch() -> LiveInjectionInputEpoch {
+        let state = CGEventSourceStateID.combinedSessionState
+        return LiveInjectionInputEpoch(
+            keyDown: CGEventSource.counterForEventType(state, eventType: .keyDown),
+            leftMouseDown: CGEventSource.counterForEventType(state, eventType: .leftMouseDown),
+            rightMouseDown: CGEventSource.counterForEventType(state, eventType: .rightMouseDown),
+            otherMouseDown: CGEventSource.counterForEventType(state, eventType: .otherMouseDown)
+        )
     }
 
     /// Whether the destructive half of a cleanup rewrite may post its backspaces.
@@ -642,6 +756,9 @@ final class DictationController {
                     accumulatedPartial = ""
                     injectedText = ""
                     liveInjectionSuppressed = false
+                    liveInjectionRetryNotBeforeUptime = nil
+                    liveInjectionRecoveryAttempts = 0
+                    pendingLiveInjectionTarget = nil
                     previousPartialSnapshot = ""
                     utteranceRoute = nil
                     injectionTarget = nil
@@ -758,6 +875,9 @@ final class DictationController {
         accumulatedPartial = ""
         injectedText = ""
         liveInjectionSuppressed = false
+        liveInjectionRetryNotBeforeUptime = nil
+        liveInjectionRecoveryAttempts = 0
+        pendingLiveInjectionTarget = nil
         previousPartialSnapshot = ""
         pendingRawText = nil
         captureInterruptionNotice = nil
@@ -929,25 +1049,182 @@ final class DictationController {
         // The frozen AX element is required for live typing. Some opaque editors do not
         // publish it; those controls safely fall back to final paste instead of risking
         // that partial speech is typed into a different field in the same app.
-        let exactElementFocused = injectionTarget.flatMap {
-            TextInjector.focusedElementMatches($0.element)
-        }
         guard let injectionAnchor, let current = currentAnchor() else {
             injectionAbandoned = true
             log.info("the frozen app disappeared; stopping injection")
             return
         }
+        let anchorUnchanged = injectionAnchor == current
+        guard anchorUnchanged else {
+            injectionAbandoned = true
+            log.info("the frozen field moved or foreign input arrived; stopping injection")
+            return
+        }
+
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let retryIsDue = Self.shouldRetryLiveInjectionEvidence(
+            hasLiveMutation: !injectedText.isEmpty,
+            anchorUnchanged: true,
+            nowUptime: nowUptime,
+            retryNotBeforeUptime: liveInjectionRetryNotBeforeUptime,
+            recoveryAttempts: liveInjectionRecoveryAttempts
+        )
+        let stagedConfirmationIsDue = Self.shouldConfirmStagedLiveInjectionTarget(
+            hasStagedTarget: pendingLiveInjectionTarget != nil,
+            hasLiveMutation: !injectedText.isEmpty,
+            anchorUnchanged: true,
+            nowUptime: nowUptime,
+            retryNotBeforeUptime: liveInjectionRetryNotBeforeUptime
+        )
+        var exactElementFocused: Bool?
+        var performedBlockingAXQuery = false
+        var inputEpochBeforeBlockingAXQuery: LiveInjectionInputEpoch?
+        var performedStagedConfirmation = false
+        var recoveredCandidateToStage: TextInjectionTarget?
+        var stagedCandidateToAdopt: TextInjectionTarget?
+
+        if let existingTarget = injectionTarget {
+            // Once an utterance has captured a field, never replace that identity merely
+            // because a later query is inconclusive. A fresh object could name another
+            // same-app control. Retry the frozen element itself after the cooldown.
+            if liveInjectionRetryNotBeforeUptime == nil || retryIsDue {
+                if liveInjectionRetryNotBeforeUptime != nil {
+                    liveInjectionRecoveryAttempts += 1
+                }
+                performedBlockingAXQuery = true
+                inputEpochBeforeBlockingAXQuery = Self.currentLiveInjectionInputEpoch()
+                exactElementFocused = TextInjector.focusedElementMatches(
+                    existingTarget.element
+                )
+                if exactElementFocused == true {
+                    liveInjectionRetryNotBeforeUptime = nil
+                }
+            }
+        } else if let pendingTarget = pendingLiveInjectionTarget,
+                  stagedConfirmationIsDue {
+            // The candidate was discovered in an earlier main-actor turn. Revalidate
+            // that exact object after the cooldown; never capture a replacement. One
+            // staged candidate gets this confirmation even if discovery consumed the
+            // ordinary retry cap, then a nil/false result retires it.
+            performedBlockingAXQuery = true
+            performedStagedConfirmation = true
+            liveInjectionRecoveryAttempts += 1
+            inputEpochBeforeBlockingAXQuery = Self.currentLiveInjectionInputEpoch()
+            exactElementFocused = TextInjector.focusedElementMatches(pendingTarget.element)
+            if Self.mayAdoptRecoveredLiveInjectionTarget(
+                wasStagedBeforeCurrentProbe: true,
+                anchorUnchanged: injectionAnchor == currentAnchor(),
+                exactElementFocused: exactElementFocused
+            ) {
+                stagedCandidateToAdopt = pendingTarget
+            }
+        } else if retryIsDue {
+            // There is no old field identity to preserve. Discover one and independently
+            // prove it is focused, but only stage it in this turn. A later partial must
+            // confirm the same object after the event tap has had time to observe input
+            // that may have happened during these blocking cross-process calls.
+            performedBlockingAXQuery = true
+            liveInjectionRecoveryAttempts += 1
+            inputEpochBeforeBlockingAXQuery = Self.currentLiveInjectionInputEpoch()
+            if let targetPID = injectionAnchor.processIdentifier,
+               let candidate = TextInjector.captureTarget(expectedPID: targetPID) {
+                exactElementFocused = TextInjector.focusedElementMatches(candidate.element)
+                if exactElementFocused == true {
+                    recoveredCandidateToStage = candidate
+                }
+            }
+        }
+
+        // AX calls can block for their full messaging timeout. A click or foreign key can
+        // arrive during that wait, so the pre-query anchor comparison is not authority to
+        // mutate afterwards. Re-check every queried path immediately before disposition.
+        if performedBlockingAXQuery, injectionAnchor != currentAnchor() {
+            injectionAbandoned = true
+            log.info("the input anchor changed while checking field identity; stopping injection")
+            return
+        }
+        if let inputEpochBeforeBlockingAXQuery,
+           !Self.liveInjectionInputStayedUnchanged(
+                before: inputEpochBeforeBlockingAXQuery,
+                after: Self.currentLiveInjectionInputEpoch()
+           ) {
+            // The event tap shares the main run loop and cannot update its timestamp
+            // while AX blocks it. WindowServer counters are independent evidence that
+            // a click/key arrived during that gap, so never authorize a write from the
+            // stale local anchor even if the foreground PID stayed the same.
+            injectionAbandoned = true
+            pendingLiveInjectionTarget = nil
+            log.info("hardware input arrived while checking field identity; stopping injection")
+            return
+        }
+        if Self.focusMismatchMayDeferToFinalPaste(
+            hasLiveMutation: !injectedText.isEmpty,
+            anchorUnchanged: true,
+            inputEpochUnchanged: true,
+            exactElementFocused: exactElementFocused
+        ) {
+            // Electron/WebView can vend a new AX proxy for the same field between two
+            // reads. With no mutation and no independent input evidence, that mismatch
+            // is not authority to disable the ordinary PID-checked final paste — which
+            // is how this sentence would otherwise reach the user's hand as a clipboard
+            // they have to paste themselves. It applies to the frozen target as much as
+            // to a rediscovered one: whether the gesture-start capture happened to
+            // succeed must not decide whether the sentence arrives. Turn the mismatch
+            // back into uncertainty and, if the cap permits, look again later.
+            pendingLiveInjectionTarget = nil
+            exactElementFocused = nil
+            liveInjectionRetryNotBeforeUptime = Self.liveInjectionRetryDeadline(
+                afterProbeAt: ProcessInfo.processInfo.systemUptime
+            )
+            log.info("the recovery field proxy changed without input; preserving final paste")
+        }
+        if let stagedCandidateToAdopt {
+            injectionTarget = stagedCandidateToAdopt
+            pendingLiveInjectionTarget = nil
+            liveInjectionRetryNotBeforeUptime = nil
+            log.info("the recovered field remained focused across retries; resuming live injection")
+        } else if let recoveredCandidateToStage {
+            pendingLiveInjectionTarget = recoveredCandidateToStage
+            // A successful discovery is not yet authority to type. Turn it back into
+            // an inconclusive result until a later partial confirms the same element.
+            exactElementFocused = nil
+            liveInjectionRetryNotBeforeUptime = Self.liveInjectionRetryDeadline(
+                afterProbeAt: ProcessInfo.processInfo.systemUptime
+            )
+            log.info("the target published field identity on retry; awaiting stable confirmation")
+        } else if performedBlockingAXQuery, exactElementFocused == nil {
+            if performedStagedConfirmation {
+                // A staged candidate receives one later confirmation opportunity. If
+                // that exact object is still unpublished, retire it rather than probing
+                // it forever; remaining ordinary attempts may discover a fresh stable
+                // candidate, while an exhausted utterance falls back to final paste.
+                pendingLiveInjectionTarget = nil
+            }
+            // Start the cooldown after the blocking probe finishes. Starting it before
+            // AX work would let a slow query consume the whole interval and immediately
+            // block the main actor again on the next queued interim.
+            liveInjectionRetryNotBeforeUptime = Self.liveInjectionRetryDeadline(
+                afterProbeAt: ProcessInfo.processInfo.systemUptime
+            )
+        }
         switch Self.liveInjectionFieldDisposition(
-            anchorUnchanged: injectionAnchor == current,
+            anchorUnchanged: true,
             exactElementFocused: exactElementFocused
         ) {
         case .continueTyping:
             break
         case .deferToFinalPaste:
-            // No mutation has happened on this path. Preserve final delivery rather
-            // than classifying an opaque editor as a target we wrote to and then lost.
-            liveInjectionSuppressed = true
-            log.info("the target exposes no exact field identity; deferring to final paste")
+            if injectedText.isEmpty {
+                // Absence is uncertainty, not disproof. A later partial may retry after
+                // the cooldown; a persistently opaque editor still reaches final paste.
+                log.info("the target exposes no exact field identity yet; deferring this partial")
+            } else {
+                // Once text exists, a later recapture could bless another same-app field.
+                // Stop live mutation permanently for this sentence and let final
+                // reconciliation use the ownership proof for what was already typed.
+                liveInjectionSuppressed = true
+                log.info("exact field identity disappeared after live typing; stopping injection")
+            }
             return
         case .abandonTarget:
             injectionAbandoned = true
@@ -988,17 +1265,37 @@ final class DictationController {
                     target: injectionTarget
                 )
                 : false
+            let hardwareInputUnchanged = inputEpochBeforeBlockingAXQuery.map {
+                Self.liveInjectionInputStayedUnchanged(
+                    before: $0,
+                    after: Self.currentLiveInjectionInputEpoch()
+                )
+            } ?? false
             guard Self.interimRevisionMayDelete(
                 firstOwnershipProof: firstOwnershipProof,
                 recheckedOwnershipProof: recheckedOwnershipProof
             ), Permissions.hasAccessibility,
                !Permissions.isSecureInputEnabled,
-               injectionAnchor == currentAnchor() else {
+               injectionAnchor == currentAnchor(),
+               hardwareInputUnchanged else {
                 injectionAbandoned = true
                 log.warning("the document cannot prove the interim text before the caret; stopping live injection")
                 return
             }
             TextInjector.deleteBackward(count: deleteCount)
+        }
+        if deleteCount == 0,
+           let inputEpochBeforeBlockingAXQuery,
+           !Self.liveInjectionInputStayedUnchanged(
+                before: inputEpochBeforeBlockingAXQuery,
+                after: Self.currentLiveInjectionInputEpoch()
+           ) {
+            // Selection/text ownership checks above can block just like the focus read.
+            // Revalidate the independent input counters after the last such query and
+            // immediately before the append-only mutation.
+            injectionAbandoned = true
+            log.info("hardware input arrived while proving the insertion range; stopping injection")
+            return
         }
         if !addition.isEmpty { TextInjector.type(addition) }
         injectedText = stable
@@ -1388,6 +1685,9 @@ final class DictationController {
         accumulatedPartial = ""
         injectedText = ""
         liveInjectionSuppressed = false
+        liveInjectionRetryNotBeforeUptime = nil
+        liveInjectionRecoveryAttempts = 0
+        pendingLiveInjectionTarget = nil
         previousPartialSnapshot = ""
         pendingRawText = nil
         utteranceGeneration += 1
@@ -1441,6 +1741,9 @@ final class DictationController {
             accumulatedPartial = ""
             injectedText = ""
             liveInjectionSuppressed = false
+            liveInjectionRetryNotBeforeUptime = nil
+            liveInjectionRecoveryAttempts = 0
+            pendingLiveInjectionTarget = nil
             previousPartialSnapshot = ""
             utteranceRoute = nil
             injectionTarget = nil
@@ -1704,6 +2007,9 @@ final class DictationController {
         accumulatedPartial = ""
         injectedText = ""
         liveInjectionSuppressed = false
+        liveInjectionRetryNotBeforeUptime = nil
+        liveInjectionRecoveryAttempts = 0
+        pendingLiveInjectionTarget = nil
         previousPartialSnapshot = ""
         pendingRawText = nil
         utteranceRoute = nil

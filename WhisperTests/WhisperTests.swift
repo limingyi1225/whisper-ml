@@ -1425,6 +1425,10 @@ import Testing
             exactElementFocused: nil
         ) == .deferToFinalPaste)
         #expect(DictationController.liveInjectionFieldDisposition(
+            anchorUnchanged: true,
+            exactElementFocused: false
+        ) == .abandonTarget)
+        #expect(DictationController.liveInjectionFieldDisposition(
             anchorUnchanged: false,
             exactElementFocused: nil
         ) == .abandonTarget)
