@@ -93,12 +93,10 @@ import Testing
         #expect(TextInjector.checkedAXElement(from: application) != nil)
     }
 
-    /// The rule three separate shipped regressions broke: a control that publishes no
-    /// focused element has not denied anything. `nil` must read like `true` here and
-    /// unlike `false`, or every sentence in an Electron or WebView editor is abandoned
-    /// on its first delta and dumped to the clipboard.
-    @Test func liveDeltasTreatAnUnobservableFieldAsPermissionNotRefusal() {
-        #expect(DictationController.canContinueLiveInjection(
+    /// Live typing is optional, while targeting the wrong same-app control leaks speech.
+    /// Missing exact-field evidence therefore falls back to final paste.
+    @Test func liveDeltasRequirePositiveExactFieldProof() {
+        #expect(!DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: nil
         ))
@@ -106,7 +104,6 @@ import Testing
             anchorUnchanged: true,
             exactElementFocused: true
         ))
-        // Silence is permission; a positive contradiction is not.
         #expect(!DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: false
@@ -122,71 +119,48 @@ import Testing
         ))
     }
 
-    /// Same rule on the destructive side, where getting it wrong is what "整理功能全面
-    /// 坏了" looked like: the raw deltas stay on screen and the cleaned sentence lands
-    /// on the clipboard instead.
-    @Test func aRewriteDeletesWhenTheDocumentIsSilentButNotWhenItDisagrees() {
-        // The full truth table, because the interesting half of it is the diagonal.
+    /// Focus identity cannot prove which text Backspace will consume. Only a positive
+    /// document read can authorize a destructive rewrite.
+    @Test func aRewriteDeletesOnlyWithPositiveTextProof() {
         for element in [nil, true, false] as [Bool?] {
-            // A document that contradicts us is disproof no matter what focus says.
             #expect(!DictationController.rewriteMayDelete(
                 typedTextStillBeforeCaret: false,
                 sameElementStillFocused: element
             ))
-            // A document that confirms us is proof no matter what focus says — the
-            // element mismatch below is the common case, not the alarming one: apps
-            // rebuild their accessibility tree around text just typed into them and
-            // hand out a fresh object for the very field we are still addressing.
             #expect(DictationController.rewriteMayDelete(
                 typedTextStillBeforeCaret: true,
                 sameElementStillFocused: element
             ))
-        }
-        // With no text proof, focus is the only evidence left. Silence permits;
-        // the system naming some *other* element is the one case that refuses.
-        #expect(DictationController.rewriteMayDelete(
-            typedTextStillBeforeCaret: nil,
-            sameElementStillFocused: nil
-        ))
-        #expect(DictationController.rewriteMayDelete(
-            typedTextStillBeforeCaret: nil,
-            sameElementStillFocused: true
-        ))
-        #expect(!DictationController.rewriteMayDelete(
-            typedTextStillBeforeCaret: nil,
-            sameElementStillFocused: false
-        ))
-    }
-
-    /// The re-read added before the backspaces must not be able to *withdraw* a proof.
-    /// A control that answered "yes, our text is before the caret" and then timed out
-    /// on the second look reports `nil`, and falling back to element identity there
-    /// refuses every app that rebuilds its accessibility tree — which is nearly all of
-    /// them, and is the outage this whole path exists to prevent.
-    @Test func aSlowSecondLookCannotWithdrawAProofAlreadyGiven() {
-        // Timed out, or never asked: the earlier `true` still stands, even against an
-        // element the system now says is a different one.
-        for element in [nil, true, false] as [Bool?] {
-            #expect(DictationController.rewriteMayStillDelete(
-                firstTextProof: true, recheckedTextProof: nil, sameElementStillFocused: element
+            #expect(!DictationController.rewriteMayDelete(
+                typedTextStillBeforeCaret: nil,
+                sameElementStillFocused: element
             ))
         }
-        // But a re-read that actually answers is why the re-read is there.
+    }
+
+    /// A stale first proof must not survive an inconclusive second read immediately
+    /// before Backspace.
+    @Test func bothDocumentReadsMustPositivelyAuthorizeDeletion() {
+        for element in [nil, true, false] as [Bool?] {
+            #expect(!DictationController.rewriteMayStillDelete(
+                firstTextProof: true, recheckedTextProof: nil, sameElementStillFocused: element
+            ))
+            #expect(DictationController.rewriteMayStillDelete(
+                firstTextProof: true, recheckedTextProof: true, sameElementStillFocused: element
+            ))
+        }
         #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: true, recheckedTextProof: false, sameElementStillFocused: true
         ))
-        // With no text evidence at any point, the element term decides, and only its
-        // explicit "some other element" refuses.
-        #expect(DictationController.rewriteMayStillDelete(
+        #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: nil
         ))
         #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: false
         ))
 
-        // And the element term is not to be evaluated when the text has already
-        // answered: obtaining it costs a blocking cross-process message on the main run
-        // loop, long enough that the system can disable the event tap underneath us.
+        // The element term is never evaluated: it cannot strengthen text ownership and
+        // costs a blocking cross-process message on the main run loop.
         var elementReads = 0
         _ = DictationController.rewriteMayStillDelete(
             firstTextProof: true,

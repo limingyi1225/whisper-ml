@@ -19,16 +19,28 @@ enum OnboardingGate {
     private static let completedKey = "didCompleteOnboarding"
     private static let owedKey = "onboardingSetupOwed"
     private static let dismissedKey = "onboardingDismissed"
+    private static let legacyCredentialRecoveryPendingKey =
+        "legacyDirectCredentialRecoveryPending"
+    private static let legacyCredentialRecoveryScheduledKey =
+        "didScheduleLegacyDirectCredentialRecovery"
 
     static func shouldPresent(
         completed: Bool,
         owed: Bool,
         dismissed: Bool,
+        requiresCredentialRecovery: Bool = false,
         hasCredential: Bool,
         hasAccessibility: Bool,
         hasMicrophone: Bool
     ) -> Bool {
-        guard !completed else { return false }
+        if requiresCredentialRecovery, !hasCredential { return true }
+        if completed {
+            // Permissions revoked after setup belong in Settings, but relay-only is a
+            // new hard prerequisite: an older direct-mode completion cannot prove that
+            // this build has a device token. Offer only credential recovery, and honour
+            // an explicit dismissal so it does not steal focus every launch.
+            return !hasCredential && !dismissed
+        }
         // Setup that is finished is finished, whichever way the window was closed.
         // Recognising only the 完成 button turned the red dot into a permanent
         // launch-time interruption: walk the whole guide, watch your sentence appear,
@@ -89,19 +101,34 @@ enum OnboardingGate {
         )
     }
 
-    /// Whether the mode the app will actually use has something to authenticate with.
-    /// Deliberately per-mode rather than "any credential anywhere": a relay user with a
-    /// stale API key in the Keychain is not set up, and neither is the reverse.
-    static func hasCredential(for mode: ConnectionMode) -> Bool {
-        switch mode {
-        case .direct: return KeychainStore.hasAPIKey()
-        case .relay: return KeychainStore.hasRelayToken()
-        }
-    }
+    /// Whether this Mac has something to authenticate with. The relay is the only
+    /// route, so the device token is the whole answer.
+    static var hasCredential: Bool { KeychainStore.hasRelayToken() }
 
     static var isCompleted: Bool { UserDefaults.standard.bool(forKey: completedKey) }
     static var isOwed: Bool { UserDefaults.standard.bool(forKey: owedKey) }
     static var isDismissed: Bool { UserDefaults.standard.bool(forKey: dismissedKey) }
+    static var requiresLegacyCredentialRecovery: Bool {
+        UserDefaults.standard.bool(forKey: legacyCredentialRecoveryPendingKey)
+    }
+
+    static func scheduleLegacyCredentialRecoveryIfNeeded(
+        hadLegacyCredential: Bool,
+        hasRelayToken: Bool
+    ) {
+        let store = UserDefaults.standard
+        guard LegacyCredentialRecoveryPolicy.shouldSchedule(
+            hadLegacyCredential: hadLegacyCredential,
+            hasRelayToken: hasRelayToken,
+            wasAlreadyScheduled: store.bool(forKey: legacyCredentialRecoveryScheduledKey)
+        ) else { return }
+        store.set(true, forKey: legacyCredentialRecoveryScheduledKey)
+        store.set(true, forKey: legacyCredentialRecoveryPendingKey)
+    }
+
+    static func markLegacyCredentialRecoveryPresented() {
+        UserDefaults.standard.removeObject(forKey: legacyCredentialRecoveryPendingKey)
+    }
 
     static func markOwed() { UserDefaults.standard.set(true, forKey: owedKey) }
 
@@ -160,6 +187,16 @@ enum OnboardingRequirements {
     }
 }
 
+enum LegacyCredentialRecoveryPolicy {
+    static func shouldSchedule(
+        hadLegacyCredential: Bool,
+        hasRelayToken: Bool,
+        wasAlreadyScheduled: Bool
+    ) -> Bool {
+        hadLegacyCredential && !hasRelayToken && !wasAlreadyScheduled
+    }
+}
+
 enum OnboardingPresentationPolicy {
     /// An explicit real-state walkthrough is sometimes setup and sometimes review.
     /// If this install would have opened the guide without the override, it still owes
@@ -168,6 +205,14 @@ enum OnboardingPresentationPolicy {
     /// permanent setup debt just because its old build never wrote the completion key.
     static func shouldTrackCompletion(preview: Bool, normallyNeedsSetup: Bool) -> Bool {
         !preview && normallyNeedsSetup
+    }
+
+    /// `shouldPresent == false` can mean either "already working" or "the user
+    /// dismissed setup". Only the first is implicit completion; completing the latter
+    /// would erase its dismissal and make credential recovery reappear every other
+    /// launch.
+    static func shouldMarkImplicitCompletion(dismissed: Bool) -> Bool {
+        !dismissed
     }
 }
 
@@ -196,18 +241,21 @@ final class OnboardingController {
         self.appDelegate = appDelegate
         let completed = OnboardingGate.isCompleted
         let owed = OnboardingGate.isOwed
-        let hasCredential = OnboardingGate.hasCredential(
-            for: AppSettings.shared.connectionMode
-        )
+        let requiresLegacyCredentialRecovery =
+            OnboardingGate.requiresLegacyCredentialRecovery
+        let hasCredential = OnboardingGate.hasCredential
         let hasAccessibility = Permissions.hasAccessibility
         let normallyNeedsSetup = OnboardingGate.shouldPresent(
             completed: completed,
             owed: owed,
             dismissed: OnboardingGate.isDismissed,
+            requiresCredentialRecovery: requiresLegacyCredentialRecovery,
             hasCredential: hasCredential,
             hasAccessibility: hasAccessibility,
             hasMicrophone: Permissions.microphoneStatus == .authorized
         )
+        let needsCredentialRecovery = !hasCredential
+            && (completed || requiresLegacyCredentialRecovery)
 
         if let request = OnboardingGate.consumeShowAgainRequest() {
             let preview = request == .preview
@@ -219,22 +267,37 @@ final class OnboardingController {
                     normallyNeedsSetup: normallyNeedsSetup
                 )
             )
+            if !preview, requiresLegacyCredentialRecovery {
+                OnboardingGate.markLegacyCredentialRecoveryPresented()
+            }
             return true
         }
         guard normallyNeedsSetup else {
             // An install that is already working has effectively been through it.
             // Recording that now means a later revoked permission cannot resurrect
             // the wizard in the middle of somebody's working day.
-            OnboardingGate.markCompleted()
+            if OnboardingPresentationPolicy.shouldMarkImplicitCompletion(
+                dismissed: OnboardingGate.isDismissed
+            ) {
+                OnboardingGate.markCompleted()
+            }
             return false
         }
-        present(controller: controller, tracksCompletion: true)
+        present(
+            controller: controller,
+            initialStep: needsCredentialRecovery ? .connection : .welcome,
+            tracksCompletion: !completed
+        )
+        if requiresLegacyCredentialRecovery {
+            OnboardingGate.markLegacyCredentialRecoveryPresented()
+        }
         return true
     }
 
     func present(
         controller: DictationController,
         preview: Bool = false,
+        initialStep: OnboardingStep = .welcome,
         tracksCompletion: Bool
     ) {
         // Persist before creating the real window. A crash, force-quit, red close, or
@@ -266,6 +329,7 @@ final class OnboardingController {
         let hosting = NSHostingController(rootView: OnboardingView(
             controller: controller,
             preview: preview,
+            initialStep: initialStep,
             finish: { [weak self] in self?.finish() },
             dismiss: { [weak self] in self?.dismiss() }
         ))
@@ -331,7 +395,8 @@ extension OnboardingController {
                 // that the user chose to close this window, so the next launch does
                 // not open it again over whatever they are doing. Preview is a
                 // rehearsal of somebody else's first run and must leave no trace.
-                if !self.isPreview, !OnboardingGate.isCompleted {
+                if !self.isPreview,
+                   (!OnboardingGate.isCompleted || !OnboardingGate.hasCredential) {
                     OnboardingGate.markDismissed()
                 }
                 self.appDelegate?.restorePreviousApplicationIfNeeded()
@@ -377,11 +442,6 @@ enum OnboardingCompletionPolicy {
     }
 }
 
-private enum CredentialChoice {
-    case invite
-    case apiKey
-}
-
 enum OnboardingLaunchAtLoginAction: Equatable {
     case none
     case register
@@ -390,6 +450,22 @@ enum OnboardingLaunchAtLoginAction: Equatable {
     static func required(currentlyEnabled: Bool, desired: Bool) -> Self {
         guard currentlyEnabled != desired else { return .none }
         return desired ? .register : .unregister
+    }
+}
+
+enum OnboardingCredentialEditor: Equatable {
+    case invite
+    case manualRelayToken
+}
+
+enum OnboardingCredentialPolicy {
+    static func editor(inviteEnrollmentEnabled: Bool) -> OnboardingCredentialEditor {
+        inviteEnrollmentEnabled ? .invite : .manualRelayToken
+    }
+
+    static func manualRelayToken(from input: String) -> String? {
+        let token = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return KeychainStore.isGeneratedRelayToken(token) ? token : nil
     }
 }
 
@@ -427,13 +503,8 @@ private struct OnboardingView: View {
     @State private var step: OnboardingStep = .welcome
 
     @State private var hasCredential = false
-    /// Which credential the 激活 step is asking for. Local to the guide, and always
-    /// starts on the invite code: that is how nearly everyone gets in, and the stored
-    /// connection mode cannot answer the question anyway — a fresh install has never
-    /// chosen one. Nothing is written to settings until an activation actually works.
-    @State private var credentialChoice = CredentialChoice.invite
     @State private var inviteField = ""
-    @State private var apiKeyField = ""
+    @State private var manualRelayTokenField = ""
     @State private var isActivating = false
     @State private var credentialError: String?
     @State private var activationTask: Task<Void, Never>?
@@ -456,6 +527,7 @@ private struct OnboardingView: View {
     init(
         controller: DictationController,
         preview: Bool,
+        initialStep: OnboardingStep,
         finish: @escaping () -> Void,
         dismiss: @escaping () -> Void
     ) {
@@ -463,12 +535,11 @@ private struct OnboardingView: View {
         self.preview = preview
         self.finish = finish
         self.dismiss = dismiss
+        _step = State(initialValue: initialStep)
         // Seeded rather than filled in on appear, so the first frame is already the
         // truth — otherwise a configured Mac flashes the 邀请码 field before the
         // 已激活 row replaces it.
-        _hasCredential = State(initialValue: preview
-            ? false
-            : OnboardingGate.hasCredential(for: AppSettings.shared.connectionMode))
+        _hasCredential = State(initialValue: preview ? false : OnboardingGate.hasCredential)
         _accessibilityGranted = State(initialValue: preview ? false : Permissions.hasAccessibility)
         _microphoneStatus = State(initialValue: preview ? .notDetermined : Permissions.microphoneStatus)
         _launchAtLogin = State(initialValue: SMAppService.mainApp.status == .enabled)
@@ -513,7 +584,7 @@ private struct OnboardingView: View {
     /// has been simulating.
     private func readSystemState() {
         guard !preview else { return }
-        hasCredential = OnboardingGate.hasCredential(for: settings.connectionMode)
+        hasCredential = OnboardingGate.hasCredential
         accessibilityGranted = Permissions.hasAccessibility
         microphoneStatus = Permissions.microphoneStatus
     }
@@ -561,23 +632,23 @@ private struct OnboardingView: View {
                 activatedSummary
                     .transition(.opacity)
             } else {
-                switch credentialChoice {
-                case .invite: inviteEditor.transition(.opacity)
-                case .apiKey: apiKeyEditor.transition(.opacity)
+                switch OnboardingCredentialPolicy.editor(
+                    inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled
+                ) {
+                case .invite:
+                    inviteEditor.transition(.opacity)
+                case .manualRelayToken:
+                    manualRelayTokenEditor.transition(.opacity)
                 }
             }
         }
         .animation(.easeInOut(duration: 0.22), value: hasCredential)
-        .animation(.easeInOut(duration: 0.18), value: credentialChoice)
     }
 
     private var activatedSummary: some View {
         HStack(spacing: 10) {
-            Label(
-                activatedThroughRelay ? "已激活" : "已保存 API Key",
-                systemImage: "checkmark.circle.fill"
-            )
-            .foregroundStyle(Color.green)
+            Label("已激活", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Color.green)
 
             Spacer(minLength: 12)
 
@@ -617,45 +688,32 @@ private struct OnboardingView: View {
             }
 
             credentialErrorLabel
-
-            Button("用自己的 OpenAI API Key") {
-                credentialChoice = .apiKey
-                credentialError = nil
-            }
-            .buttonStyle(.link)
-            .disabled(isActivating)
         }
     }
 
-    private var apiKeyEditor: some View {
+    /// Non-invite development and personalised builds still receive a relay device
+    /// token directly. This is the same Keychain path exposed in Settings, so first
+    /// launch can be completed without escaping the guide to configure the app later.
+    private var manualRelayTokenEditor: some View {
         VStack(alignment: .leading, spacing: 10) {
-            credentialCard(label: "API Key") {
-                SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
-                    .textFieldStyle(.roundedBorder)
-                    .labelsHidden()
-                    .onChange(of: apiKeyField) { credentialError = nil }
-                    .onSubmit(saveAPIKey)
+            credentialCard(label: "设备 Token") {
+                SecureField(
+                    "设备 Token",
+                    text: $manualRelayTokenField,
+                    prompt: Text("relay_…")
+                )
+                .textFieldStyle(.roundedBorder)
+                .labelsHidden()
+                .onChange(of: manualRelayTokenField) { credentialError = nil }
+                .onSubmit(saveManualRelayToken)
 
-                Button("保存", action: saveAPIKey)
+                Button("保存", action: saveManualRelayToken)
                     .buttonStyle(.borderedProminent)
-                    .disabled(apiKeyField.trimmed.isEmpty)
+                    .disabled(manualRelayTokenField.trimmed.isEmpty)
             }
 
             credentialErrorLabel
-
-            Button("用邀请码激活") {
-                credentialChoice = .invite
-                credentialError = nil
-            }
-            .buttonStyle(.link)
         }
-    }
-
-    /// In preview the stored connection mode is this Mac's real one, which would
-    /// mislabel a simulated activation; the editor the user just used is the honest
-    /// answer there.
-    private var activatedThroughRelay: Bool {
-        preview ? credentialChoice == .invite : settings.connectionMode == .relay
     }
 
     private func credentialCard(
@@ -1097,10 +1155,6 @@ private struct OnboardingView: View {
                 try await RelayEnrollmentClient().enroll(inviteCode: invite)
                 guard !Task.isCancelled else { return }
                 inviteField = ""
-                // Written here rather than when the user picked the tab: until an
-                // activation succeeds there is nothing to route, and a half-finished
-                // guide should not leave the app pointed at a credential it does not have.
-                settings.connectionMode = .relay
                 controller.reconnect()
                 credentialLanded()
             } catch {
@@ -1110,21 +1164,26 @@ private struct OnboardingView: View {
         }
     }
 
-    private func saveAPIKey() {
-        let key = apiKeyField.trimmed
-        guard !key.isEmpty else { return }
+    private func saveManualRelayToken() {
+        let candidate = manualRelayTokenField.trimmed
+        guard !candidate.isEmpty else { return }
         guard !preview else {
-            apiKeyField = ""
+            manualRelayTokenField = ""
             credentialLanded()
             return
         }
-        guard KeychainStore.saveAPIKey(key) else {
+        guard let token = OnboardingCredentialPolicy.manualRelayToken(
+            from: candidate
+        ) else {
+            credentialError = "设备 Token 格式不正确"
+            return
+        }
+        guard KeychainStore.saveRelayToken(token) else {
             credentialError = "无法写入钥匙串"
             return
         }
-        apiKeyField = ""
+        manualRelayTokenField = ""
         credentialError = nil
-        settings.connectionMode = .direct
         controller.reconnect()
         credentialLanded()
     }

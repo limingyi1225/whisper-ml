@@ -67,7 +67,13 @@ function onlyKeys(object, allowed) {
     && Object.keys(object).every((key) => allowed.has(key));
 }
 
-export function validateRealtimeEvent(data, isBinary, config, state) {
+export function validateRealtimeEvent(
+  data,
+  isBinary,
+  config,
+  state,
+  allowedModels = config.allowedTranscriptionModels,
+) {
   state.acceptedAudioBytes = 0;
   state.acceptedAudioEventID = undefined;
   if (isBinary) return REJECT.binary;
@@ -110,7 +116,7 @@ export function validateRealtimeEvent(data, isBinary, config, state) {
         || format.type !== "audio/pcm"
         || format.rate !== 24_000
         || input.turn_detection !== null
-        || !config.allowedTranscriptionModels.has(transcription.model)
+        || !allowedModels.has(transcription.model)
         || (transcription.delay !== undefined && !ALLOWED_DELAYS.has(transcription.delay))) {
       return REJECT.sessionConfig;
     }
@@ -231,7 +237,7 @@ function forward(target, data, isBinary, config) {
 /// normally looks dead for the whole pause, and the first tick after resuming would
 /// act on a verdict that was really about backpressure. Measured, not assumed:
 /// zero pongs are delivered while paused.
-function pauseUntilDrained(source, target, config, isSettled, {
+export function pauseUntilDrained(source, target, config, isSettled, {
   onBackpressure,
   onResume,
   onStall,
@@ -288,6 +294,8 @@ export function bridgeRealtime(
     perMessageDeflate: false,
   });
   const state = { turnAudioBytes: 0 };
+  const allowedModels = config.allowedOpenAITranscriptionModels
+    || config.allowedTranscriptionModels;
   const preopenQueue = [];
   let preopenBytes = 0;
   let settled = false;
@@ -379,7 +387,13 @@ export function bridgeRealtime(
   };
 
   downstream.on("message", (data, isBinary) => {
-    const validationError = validateRealtimeEvent(data, isBinary, config, state);
+    const validationError = validateRealtimeEvent(
+      data,
+      isBinary,
+      config,
+      state,
+      allowedModels,
+    );
     if (validationError) {
       downstream.send(relayError(
         validationError,

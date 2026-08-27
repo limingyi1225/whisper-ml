@@ -134,6 +134,10 @@ public final class TranscriptPolisher {
     /// never costs the caller its text: every failure path leaves the raw transcript
     /// standing.
     public func polish(_ raw: String, route: ServiceRoute) async -> Outcome {
+        // Gemini SMART already performs this cleanup inside the transcription turn.
+        // Keeping the guard here protects every DictationKit host (including Wink)
+        // from accidentally paying for and applying a second rewrite.
+        guard route.provider.requiresSeparatePolish else { return .cleaned(raw) }
         let started = Date()
         let deadline = started.addingTimeInterval(12)
         guard !Task.isCancelled else { return .unchanged(notice: nil) }

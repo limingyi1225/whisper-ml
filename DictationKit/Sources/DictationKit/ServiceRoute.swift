@@ -70,13 +70,23 @@ public struct ServiceRoute: CustomStringConvertible {
         }
     }
 
-    public let mode: ConnectionMode
+    /// The model is part of the connection snapshot, not a live preference lookup.
+    /// Its provider chooses the WebSocket endpoint and the same value must be reused
+    /// for every `session.update` retry on that socket.
+    public let transcriptionModel: TranscriptionModel
+    public let provider: TranscriptionProvider
     public let realtimeURL: URL
     public let polishURL: URL
     public let credential: String
 
-    public init(mode: ConnectionMode, realtimeURL: URL, polishURL: URL, credential: String) {
-        self.mode = mode
+    public init(
+        transcriptionModel: TranscriptionModel = .liveTranscribe,
+        realtimeURL: URL,
+        polishURL: URL,
+        credential: String
+    ) {
+        self.transcriptionModel = transcriptionModel
+        self.provider = transcriptionModel.provider
         self.realtimeURL = realtimeURL
         self.polishURL = polishURL
         self.credential = credential
@@ -84,30 +94,18 @@ public struct ServiceRoute: CustomStringConvertible {
 
     public static func current() throws -> ServiceRoute {
         let settings = DictationEnvironment.settings
-        switch settings.connectionMode {
-        case .direct:
-            guard let apiKey = KeychainStore.loadAPIKey() else {
-                throw ConfigurationError.message("还没有设置 API Key")
-            }
-            return ServiceRoute(
-                mode: .direct,
-                realtimeURL: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!,
-                polishURL: URL(string: "https://api.openai.com/v1/chat/completions")!,
-                credential: apiKey
-            )
-
-        case .relay:
-            guard let token = KeychainStore.loadRelayToken() else {
-                throw ConfigurationError.message("还没有设置设备 Token")
-            }
-            let base = effectiveRelayBaseURL
-            return ServiceRoute(
-                mode: .relay,
-                realtimeURL: relayRealtimeURL(baseURL: base),
-                polishURL: base.appendingPathComponent("v1/polish"),
-                credential: token
-            )
+        guard let token = KeychainStore.loadRelayToken() else {
+            throw ConfigurationError.message("还没有设置设备 Token")
         }
+        let model = settings.transcriptionModel
+        let provider = model.provider
+        let base = effectiveRelayBaseURL
+        return ServiceRoute(
+            transcriptionModel: model,
+            realtimeURL: relayRealtimeURL(baseURL: base, provider: provider),
+            polishURL: base.appendingPathComponent("v1/polish"),
+            credential: token
+        )
     }
 
     /// Production relay addresses must use TLS. Plain HTTP is accepted only for a
@@ -146,16 +144,22 @@ public struct ServiceRoute: CustomStringConvertible {
     /// `log("\(route)")` added later would put it in the unified log for anyone with
     /// Console.app. Overriding it makes that mistake harmless instead of silent.
     public nonisolated var description: String {
-        "ServiceRoute(mode: \(mode.rawValue), host: \(realtimeURL.host ?? "?"), credential: <redacted>)"
+        "ServiceRoute(provider: \(provider.rawValue), model: \(transcriptionModel.rawValue), host: \(realtimeURL.host ?? "?"), credential: <redacted>)"
     }
 
-    public nonisolated static func relayRealtimeURL(baseURL: URL) -> URL {
+    public nonisolated static func relayRealtimeURL(
+        baseURL: URL,
+        provider: TranscriptionProvider = .openAI
+    ) -> URL {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/realtime"),
             resolvingAgainstBaseURL: false
         )!
         components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
-        components.queryItems = [URLQueryItem(name: "intent", value: "transcription")]
+        components.queryItems = [
+            URLQueryItem(name: "intent", value: "transcription"),
+            URLQueryItem(name: "provider", value: provider.rawValue),
+        ]
         return components.url!
     }
 }

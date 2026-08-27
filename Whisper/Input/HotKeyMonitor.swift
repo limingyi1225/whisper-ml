@@ -189,7 +189,10 @@ final class HotKeyMonitor {
         let isDown = rawFlags & trigger.deviceMask != 0
         isTriggerHeld = isDown
         if isDown {
-            guard !isKeyDown else { return }
+            // The stranded half of a lost key-up, cleared before this press arms on
+            // top of it. Deliberately not a `return`: the press the user just made is
+            // a real one and goes on to arm normally.
+            if isKeyDown { recoverLostKeyUp() }
             // Other modifiers already held when the trigger goes down mean a chord
             // (⇧⌘-something) is being typed, not a dictation — never arm.
             guard rawFlags & trigger.foreignModifierMask == 0 else { return }
@@ -218,6 +221,31 @@ final class HotKeyMonitor {
                 onEvent?(.cancelled(.userGesture))
             }
         }
+    }
+
+    /// Recovers from a key-up that never arrived.
+    ///
+    /// `isKeyDown` is set by a key-down and cleared only by the matching key-up. Miss
+    /// that key-up — the tap can drop one across a system disable/re-enable — and
+    /// `handleFlagsChanged` swallows every later key-down at its `guard !isKeyDown`,
+    /// silently and permanently. To the user the trigger key is simply dead until
+    /// Whisper is relaunched, and because the event never reaches the controller,
+    /// nothing anywhere logs a reason.
+    ///
+    /// A second key-down with no key-up between them is the proof. A modifier reports
+    /// transitions, never repeats, so the same physical key cannot go down twice while
+    /// held — receiving that means the up was lost. Asking the OS instead does not
+    /// work: this tap *consumes* the trigger key, so the modifier never enters the
+    /// session state and `CGEventSource.flagsState` reads it as up throughout a real
+    /// hold. That version cancelled a live recording once a second (measured:
+    /// "recording started" 10:52:55.653, latch "recovered" 10:52:56.859, key still
+    /// held).
+    private func recoverLostKeyUp() {
+        log.warning("trigger key-up was lost; recovering the arm latch")
+        cancelHold()
+        isKeyDown = false
+        didLongPress = false
+        onEvent?(.cancelled(.userGesture))
     }
 
     /// Any real keystroke while the trigger is held means the user is doing ⌘C / ⌘V / etc.

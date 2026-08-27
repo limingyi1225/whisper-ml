@@ -2,14 +2,15 @@
 
 按住右 ⌘ 说话，松手出字。中文、英文、中英混说都行。
 
-菜单栏常驻，没有 Dock 图标。转写走 OpenAI Realtime 的 `gpt-live-transcribe`，
-说话过程中文字就会实时打进你正在输入的那个 App，松手后再自动整理掉口头禅。
+菜单栏常驻，没有 Dock 图标。默认走 Relay 上的 Gemini 3.5 Transcribe Live SMART：
+说话过程中文字就会实时打进你正在输入的那个 App，最终结果已经包含口头禅、
+自我修正和标点整理，不再额外调用一个整理模型。
 
 ## 怎么用
 
 1. 按住 **右 Command** 超过 300ms → 屏幕底部的小条变宽 → 开始说话
 2. 边说边有字出现在光标处
-3. 松手 → 约 1.5 秒后文字自动整理（去掉「嗯、啊、那个」，补标点）
+3. 松手 → Gemini 返回整理后的最终文字（去掉「嗯、啊、那个」，处理口误，补标点）
 
 短按右 ⌘ 不会触发，它仍然是普通修饰键。按住期间再按别的键（比如 ⌘C）会自动取消录音。
 
@@ -83,14 +84,15 @@ open -n --env WHISPER_INJECTION_SELFTEST=2 --env WHISPER_SELFTEST_APP=TextEdit /
 设置 → **软件更新** 里的 **检查更新** 可以立即查找新版，结果会显示在当前版本旁边；
 手动检查不会另开更新窗口。“自动检查更新”开启后会定期检查，发现新版时由系统更新窗口提醒；默认关闭。
 
-- **听写**：连接方式、触发键、转写模型、延迟、文字整理和常用词汇
+- **听写**：连接方式、触发键、转写模型、文本选项和常用词汇
 - **设置**：登录启动、辅助功能 / 麦克风，以及当前连接方式使用的凭据
 
 > 触发键里原来有 **Fn**，现在去掉了。之前选了 Fn 的机器升级后会**静默回落到右 Command**
 > ——`UserDefaults` 里存的 `"fn"` 解析不出对应的枚举值，就走了默认值，App 不会提示。
 > 如果你按住 Fn 发现没反应，去设置里重新挑一个键即可。
 
-人名的处理分两层，都在整理这一步，所以要开着「自动去掉口头禅、补标点」才生效：
+文本整理始终开启，不再有单独开关。Gemini 由 SMART 转写在同一次请求中完成；
+OpenAI 备用模式才会在转写后调用 Luna。人名和术语的处理分两层：
 
 - **明显是英文名音译的，不用配置就会转成原名**：「凯文和艾米明天过来」→「Kevin 和 Amy
   明天过来」，「我跟莎拉聊过了」→「我跟 Sarah 聊过了」。中文名字（于诗禾、小明）、公司
@@ -100,8 +102,9 @@ open -n --env WHISPER_INJECTION_SELFTEST=2 --env WHISPER_SELFTEST_APP=TextEdit /
   `赵砚辞`，「赵言词老师」会修成「赵砚辞老师」；写了 `Xcode`，「我用 ex code 打开」会
   修成 Xcode。
 
-没有单独的「出字方式」开关：选了 `gpt-live-transcribe` 就是边说边上屏，选了
-`gpt-transcribe` 就是松手后上屏。这不是两个决定，是同一个。
+没有单独的「出字方式」开关：Gemini 和 OpenAI Live 都会边说边上屏，OpenAI Transcribe
+则是松手后一次上屏。Gemini 只提交相邻 hypothesis 一致的稳定前缀，见下面
+「Gemini 的中间结果可以改写」。
 
 ## 结构
 
@@ -120,7 +123,7 @@ Whisper/
     ├── Onboarding.swift           第一次打开的引导窗口
     └── SettingsView.swift
 DictationKit/                    本地 SwiftPM 包，见下
-server/                          可选的自托管 Relay（WebSocket 转写 + HTTPS 整理）
+server/                          可选的自托管 Relay（Gemini/OpenAI WebSocket + OpenAI 备用整理）
 ```
 
 ### DictationKit
@@ -133,8 +136,8 @@ DictationKit/Sources/DictationKit/
 ├── AudioCapture.swift         采集 + 重采样到 24kHz PCM16 + 预卷缓冲
 ├── RealtimeClient.swift       常驻预热的转写 WebSocket
 ├── TranscriptPolisher.swift   松手后的文字整理
-├── ServiceRoute.swift         直连 / 代理的路由快照
-├── KeychainStore.swift        API Key 与设备 Token 存钥匙串
+├── ServiceRoute.swift         Relay 的路由快照
+├── KeychainStore.swift        设备 Token 存钥匙串
 └── DictationEnvironment.swift 包向宿主索取设置的协议
 ```
 
@@ -150,26 +153,27 @@ async 函数跑在哪个 executor 上。`DictationKit/Package.swift` 里记了�
 的提前返回之前——测试会走到读它的 `ServiceRoute`）。忘了注入不会崩，会静默回落到
 一份读同样 UserDefaults 键的兜底实现，所以别忘。
 
-三个枚举（`ConnectionMode`、`TranscriptionModel`、`TranscriptionDelay`）跟着搬进了
-包，因为对它们做事的是 `ServiceRoute` 和 `RealtimeClient`。留在 App 里的是
+两个枚举（`TranscriptionModel`、`TranscriptionDelay`）跟着搬进了包，因为对它们
+做事的是 `ServiceRoute` 和 `RealtimeClient`。留在 App 里的是
 `displayName` / `summary` / `Identifiable`——包不该持有会本地化的界面文案。
 
-## 代理模式（本机不放 OpenAI Key）
+## 代理模式（本机不放上游 API Key）
 
-「听写」里可以手动选择两种连接方式：
+Relay 是**唯一**的连接方式。Mac 上不存任何上游 API Key，只持有 Keychain 中一枚可撤销的
+设备 Token；Gemini / OpenAI 的 Key 只存在服务器上。流量走已经配置好的
+`https://limingyi.com/whisper-relay`。
 
-- **直连**：保持原来的行为，Mac 用钥匙串中的 OpenAI API Key 直接请求 OpenAI。
-- **代理模式**：走已经配置好的 `https://limingyi.com/whisper-relay`；Mac 只持有
-  Keychain 中可撤销的设备 Token，OpenAI API Key 只存在服务器环境变量中。
+名字里没有「大陆」是有意的：它解决的是**本机不放上游 Key**，无 VPN 可用只是其中一个
+后果。公开发行版第一次打开时用一次性邀请码激活，由 App 在本机生成独立的设备 Token 并
+存进 Keychain；服务端只保存 hash。这样每台 Mac 都能单独吊销，不需要把某个大家共用的
+Token 复制给别人——不管对方在哪个国家。
 
-  名字里没有「大陆」是有意的：它解决的是**本机不放 OpenAI Key**，无 VPN 可用只是
-  其中一个后果。公开发行版第一次打开时用一次性邀请码激活，由 App 在本机生成独立的
-  设备 Token 并存进 Keychain；服务端只保存 hash。这样每台 Mac 都能单独吊销，不需要
-  把自己的 API Key 或某个大家共用的 Token 复制给别人——不管对方在哪个国家。
+早期版本还有一个「直连」模式：Mac 用钥匙串里自己的 OpenAI API Key 直接请求 OpenAI。
+它已经删掉了。默认路径换成 Gemini 之后直连就无路可走（Gemini 的直连鉴权从来没做），
+留着只是让每个碰路由、设置界面和首次引导的改动都要多照顾一条走不通的分支。
 
-Relay 同时覆盖 Realtime WebSocket 转写和松手后的 HTTPS 整理。不能只代理整理请求，否则
-Realtime 仍然需要从 Mac 直连 OpenAI。连接方式发生变化时，如果当前有一句正在转写，应用会等
-它结束再重连，不会中途换线路或重放音频。
+Relay 同时覆盖 Gemini/OpenAI Realtime WebSocket，以及 OpenAI 备用模式松手后的 HTTPS 整理。
+设置发生变化时，如果当前有一句正在转写，应用会等它结束再重连，不会中途换线路或重放音频。
 
 启动 Relay：
 
@@ -178,15 +182,21 @@ cd server
 npm install
 npm run generate-token
 cp .env.example .env
-# 编辑 .env：填 OPENAI_API_KEY，并把生成出来的 hash 填入
+# 编辑 .env：填 GEMINI_API_KEY 和 OPENAI_API_KEY，并把生成出来的 hash 填入
 # RELAY_DEVICE_TOKEN_HASHES。普通本机启动保持两个 enrollment 路径为注释状态；
 # 它们是 systemd 部署选项，不应指向本机通常不存在的 /var/lib 和 /run 目录。
 npm test
 npm start
 ```
 
-`npm run generate-token` 打印一对值：**设备 Token** 粘贴到 App 的「设置 → 代理」
-（切到代理模式后才会出现），服务器只保存它的 **SHA-256 hash**。Token 只在生成时
+`GEMINI_LIVE_URL` 是可选的测试/自建代理覆盖项；不设置时 Relay 使用 Google 官方 Gemini
+Live WebSocket endpoint。它必须是 `wss://`（本机集成测试也允许 `ws://`），正常部署无需填写。
+`script/deploy_relay.sh` 上线后会从公网 Relay 建立一条 Gemini 会话，发送真实
+`session.update` 并等到 Google 的 `setupComplete` 被映射为 `session.updated`；因此缺失、失效或
+无权限的 Gemini Key 不会再只靠 `/healthz` 蒙混过关。
+
+`npm run generate-token` 打印一对值：**设备 Token** 粘贴到 App 的「设置 → 设置」，
+服务器只保存它的 **SHA-256 hash**。Token 只在生成时
 显示一次。凭据由 App 自己写进钥匙串，不要用 `security` 命令行塞进去——那样建出来的条目 ACL
 里没有本 App，读取时会弹授权框甚至直接失败。
 
@@ -261,14 +271,14 @@ header。`GET /healthz`（或 `<前缀>/healthz`）可用于健康检查；发�
 
 ### 边界与自查
 
-Relay 只允许本 App 使用的三个转写模型、固定整理模型和有限的请求形状；另外限制每设备并发、
+Relay 只允许本 App 使用的三个转写模型、固定的 OpenAI 备用整理模型和有限的请求形状；另外限制每设备并发、
 单轮音频大小和整理频率。上限不是随手取的整数，是按 App 自己那 610 秒音频缓冲推出来的——改
 客户端缓冲时对应改 `CLIENT_MAX_TURN_AUDIO_BYTES`。上行拥塞时 Relay 会暂停读取来施加背压，
 而不是掐断连接，否则丢掉的正是排队补录机制要保住的那句话。Relay 每 25 秒 ping 一次 Mac，
 一整个周期没有 pong 就断开：合盖和换 Wi-Fi 都会留下半开连接，不清掉的话它既占着设备的并发
-名额，也让那条计费的 OpenAI session 一直活着。
+名额，也让那条计费的上游 session 一直活着。
 
-不要记录请求体或 Authorization header，并为服务器上的 OpenAI key 单独设置预算。部署完成后
+不要记录请求体或 Authorization header，并为服务器上的上游 key 单独设置预算。部署完成后
 仍要在无 VPN 的不同网络上实测域名、TLS 和 WebSocket 长连接是否可达。
 
 想指向本地 Relay 调试（生产地址是写死的，设置里不给改）：
@@ -296,7 +306,22 @@ socket 在 App 启动时就建好、用 ping 保活、会话快过期时提前�
 **沙盒必须关。** CGEventTap 和合成键盘事件在 App Sandbox 里都用不了。Hardened runtime
 保持开启，麦克风靠 `com.apple.security.device.audio-input` entitlement。
 
-**换便宜模型就换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
+**Gemini 的中间结果可以改写，所以它只上屏稳定前缀。** 实测同一句话的 interim 序列是
+`好。` → `好,` → `好, 现在` → `好, 现在 测试一` → `好, 现在测试一下效果。`，最终才是
+`好，现在测试一下效果。`：它会改掉自己已经吐出来的标点，用 ASCII 逗号和词间空格，到
+final 才换全角并去空格。而 SMART 模式的本职就是回头删口头禅、改口误。
+
+把这种流原样打进第三方 App，就是在打一些**马上要变的字**。Whisper 因此只提交
+相邻两次 interim 一致的稳定前缀，并先把 CJK 周围的 ASCII 标点和多余空格正常化。
+如果后续 hypothesis 要改写已上屏内容，只有在 Accessibility 能够前后两次证明光标前文字
+完全等于 Whisper 已注入的前缀时才会回删；无法证明就停止实时注入，等 final 安全收尾。
+
+Relay 把 `generationComplete` / `turnComplete` 当作 provider response boundary，但 Gemini
+不保证它们与 `inputTranscription` 的顺序，所以会再等一个可重置的短 quiet period 收齐迟到的
+final segment。只有拿到 final 却一直等不到 boundary 的异常 fallback，才会在交付文字后强制
+更换 session，避免迟到的上一句混进下一句。
+
+**OpenAI 备用的便宜模型换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
 20 个 delta，`gpt-transcribe` 是 **0 个**。注意不能看 delta 总数——两者总数几乎一样
 （23 vs 24），差别全在时间上：便宜那档把每一个 delta 都堆到 commit 之后才发，那时人已经
 松手了。所以出字方式不是一个独立选项，而是模型能力的直接结果。
@@ -307,20 +332,20 @@ socket 在 App 启动时就建好、用 ping 保活、会话快过期时提前�
 是不够的：上一轮超时取消后，它的迟到事件可能抢在新一轮前面到达、把自己的 id 认领成新一轮
 的 id，于是旧句子结束了新录音，真正的新结果反被丢弃。所以放弃的轮次会进 retired 名单。
 
-**转写和整理必须分开做。** 非 realtime 模型确实支持 `prompt` 参数，看起来可以让它
+**OpenAI 备用路径的转写和整理必须分开做。** 非 realtime 模型确实支持 `prompt` 参数，看起来可以让它
 "边转写边整理"。实测不行：同一段音频、同一个模型，唯一变量是加不加整理 prompt，加了之后
 `deadline`→`dead line`、`backend`→`button`、`Kevin`→`Kelvin`，而且口头禅还没删干净
 （gpt-4o-mini-transcribe 更是完全无视）。`prompt` 在 Whisper 系列里是词汇/风格偏置，
-不是指令通道，拿它当指令用会让模型分心，两件事都做不好。
+不是指令通道，拿它当指令用会让模型分心，两件事都做不好。Gemini SMART
+是另一套转写协议：口误和口头禅整理本来就属于这一次转写，所以不触发 Luna。
 
 **常用词汇现在两边都挂。** 上一代的 `gpt-realtime-whisper` 直接拒收 `prompt`，而它是唯一
 能边说边出字的模型，词表就只剩整理模型这一条路。新一代多了专门喂术语的 `keywords`，这个
 限制没有了。实测同一段音频、唯一变量是这个字段：不加是「李**明**一」「赵**云熙**」，加了是
 「李**铭**一」「赵**芸溪**」，首字延迟没变化。
 
-注意这**不是把职责搬过去了**，是加了一道。整理那侧的词表留着，因为 keywords 是概率偏置不是
-保证；而且只在用户真填了词的时候才追加那一段，空表时提示词与调优时逐字一致。上面那条「转写
-和整理必须分开」依然成立——它说的是 `prompt` 当指令通道，和 `keywords` 是两套机制。
+在 OpenAI 备用路径里，整理那侧的词表仍留着，因为 keywords 是概率偏置不是保证。
+Gemini 路径只把这份词表发给 SMART 转写，不做第二次改写。
 
 **词表的校验规则比看起来重要。** 它以前只喂整理模型，一条烂词最多少修一个字；现在它进了
 `session.update`，一条烂词会让整个会话建不起来，口述直接不能用。所以长度按 **UTF-16** 计
@@ -338,7 +363,7 @@ socket 在 App 启动时就建好、用 ping 保活、会话快过期时提前�
 删之前对照实测过 8 句含专有名词 / 代码标识符的转写，6 句输出完全一致，一句变好
 （"usr underscore idx" → `usr_idx`），没有出现乱改专有名词的情况。
 
-**开头几个字的语言识别错，用 `delay` 调。** 流式模型必须在听完整句之前就吐字，开头
+**OpenAI Live 开头几个字的语言识别错，用 `delay` 调。** 流式模型必须在听完整句之前就吐字，开头
 天然缺上下文。`delay` 就是控制吐字前先听多久的旋钮，实测首字返回时间：minimal 737ms、
 low 811ms、medium 1250ms、high 1937ms。设置里叫「出字前先听多久」。
 
@@ -351,7 +376,7 @@ low 811ms、medium 1250ms、high 1937ms。设置里叫「出字前先听多久�
 全部重打——差异出现在句首就等于整句重写，看起来就是"闪一下"。而 realtime 模型会在中文
 句号后面加个空格、整理模型又会把它去掉，正好制造句首差异。所以纯空格差异直接跳过不改。
 
-**整理模型固定为 gpt-5.6-luna，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
+**OpenAI 备用的整理模型固定为 gpt-5.6-luna，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
 中位 1.68s 但出现过 4.70s；gpt-5.6 系列中位都在 1.7s 上下、尾部收敛），档位之间的差距
 在噪音以内，不值得一个设置项，最终按当前客户端档位定为 luna 并写死。
 
@@ -385,7 +410,7 @@ caret 级检查必然产生假阴性。丢句风险由超时路径兜底：目�
 到来的重试。现在的做法是**在出队之前**先探一次路由：探失败就一次性清空整个队列、只报一条
 错（并说明丢了几句），而不是逐句出队、逐句销毁音频、逐句弹同一条错误提示。
 
-**整理挂掉时会提示一次，但不影响出字。** 整理失败一律回退到原始转写，文字照常上屏——
+**OpenAI 备用的整理挂掉时会提示一次，但不影响出字。** 整理失败一律回退到原始转写，文字照常上屏——
 但如果失败原因是**会一直失败**的那种（API Key 无效、额度不足、地区被拒），静默就等于每句
 话都白白失去整理而屏幕上毫无线索。所以这类原因会在文字落地**之后**弹一次提示条（不是错误
 路径，句子已经交付了），同一个原因不重复弹，下次整理成功就清空标记。超时、5xx、限流这类

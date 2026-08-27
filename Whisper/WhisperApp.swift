@@ -23,36 +23,14 @@ struct WhisperApp: App {
     }
 }
 
-/// Keeps first-launch routing and the Settings prompt on the same contract.
-/// An existing direct-mode user must never be rerouted just because this generic
-/// build has no relay token; conversely, an API key left in the Keychain must not hide
-/// activation when the user has explicitly selected relay mode.
+/// Keeps first-launch routing and the Settings prompt on the same contract: the relay
+/// is the only route, so activation is simply "this Mac has no device token yet".
 enum InviteEnrollmentOnboarding {
-    static func shouldDefaultToRelay(
-        inviteEnrollmentEnabled: Bool,
-        hasRelayToken: Bool,
-        hasAPIKey: Bool,
-        connectionModeWasChosen: Bool
-    ) -> Bool {
-        inviteEnrollmentEnabled
-            && !hasRelayToken
-            && !hasAPIKey
-            && !connectionModeWasChosen
-    }
-
     static func shouldPresentInvite(
         inviteEnrollmentEnabled: Bool,
-        hasRelayToken: Bool,
-        hasAPIKey: Bool,
-        connectionModeWasChosen: Bool,
-        connectionMode: ConnectionMode
+        hasRelayToken: Bool
     ) -> Bool {
-        guard inviteEnrollmentEnabled, !hasRelayToken else { return false }
-        // Do not depend on AppDelegate having already persisted the fresh-install
-        // default before SwiftUI starts the menu-label task. The second branch is the
-        // same fresh/no-credential predicate used by `shouldDefaultToRelay`, so the
-        // prompt cannot be lost to launch ordering.
-        return connectionMode == .relay || (!connectionModeWasChosen && !hasAPIKey)
+        inviteEnrollmentEnabled && !hasRelayToken
     }
 }
 
@@ -90,31 +68,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Direct mode no longer exists. Remove the upstream OpenAI key older builds
+        // stored before opening any network path; the relay device token is untouched.
+        let hadLegacyUpstreamCredential = KeychainStore.hasLegacyUpstreamCredential()
+        _ = KeychainStore.deleteLegacyUpstreamCredentials()
         updater.start()
         // Before `controller.start()`, which opens the socket: a personalised build
         // should come up already connected rather than showing 「还没有设置设备 Token」
         // and reconnecting a moment later. No-op in an ordinary build.
         //
         // A seed is either the first run ever or a rotation replacing this app's own
-        // earlier token. Only a user who has never chosen a mode gets moved to 代理:
-        // the token itself always lands in the keychain, but rerouting someone's audio
-        // and billing is a decision that is theirs once they have made it.
-        //
-        // The earlier test — "was there no relay token before the seed?" — got this
-        // wrong for the most ordinary existing user there is: 直连 with their own API
-        // key and no relay token looks identical to a brand-new Mac, and installing a
-        // personalised build silently switched them to the relay.
-        let modeWasChosen = AppSettings.connectionModeWasChosen
-        if KeychainStore.seedBundledRelayTokenIfNeeded(), !modeWasChosen {
-            AppSettings.shared.connectionMode = .relay
-        } else if InviteEnrollmentOnboarding.shouldDefaultToRelay(
-            inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
-            hasRelayToken: KeychainStore.hasRelayToken(),
-            hasAPIKey: KeychainStore.hasAPIKey(),
-            connectionModeWasChosen: modeWasChosen
-        ) {
-            AppSettings.shared.connectionMode = .relay
-        }
+        // earlier token. No-op in an ordinary build.
+        KeychainStore.seedBundledRelayTokenIfNeeded()
+        OnboardingGate.scheduleLegacyCredentialRecoveryIfNeeded(
+            hadLegacyCredential: hadLegacyUpstreamCredential,
+            hasRelayToken: KeychainStore.hasRelayToken()
+        )
 
         // Menu-bar only; LSUIElement already keeps us out of the Dock, but be explicit
         // so the app never steals focus from whatever the user is typing into.

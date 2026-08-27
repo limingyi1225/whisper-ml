@@ -6,6 +6,55 @@ import OSLog
 
 private nonisolated let log = Logger(subsystem: "com.mingyili.Whisper", category: "audio")
 
+/// Identifies one attempt to rebuild the audio engine within one capture gesture.
+/// The generation prevents delayed work from crossing gesture boundaries; the epoch
+/// distinguishes multiple configuration changes during the same gesture.
+nonisolated struct AudioCaptureRestartAttempt: Equatable, Sendable {
+    let captureGeneration: UInt64
+    let restartEpoch: UInt64
+}
+
+/// Pure lifecycle checks shared by the deferred restart and its watchdog. Keeping
+/// these checks independent of AVAudioEngine makes the stale-callback behavior
+/// deterministic to test without opening the microphone.
+nonisolated enum AudioCaptureRestartPolicy {
+    static func isCurrent(
+        _ attempt: AudioCaptureRestartAttempt,
+        activeCaptureGeneration: UInt64?,
+        currentRestartEpoch: UInt64
+    ) -> Bool {
+        activeCaptureGeneration == attempt.captureGeneration
+            && currentRestartEpoch == attempt.restartEpoch
+    }
+
+    static func shouldReportStalledCapture(
+        _ attempt: AudioCaptureRestartAttempt,
+        activeCaptureGeneration: UInt64?,
+        currentRestartEpoch: UInt64,
+        deliveredBuffersBefore: UInt64,
+        deliveredBuffersNow: UInt64,
+        isRunning: Bool,
+        captureFailureReported: Bool
+    ) -> Bool {
+        isRunning
+            && !captureFailureReported
+            && deliveredBuffersNow == deliveredBuffersBefore
+            && isCurrent(
+                attempt,
+                activeCaptureGeneration: activeCaptureGeneration,
+                currentRestartEpoch: currentRestartEpoch
+            )
+    }
+
+    static func newlyLatchedFailureGeneration(
+        wasReported: Bool,
+        isReported: Bool,
+        activeCaptureGeneration: UInt64?
+    ) -> UInt64? {
+        !wasReported && isReported ? activeCaptureGeneration : nil
+    }
+}
+
 /// Captures the default input device and hands back 24 kHz mono PCM16 — the format the
 /// Realtime transcription session expects.
 ///
@@ -58,6 +107,14 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
     private var nextCaptureGeneration: UInt64 = 0
     private var activeCaptureGeneration: UInt64?
     private var configChangeObserver: NSObjectProtocol?
+    /// Buffers the input tap has actually delivered. Only ever compared against a
+    /// snapshot, so wraparound does not matter.
+    private var deliveredBuffers: UInt64 = 0
+    /// The configuration-change rebuild queued for the next main-queue turn.
+    /// A token, rather than a Boolean, ensures a stale callback cannot consume a
+    /// newer gesture's pending restart.
+    private var configurationRestartPending: AudioCaptureRestartAttempt?
+    private var configurationRestartEpoch: UInt64 = 0
 
     public init() {
         // The engine stops and deinitializes itself when the input device changes
@@ -79,42 +136,87 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
         }
     }
 
-    /// Rebuilds the tap and restarts the engine after a device change. A short gap
-    /// in the audio is unavoidable; losing the rest of the sentence is not.
+    /// Rebuilds capture after the input device changes.
+    ///
+    /// The notification is not the user yanking a headset out mid-sentence. Measured:
+    /// the engine only runs while a gesture is held, and all three observed changes
+    /// arrived with no `recording started` anywhere near them — the user had switched
+    /// the input source while idle, and the change surfaced on the *next* press, when
+    /// `beginPreroll` started the engine on hardware that had moved underneath it.
+    /// So this path is on the critical path of an ordinary press, and failing it means
+    /// the first press after every device switch dies with "microphone unavailable".
+    ///
+    /// Rebuilding the tap inline, inside the notification, never once worked: three
+    /// restarts returned without throwing and then delivered no audio at all. Worse,
+    /// `isRunning` stayed true over that dead tap, so the next press hit
+    /// `beginPreroll`'s early return and inherited the corpse, and nothing found out
+    /// until the 20 s transcription timeout — with every press in between queued behind
+    /// an utterance that would never settle. That is what made the trigger key look
+    /// dead until a relaunch.
+    ///
+    /// So: stop for real (`isRunning` false, no corpse to inherit), then rebuild on the
+    /// next main-queue turn, once the engine has finished reconfiguring itself.
     private func handleConfigurationChange() {
         guard isRunning else { return }
-        log.warning("input configuration changed mid-capture; restarting engine")
-
-        let input = engine.inputNode
-        input.removeTap(onBus: 0)
-        engine.stop()
-        isRunning = false
-        let tail = lock.withLock { drainConverterLocked() }
+        log.warning("input configuration changed; restarting engine")
+        stopEngine()
+        let (tail, failedGeneration): ([Data], UInt64?) = lock.withLock {
+            let failureWasReported = captureFailureReported
+            let tail = drainConverterLocked()
+            return (
+                tail,
+                AudioCaptureRestartPolicy.newlyLatchedFailureGeneration(
+                    wasReported: failureWasReported,
+                    isReported: captureFailureReported,
+                    activeCaptureGeneration: activeCaptureGeneration
+                )
+            )
+        }
         routeConvertedChunks(tail)
+        if let failedGeneration {
+            // The engine is already stopped. Publishing immediately is essential:
+            // the latch intentionally prevents the restart below, and the ordinary
+            // one-shot reporter would now no-op because the drain set that latch.
+            onCaptureFailure?(failedGeneration)
+            return
+        }
 
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0 else {
-            log.error("no valid input after configuration change; capture lost")
+        let attempt: AudioCaptureRestartAttempt? = lock.withLock {
+            guard let generation = activeCaptureGeneration, !captureFailureReported else {
+                return nil
+            }
+            guard configurationRestartPending == nil else { return nil }
+            configurationRestartEpoch &+= 1
+            let attempt = AudioCaptureRestartAttempt(
+                captureGeneration: generation,
+                restartEpoch: configurationRestartEpoch
+            )
+            configurationRestartPending = attempt
+            return attempt
+        }
+        guard let attempt else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.restartAfterConfigurationChange(attempt)
+        }
+    }
+
+    private func restartAfterConfigurationChange(_ attempt: AudioCaptureRestartAttempt) {
+        let stillWanted: Bool = lock.withLock {
+            guard configurationRestartPending == attempt else { return false }
+            configurationRestartPending = nil
+            return !captureFailureReported
+                && AudioCaptureRestartPolicy.isCurrent(
+                    attempt,
+                    activeCaptureGeneration: activeCaptureGeneration,
+                    currentRestartEpoch: configurationRestartEpoch
+                )
+        }
+        guard stillWanted, !isRunning else { return }
+        guard startEngine() else {
             reportCaptureFailureOnce()
             return
         }
-        guard lock.withLock({ makeConverterLocked(from: format) }) else {
-            reportCaptureFailureOnce()
-            return
-        }
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
-            self?.process(buffer)
-        }
-        do {
-            engine.prepare()
-            try engine.start()
-            isRunning = true
-        } catch {
-            log.error("engine restart failed after configuration change: \(error.localizedDescription)")
-            isRunning = false
-            input.removeTap(onBus: 0)
-            reportCaptureFailureOnce()
-        }
+        verifyCaptureResumed(after: attempt)
     }
 
     /// How much audio to keep from before streaming starts. One second is plenty for
@@ -134,6 +236,15 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
         if isRunning {
             return lock.withLock { activeCaptureGeneration }
         }
+        // `.armed` and `beginRecording` can both reach here. If a configuration
+        // notification stopped the engine between those calls, keep ownership with
+        // the same gesture and let its already-queued rebuild run next turn. Starting
+        // inline here would bypass the deferral that lets AVAudioEngine settle.
+        if let deferredGeneration = lock.withLock({
+            configurationRestartPending == nil ? nil : activeCaptureGeneration
+        }) {
+            return deferredGeneration
+        }
         // `.armed` and `beginRecording` both call this method. If the first attempt
         // failed, its callback is intentionally asynchronous; do not start (and report)
         // the same broken gesture a second time before the controller handles it.
@@ -147,34 +258,80 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
             return activeCaptureGeneration
         }
         guard let generation else { return nil }
+        if !startEngine() { reportCaptureFailureOnce() }
+        return generation
+    }
 
+    /// Installs a tap matching the input device's *current* format and starts the
+    /// engine. Shared by the first start of a gesture and by the rebuild after a
+    /// configuration change, so the two can never drift apart.
+    private func startEngine() -> Bool {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
             log.error("input node has no valid format (sampleRate=\(inputFormat.sampleRate)); is a mic present?")
-            reportCaptureFailureOnce()
-            return generation
+            return false
         }
-        guard lock.withLock({ makeConverterLocked(from: inputFormat) }) else {
-            reportCaptureFailureOnce()
-            return generation
-        }
+        guard lock.withLock({ makeConverterLocked(from: inputFormat) }) else { return false }
 
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.process(buffer)
         }
-
         do {
             engine.prepare()
             try engine.start()
             isRunning = true
+            return true
         } catch {
             log.error("engine start failed: \(error.localizedDescription)")
             input.removeTap(onBus: 0)
-            reportCaptureFailureOnce()
+            return false
         }
-        return generation
+    }
+
+    /// Puts the engine back in the state `startEngine` can start from. After this,
+    /// `isRunning == false` is the truth, so nothing can inherit a tap that is no
+    /// longer delivering.
+    private func stopEngine() {
+        guard isRunning else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        isRunning = false
+    }
+
+    /// `engine.start()` returning without throwing does not mean the tap is delivering.
+    /// Measured on this machine: after a configuration change the restart reported
+    /// success and logged no error, while the relay received 0.9 s of audio for a 21 s
+    /// utterance — the sentence was gone and nothing said so.
+    ///
+    /// The deferred rebuild is meant to fix that. This is the backstop for when it
+    /// does not: the utterance cannot be saved here, but being told beats waiting out
+    /// a 20 s transcription timeout for audio that is never coming.
+    private func verifyCaptureResumed(after attempt: AudioCaptureRestartAttempt) {
+        let before = lock.withLock { deliveredBuffers }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self else { return }
+            let failedGeneration: UInt64? = self.lock.withLock {
+                guard AudioCaptureRestartPolicy.shouldReportStalledCapture(
+                    attempt,
+                    activeCaptureGeneration: self.activeCaptureGeneration,
+                    currentRestartEpoch: self.configurationRestartEpoch,
+                    deliveredBuffersBefore: before,
+                    deliveredBuffersNow: self.deliveredBuffers,
+                    isRunning: self.isRunning,
+                    captureFailureReported: self.captureFailureReported
+                ) else {
+                    return nil
+                }
+                self.captureFailureReported = true
+                return attempt.captureGeneration
+            }
+            guard let failedGeneration else { return }
+            log.error("no audio after the configuration-change restart; capture lost")
+            self.stopEngine()
+            self.onCaptureFailure?(failedGeneration)
+        }
     }
 
     /// Promotes the session to live streaming and returns the buffered pre-roll audio.
@@ -226,6 +383,7 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
             prerollBytes = 0
             captureFailureReported = false
             activeCaptureGeneration = nil
+            configurationRestartPending = nil
             return StopResult(
                 audio: drained,
                 captureFailed: failed,
@@ -255,6 +413,7 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
             prerollBytes = 0
             captureFailureReported = false
             activeCaptureGeneration = nil
+            configurationRestartPending = nil
             return (tail, wasStreaming, failed, generation)
         }
         if wasStreaming {
@@ -270,6 +429,7 @@ public nonisolated final class AudioCapture: @unchecked Sendable {
     // MARK: - Audio thread
 
     private func process(_ buffer: AVAudioPCMBuffer) {
+        lock.withLock { deliveredBuffers &+= 1 }
         publishLevel(of: buffer)
         guard let data = convert(buffer), !data.isEmpty else { return }
         routeConvertedChunks([data])

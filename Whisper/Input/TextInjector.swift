@@ -739,6 +739,47 @@ enum TextInjector {
         return actual.utf16.count == expectedLength && actual == text
     }
 
+    /// Strict ownership proof for a destructive live revision. A matching suffix alone
+    /// is ambiguous: if Whisper typed "a" and the user then typed another "a", the
+    /// current suffix is still "a" even though Backspace would delete the user's input.
+    /// Require the exact field captured at utterance start, the caret position predicted
+    /// from its original selection, and our text at that original insertion range.
+    static func matchesInjectedTextAtOriginalSelection(
+        _ text: String,
+        target: TextInjectionTarget
+    ) -> Bool {
+        guard focusedElementMatches(target.element) == true,
+              let originalSelection = target.selection,
+              let currentSelection = selectedTextRange(of: target.element),
+              selectionMatches(
+                snapshot: originalSelection,
+                current: currentSelection,
+                insertedUTF16Count: text.utf16.count
+              ) else {
+            return false
+        }
+
+        // Before the first live append, exact field + unchanged selection is the whole
+        // ownership proof; there is no injected range to inspect yet.
+        guard !text.isEmpty else { return true }
+
+        var requested = CFRange(
+            location: originalSelection.location,
+            length: text.utf16.count
+        )
+        guard let requestedValue = AXValueCreate(.cfRange, &requested) else { return false }
+        var actualValue: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            target.element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            requestedValue,
+            &actualValue
+        ) == .success, let actual = actualValue as? String else {
+            return false
+        }
+        return actual.utf16.count == text.utf16.count && actual == text
+    }
+
     // MARK: - Event plumbing
 
     private static func snapshot(

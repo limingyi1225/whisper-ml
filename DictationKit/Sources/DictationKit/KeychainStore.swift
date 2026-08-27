@@ -8,15 +8,13 @@ private let log = Logger(subsystem: "com.mingyili.Whisper", category: "keychain"
 /// Credentials live in the login keychain, not in the binary or in UserDefaults.
 public enum KeychainStore {
     private static let service = "com.mingyili.Whisper"
-    private static let apiKeyAccount = "openai-api-key"
+    /// Removed with direct mode. Kept only so upgraded installs can erase the upstream
+    /// credential that older builds stored; no API can load or save it anymore.
+    private static let legacyOpenAIAPIKeyAccount = "openai-api-key"
     private static let relayTokenAccount = "relay-device-token"
     private static let pendingRelayTokenAccount = "relay-pending-enrollment-token"
     private static let relayTokenProvenanceAccount = "relay-device-token-provenance"
     private static let relayCredentialProcessLock = RelayCredentialProcessLock()
-
-    public static func loadAPIKey() -> String? {
-        load(account: apiKeyAccount)
-    }
 
     public static func loadRelayToken() -> String? {
         load(account: relayTokenAccount)
@@ -420,9 +418,27 @@ public enum KeychainStore {
     /// the item and materialised the plaintext secret each time, purely to compare it
     /// against nil. `kSecReturnData: false` answers the same question from the item's
     /// attributes.
-    public static func hasAPIKey() -> Bool { exists(account: apiKeyAccount) }
 
     public static func hasRelayToken() -> Bool { exists(account: relayTokenAccount) }
+
+    /// Read only for the one-time relay-only migration. The value itself remains
+    /// inaccessible; the app only needs to know whether removing direct mode took away
+    /// the credential an upgraded install had previously relied on.
+    public static func hasLegacyUpstreamCredential() -> Bool {
+        exists(account: legacyOpenAIAPIKeyAccount)
+    }
+
+    /// Enforces the relay-only privacy boundary on upgrade. Idempotent by design so a
+    /// failed Keychain operation is retried next launch instead of being hidden behind a
+    /// UserDefaults migration bit.
+    @discardableResult
+    public static func deleteLegacyUpstreamCredentials() -> Bool {
+        let deleted = delete(account: legacyOpenAIAPIKeyAccount)
+        if !deleted {
+            log.error("could not remove the legacy upstream API credential")
+        }
+        return deleted
+    }
 
     private static func exists(account: String) -> Bool {
         var query: [String: Any] = baseQuery(account: account)
@@ -443,15 +459,6 @@ public enum KeychainStore {
               !key.isEmpty
         else { return nil }
         return key
-    }
-
-    /// Returns `true` only when a key was actually written. Whitespace-only input
-    /// is rejected rather than treated as a delete — callers report `true` as
-    /// "已存入钥匙串", and silently *removing* the key under that message would
-    /// leave the user believing the opposite of what happened.
-    @discardableResult
-    public static func saveAPIKey(_ key: String) -> Bool {
-        save(key, account: apiKeyAccount)
     }
 
     @discardableResult
@@ -485,11 +492,6 @@ public enum KeychainStore {
         // keychain items, and this is a file-based login-keychain item — setting
         // it would document a guarantee that is silently not enforced.
         return SecItemAdd(insert as CFDictionary, nil) == errSecSuccess
-    }
-
-    @discardableResult
-    public static func deleteAPIKey() -> Bool {
-        delete(account: apiKeyAccount)
     }
 
     @discardableResult

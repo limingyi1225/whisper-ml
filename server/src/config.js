@@ -233,6 +233,20 @@ export function loadConfig(env = process.env) {
   const deviceTokenHashes = loadDeviceTokenHashes(env, null, {
     allowIntentionalEmpty: enrollmentEnabled,
   });
+  const allowedTranscriptionModels = commaSeparatedSet(
+    env.ALLOWED_TRANSCRIPTION_MODELS
+    || "gemini-3.5-transcribe-live,gpt-live-transcribe,gpt-transcribe",
+  );
+  // The public query chooses the provider before the session.update frame arrives.
+  // Keep the deployment's single allowlist as the source of truth, but derive a
+  // provider-specific view so a cross-provider model can never be forwarded merely
+  // because its name appears in the global list.
+  const allowedOpenAITranscriptionModels = new Set(
+    [...allowedTranscriptionModels].filter((model) => model.startsWith("gpt-")),
+  );
+  const allowedGeminiTranscriptionModels = new Set(
+    [...allowedTranscriptionModels].filter((model) => model.startsWith("gemini-")),
+  );
 
   return Object.freeze({
     /// Where to re-read the allowlist from on SIGHUP; empty means it is static.
@@ -243,6 +257,7 @@ export function loadConfig(env = process.env) {
     port: positiveInteger(env, "PORT", DEFAULTS.port),
     basePath: normalizeBasePath(env.RELAY_BASE_PATH) || DEFAULTS.basePath,
     openAIAPIKey: required(env, "OPENAI_API_KEY"),
+    geminiAPIKey: required(env, "GEMINI_API_KEY"),
     openAIRealtimeURL: endpointURL(
       env,
       "OPENAI_REALTIME_URL",
@@ -255,11 +270,16 @@ export function loadConfig(env = process.env) {
       "https://api.openai.com/v1/chat/completions",
       ["https:", "http:"],
     ),
-    deviceTokenHashes,
-    allowedTranscriptionModels: commaSeparatedSet(
-      env.ALLOWED_TRANSCRIPTION_MODELS
-      || "gpt-live-transcribe,gpt-transcribe",
+    geminiLiveURL: endpointURL(
+      env,
+      "GEMINI_LIVE_URL",
+      "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+      ["wss:", "ws:"],
     ),
+    deviceTokenHashes,
+    allowedTranscriptionModels,
+    allowedOpenAITranscriptionModels,
+    allowedGeminiTranscriptionModels,
     allowedPolishModels: commaSeparatedSet(
       env.ALLOWED_POLISH_MODELS || "gpt-5.6-luna",
     ),

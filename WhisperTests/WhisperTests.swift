@@ -574,6 +574,7 @@ import Testing
         // count is what keeps the backspace count aligned with what the user sees.
         #expect(DictationController.commonPrefixLength("👨‍👩‍👧a", "👨‍👩‍👧b") == 1)
     }
+
 }
 
 @Suite struct IgnoringWhitespaceTests {
@@ -598,8 +599,10 @@ import Testing
 
     @Test func chineseMessagesPassThroughUntranslated() {
         // Our own messages can legitimately contain English keywords
-        // ("还没有设置 API Key") — keyword matching must not fire on them.
-        #expect(DictationController.friendlyMessage("还没有设置 API Key") == "还没有设置 API Key")
+        // ("还没有设置设备 Token") — keyword matching must not fire on them.
+        #expect(
+            DictationController.friendlyMessage("还没有设置设备 Token") == "还没有设置设备 Token"
+        )
         #expect(DictationController.friendlyMessage("连接中断：quota") == "连接中断：quota")
     }
 
@@ -887,11 +890,18 @@ import Testing
 }
 
 @Suite struct SettingsTableTests {
-    @Test func onlyTheLiveModelTypesLive() {
-        // The behavior the whole output-mode design hangs on: only the streaming
-        // model returns anything before `input_audio_buffer.commit`.
+    @Test func streamingModelsTypeLiveAndOnlyOpenAIExposesDelay() {
+        // Both streaming models type as you speak; they differ in how. Gemini's
+        // interim is a revisable snapshot, so the controller types only the prefix two
+        // hypotheses agree on and takes revisions back with backspaces. Only OpenAI has
+        // a latency knob to expose.
+        #expect(TranscriptionModel.geminiLive.supportsLiveTyping)
         #expect(TranscriptionModel.liveTranscribe.supportsLiveTyping)
         #expect(!TranscriptionModel.transcribe.supportsLiveTyping)
+        #expect(!TranscriptionModel.geminiLive.supportsTranscriptionDelay)
+        #expect(TranscriptionModel.liveTranscribe.supportsTranscriptionDelay)
+        #expect(TranscriptionModel.geminiLive.provider == .gemini)
+        #expect(TranscriptionModel.liveTranscribe.provider == .openAI)
     }
 }
 
@@ -927,12 +937,32 @@ import Testing
         ))
     }
 
-    /// Once finished it is finished, whatever the machine looks like afterwards. A
-    /// permission revoked months later is a menu-bar problem, not a reason to reopen a
-    /// welcome screen in the middle of somebody's working day.
-    @Test func aFinishedGuideNeverComesBack() {
+    /// Revoked permissions remain a Settings problem, but removing direct mode creates
+    /// a new hard credential prerequisite that an old completion flag cannot satisfy.
+    @Test func aFinishedDirectInstallIsOfferedRelayCredentialRecovery() {
+        #expect(OnboardingGate.shouldPresent(
+            completed: true,
+            owed: false,
+            dismissed: false,
+            hasCredential: false,
+            hasAccessibility: false,
+            hasMicrophone: false
+        ))
         #expect(!OnboardingGate.shouldPresent(
-            completed: true, hasCredential: false, hasAccessibility: false
+            completed: true,
+            owed: false,
+            dismissed: false,
+            hasCredential: true,
+            hasAccessibility: false,
+            hasMicrophone: false
+        ))
+        #expect(!OnboardingGate.shouldPresent(
+            completed: true,
+            owed: false,
+            dismissed: true,
+            hasCredential: false,
+            hasAccessibility: true,
+            hasMicrophone: true
         ))
     }
 
@@ -1049,14 +1079,6 @@ import Testing
 }
 
 @Suite struct KeychainInputTests {
-    @Test func whitespaceOnlyKeysAreRejectedWithoutTouchingTheKeychain() {
-        // A rejected save must return false — SettingsView reports true as
-        // "已存入钥匙串", and a silent delete under that message once shipped.
-        #expect(!KeychainStore.saveAPIKey(""))
-        #expect(!KeychainStore.saveAPIKey("   "))
-        #expect(!KeychainStore.saveAPIKey(" \n\t"))
-    }
-
     @Test func whitespaceOnlyRelayTokensAreRejectedWithoutTouchingTheKeychain() {
         #expect(!KeychainStore.saveRelayToken(""))
         #expect(!KeychainStore.saveRelayToken("   "))
@@ -1113,62 +1135,22 @@ import Testing
         ))
     }
 
-    @Test func inviteOnboardingPreservesAnExplicitRoute() {
-        #expect(InviteEnrollmentOnboarding.shouldDefaultToRelay(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: false,
-            connectionModeWasChosen: false
-        ))
-        #expect(!InviteEnrollmentOnboarding.shouldDefaultToRelay(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: false,
-            connectionModeWasChosen: true
-        ))
-        #expect(!InviteEnrollmentOnboarding.shouldDefaultToRelay(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: true,
-            connectionModeWasChosen: false
-        ))
-    }
-
-    @Test func invitePromptFollowsRelayModeRatherThanAPIKeyPresence() {
+    @Test func theInvitePromptIsExactlyAMissingDeviceToken() {
+        // The relay is the only route, so activation has one question left: does this
+        // Mac hold a device token? The old per-mode reasoning — an API key in the
+        // Keychain, a connection mode the user had chosen — described a fork that no
+        // longer exists.
         #expect(InviteEnrollmentOnboarding.shouldPresentInvite(
             inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: true,
-            connectionModeWasChosen: true,
-            connectionMode: .relay
+            hasRelayToken: false
         ))
         #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
             inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: false,
-            connectionModeWasChosen: true,
-            connectionMode: .direct
-        ))
-        #expect(InviteEnrollmentOnboarding.shouldPresentInvite(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: false,
-            connectionModeWasChosen: false,
-            connectionMode: .direct
+            hasRelayToken: true
         ))
         #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: false,
-            hasAPIKey: true,
-            connectionModeWasChosen: false,
-            connectionMode: .direct
-        ))
-        #expect(!InviteEnrollmentOnboarding.shouldPresentInvite(
-            inviteEnrollmentEnabled: true,
-            hasRelayToken: true,
-            hasAPIKey: false,
-            connectionModeWasChosen: false,
-            connectionMode: .relay
+            inviteEnrollmentEnabled: false,
+            hasRelayToken: false
         ))
     }
 }
@@ -1204,7 +1186,9 @@ import Testing
         #expect(base.appendingPathComponent("v1/polish").absoluteString
             == "https://relay.example.com/whisper/v1/polish")
         #expect(ServiceRoute.relayRealtimeURL(baseURL: base).absoluteString
-            == "wss://relay.example.com/whisper/v1/realtime?intent=transcription")
+            == "wss://relay.example.com/whisper/v1/realtime?intent=transcription&provider=openai")
+        #expect(ServiceRoute.relayRealtimeURL(baseURL: base, provider: .gemini).absoluteString
+            == "wss://relay.example.com/whisper/v1/realtime?intent=transcription&provider=gemini")
     }
 
     /// The deployed relay is published under a path prefix, so these are the exact
@@ -1214,7 +1198,7 @@ import Testing
             .absoluteString == "https://limingyi.com/whisper-relay/v1/polish")
         #expect(ServiceRoute.relayRealtimeURL(baseURL: ServiceRoute.relayBaseURL)
             .absoluteString
-            == "wss://limingyi.com/whisper-relay/v1/realtime?intent=transcription")
+            == "wss://limingyi.com/whisper-relay/v1/realtime?intent=transcription&provider=openai")
     }
 
     /// A stale or malformed development override must not be able to brick the app,
@@ -1260,15 +1244,14 @@ import Testing
     /// the one thing that must never happen is it being interpolated into a log line.
     @Test func interpolatingARouteNeverPrintsTheCredential() {
         let route = ServiceRoute(
-            mode: .relay,
             realtimeURL: URL(string: "wss://relay.example.com/v1/realtime")!,
             polishURL: URL(string: "https://relay.example.com/v1/polish")!,
             credential: "relay_super-secret-token"
         )
         let logged = "route=\(route)"
         #expect(!logged.contains("relay_super-secret-token"))
-        // Still has to be worth logging: mode and host are the two facts that matter.
-        #expect(logged.contains("relay"))
+        // Still has to be worth logging: provider and host are the facts that matter.
+        #expect(logged.contains("openai"))
         #expect(logged.contains("relay.example.com"))
     }
 
@@ -1277,22 +1260,18 @@ import Testing
     /// without reading the status off the task's `response` a revoked device token is
     /// indistinguishable from a dead café Wi-Fi — and the app burns all six backoff
     /// attempts on a credential that will never start working.
-    @Test func aRejectedHandshakeSaysWhichPeerRefusedItAndWhetherRetryingHelps() {
-        let unauthorized = RealtimeClient.handshakeRejection(statusCode: 401, viaRelay: true)
+    @Test func aRejectedHandshakeSaysWhyItWasRefusedAndWhetherRetryingHelps() {
+        let unauthorized = RealtimeClient.handshakeRejection(statusCode: 401)
         #expect(unauthorized.message.contains("设备凭证"))
         #expect(unauthorized.retryable == false)
         // The one failure a personalised build may repair by installing its bundled
         // token: our relay's auth answers a bad token with 401 and nothing else.
         #expect(unauthorized.rejectedCredential)
 
-        let badKey = RealtimeClient.handshakeRejection(statusCode: 403, viaRelay: false)
-        #expect(badKey.message.contains("API Key"))
-        #expect(badKey.retryable == false)
-
-        // A relay-path 403 is Cloudflare or nginx, never the relay itself — it does
-        // not send 403. Marking it a rejected credential once let one transient edge
-        // hiccup *permanently* overwrite a hand-typed token with the bundled one.
-        let edge = RealtimeClient.handshakeRejection(statusCode: 403, viaRelay: true)
+        // A 403 is Cloudflare or nginx, never the relay itself — it does not send 403.
+        // Marking it a rejected credential once let one transient edge hiccup
+        // *permanently* overwrite a hand-typed token with the bundled one.
+        let edge = RealtimeClient.handshakeRejection(statusCode: 403)
         #expect(edge.rejectedCredential == false)
         #expect(edge.retryable)
         #expect(edge.message.contains("403"))
@@ -1301,13 +1280,13 @@ import Testing
         // Usually this device's own sleep/wake zombies still holding their slots. The
         // relay's heartbeat reaps them within a sweep or two, so this one must keep
         // retrying rather than stranding the user on a self-healing error.
-        let throttled = RealtimeClient.handshakeRejection(statusCode: 429, viaRelay: true)
+        let throttled = RealtimeClient.handshakeRejection(statusCode: 429)
         #expect(throttled.message.contains("429"))
         #expect(throttled.retryable)
 
         // Anything unclassified still beats "There was a bad response from the server":
         // the status is the one fact that says whether it is the relay or the edge.
-        let gateway = RealtimeClient.handshakeRejection(statusCode: 502, viaRelay: true)
+        let gateway = RealtimeClient.handshakeRejection(statusCode: 502)
         #expect(gateway.message.contains("502"))
         #expect(gateway.message.contains("转发服务器"))
         #expect(gateway.retryable)
@@ -1353,5 +1332,184 @@ import Testing
                 version: String(repeating: "1", count: 33)
             ) == .init(client: "unknown", version: "unknown")
         )
+    }
+}
+
+@MainActor
+@Suite struct RevisableInterimTypingTests {
+    @Test func onlyThePrefixTwoHypothesesAgreeOnIsTyped() {
+        // The volatile tail is held back, so a revision that changes it costs nothing.
+        #expect(DictationController.stablePartialPrefix("好，现在测", "好，现在测试") == "好，现在测")
+        #expect(DictationController.stablePartialPrefix("好，现在测", "好，现在吃") == "好，现在")
+        #expect(DictationController.stablePartialPrefix("", "好").isEmpty)
+    }
+
+    @Test func interimSpacingAndPunctuationAreTightenedBetweenChineseCharacters() {
+        #expect(
+            DictationController.normalizeCJKTypography("好 , 现在 测试 一下 效果 .")
+                == "好，现在测试一下效果。"
+        )
+        #expect(DictationController.normalizeCJKTypography("这样 吗 ?") == "这样吗？")
+    }
+
+    @Test func latinTextKeepsItsOwnSpacingAndPunctuation() {
+        #expect(DictationController.normalizeCJKTypography("用 GPT 测试 一下") == "用 GPT 测试一下")
+        #expect(DictationController.normalizeCJKTypography("version 1.10, ok") == "version 1.10, ok")
+        #expect(DictationController.normalizeCJKTypography("hello world.") == "hello world.")
+    }
+
+    @Test func aTrailingSpaceIsNeverTypedOnlyToBeDeletedAgain() {
+        #expect(DictationController.trimmingTrailingSpaces("好，现在 ") == "好，现在")
+        #expect(DictationController.trimmingTrailingSpaces("hello") == "hello")
+    }
+
+    @Test func autocorrectOrPartialWritesCannotAuthorizeInterimBackspace() {
+        // `false` covers both transformations of our typed text (such as autocorrect)
+        // and a synthetic write that only partly reached the target.
+        #expect(!DictationController.interimRevisionMayDelete(
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false
+        ))
+        #expect(!DictationController.interimRevisionMayDelete(
+            firstOwnershipProof: true,
+            recheckedOwnershipProof: false
+        ))
+    }
+
+    @Test func unknownAXTextEvidenceFailsClosedForInterimBackspace() {
+        #expect(!DictationController.interimRevisionMayDelete(
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false
+        ))
+        #expect(!DictationController.interimRevisionMayDelete(
+            firstOwnershipProof: true,
+            recheckedOwnershipProof: false
+        ))
+        #expect(DictationController.interimRevisionMayDelete(
+            firstOwnershipProof: true,
+            recheckedOwnershipProof: true
+        ))
+    }
+
+    @Test func repeatedSuffixCannotStandInForTheOriginalInsertionPosition() {
+        let original = CFRange(location: 10, length: 0)
+        #expect(TextInjector.selectionMatches(
+            snapshot: original,
+            current: CFRange(location: 11, length: 0),
+            insertedUTF16Count: 1
+        ))
+        // Whisper inserted one "a", then the user inserted the same suffix. Text alone
+        // still matches, but the caret is one position beyond Whisper's owned range.
+        #expect(!TextInjector.selectionMatches(
+            snapshot: original,
+            current: CFRange(location: 12, length: 0),
+            insertedUTF16Count: 1
+        ))
+    }
+
+    @Test func liveTypingRequiresPositiveExactFieldEvidence() {
+        #expect(DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: true
+        ))
+        #expect(!DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: nil
+        ))
+        #expect(!DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: false
+        ))
+        #expect(DictationController.liveInjectionFieldDisposition(
+            anchorUnchanged: true,
+            exactElementFocused: nil
+        ) == .deferToFinalPaste)
+        #expect(DictationController.liveInjectionFieldDisposition(
+            anchorUnchanged: false,
+            exactElementFocused: nil
+        ) == .abandonTarget)
+    }
+
+    @Test func finalSuffixTypingRequiresPositiveOriginalFieldOwnership() {
+        #expect(DictationController.finalAdditionMayType(
+            originalFieldOwnershipProof: true
+        ))
+        #expect(!DictationController.finalAdditionMayType(
+            originalFieldOwnershipProof: false
+        ))
+        #expect(!DictationController.finalAdditionMayType(
+            originalFieldOwnershipProof: nil
+        ))
+    }
+
+    @Test func finalBackspaceRequiresTwoPositiveDocumentProofs() {
+        #expect(!DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: nil
+        ))
+        #expect(!DictationController.rewriteMayStillDelete(
+            firstTextProof: true,
+            recheckedTextProof: nil,
+            sameElementStillFocused: true
+        ))
+        #expect(DictationController.rewriteMayStillDelete(
+            firstTextProof: true,
+            recheckedTextProof: true,
+            sameElementStillFocused: true
+        ))
+    }
+}
+
+@Suite struct OnboardingCredentialPolicyTests {
+    @Test func legacyDirectRecoveryOverridesDismissalExactlyOnce() {
+        #expect(LegacyCredentialRecoveryPolicy.shouldSchedule(
+            hadLegacyCredential: true,
+            hasRelayToken: false,
+            wasAlreadyScheduled: false
+        ))
+        #expect(!LegacyCredentialRecoveryPolicy.shouldSchedule(
+            hadLegacyCredential: true,
+            hasRelayToken: false,
+            wasAlreadyScheduled: true
+        ))
+        #expect(!LegacyCredentialRecoveryPolicy.shouldSchedule(
+            hadLegacyCredential: true,
+            hasRelayToken: true,
+            wasAlreadyScheduled: false
+        ))
+        #expect(OnboardingGate.shouldPresent(
+            completed: false,
+            owed: false,
+            dismissed: true,
+            requiresCredentialRecovery: true,
+            hasCredential: false,
+            hasAccessibility: true,
+            hasMicrophone: true
+        ))
+    }
+
+    @Test func suppressedPresentationDoesNotEraseDismissal() {
+        #expect(!OnboardingPresentationPolicy.shouldMarkImplicitCompletion(
+            dismissed: true
+        ))
+        #expect(OnboardingPresentationPolicy.shouldMarkImplicitCompletion(
+            dismissed: false
+        ))
+    }
+
+    @Test func editorMatchesTheBuildEnrollmentCapability() {
+        #expect(OnboardingCredentialPolicy.editor(inviteEnrollmentEnabled: true) == .invite)
+        #expect(
+            OnboardingCredentialPolicy.editor(inviteEnrollmentEnabled: false)
+                == .manualRelayToken
+        )
+    }
+
+    @Test func manualDeviceTokenIsValidatedAndTrimmed() {
+        let token = "relay_" + String(repeating: "a", count: 43)
+        #expect(OnboardingCredentialPolicy.manualRelayToken(from: "  \(token)  ") == token)
+        #expect(OnboardingCredentialPolicy.manualRelayToken(from: "relay_device") == nil)
+        #expect(OnboardingCredentialPolicy.manualRelayToken(from: "x") == nil)
+        #expect(OnboardingCredentialPolicy.manualRelayToken(from: " \n\t ") == nil)
     }
 }

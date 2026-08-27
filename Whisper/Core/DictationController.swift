@@ -69,6 +69,13 @@ final class DictationController {
 
     /// What we have actually typed into the target app this utterance.
     @ObservationIgnored private var injectedText = ""
+    /// The target does not publish enough exact AX identity for safe live typing.
+    /// This is not the same as losing ownership after a write: no text has been sent,
+    /// so the authoritative final may still use the ordinary PID-checked paste path.
+    @ObservationIgnored private var liveInjectionSuppressed = false
+    /// The previous interim hypothesis, kept so that only the part two of them
+    /// agree on is typed. See `stablePartialPrefix`.
+    @ObservationIgnored private var previousPartialSnapshot = ""
     /// The deltas accumulated for the current utterance. Kept as a whole so leading
     /// whitespace normalization sees the beginning of the sentence on every update.
     @ObservationIgnored private var accumulatedPartial = ""
@@ -224,8 +231,8 @@ final class DictationController {
             self?.handleHotKey(event)
         }
 
-        client.onDelta = { [weak self] delta in
-            self?.handleDelta(delta)
+        client.onPartialSnapshot = { [weak self] snapshot in
+            self?.handlePartialSnapshot(snapshot)
         }
         client.onCompleted = { [weak self] transcript in
             self?.handleCompleted(transcript)
@@ -304,66 +311,71 @@ final class DictationController {
         anchorUnchanged: Bool,
         exactElementFocused: Bool?
     ) -> Bool {
-        // `nil` is a control that publishes no focused element to compare — the answer
-        // Electron and WebView editors give — and it is deliberately not disproof. The
-        // optional is resolved here rather than at the call site so a test can pin it;
-        // the three times this rule was inverted, it was inverted at a call site no
-        // test could reach.
-        anchorUnchanged && exactElementFocused != false
+        // Live typing is optional and can expose spoken text to the wrong control.
+        // Absence of exact element evidence therefore fails closed; the final result
+        // still uses the clipboard/paste recovery path.
+        anchorUnchanged && exactElementFocused == true
+    }
+
+    enum LiveInjectionFieldDisposition: Equatable {
+        case continueTyping
+        case deferToFinalPaste
+        case abandonTarget
+    }
+
+    static func liveInjectionFieldDisposition(
+        anchorUnchanged: Bool,
+        exactElementFocused: Bool?
+    ) -> LiveInjectionFieldDisposition {
+        guard anchorUnchanged else { return .abandonTarget }
+        guard let exactElementFocused else { return .deferToFinalPaste }
+        return exactElementFocused ? .continueTyping : .abandonTarget
     }
 
     /// Whether the destructive half of a cleanup rewrite may post its backspaces.
     ///
-    /// Two independent kinds of evidence, both optional, because most targets publish
-    /// neither and absent evidence is not disproof.
+    /// Backspace is destructive, so only positive proof that the exact text is still
+    /// at the captured insertion point can authorize it. Element identity alone is not
+    /// enough: a focus move can race between that read and the key event, and an opaque
+    /// editor gives us no way to prove what those backspaces would consume.
     ///
-    /// `typedTextStillBeforeCaret` outranks the other. `false` is a control that
-    /// answered and contradicted us: our keystrokes are no longer what sits before the
-    /// caret, so backspacing by our own count would cross into the user's text. `true`
-    /// is positive proof that the caret is exactly where the deltas left it, and it
-    /// settles the question on its own — in particular it overrides an element mismatch,
-    /// because an app that rebuilt its accessibility tree around the text we just typed
-    /// vends a fresh object for the very field we are still correctly addressing.
-    ///
-    /// `sameElementStillFocused` only decides the remaining case: a control that
-    /// exposes no text range at all. There, `false` — the system naming some *other*
-    /// element — is the only signal left that focus moved within the app, and
-    /// backspacing would eat that other control's content. `nil` is the system naming
-    /// nothing, which is not the same thing; refusing on it leaves the raw deltas on
-    /// screen and strands the corrected sentence on the clipboard, which is what the
-    /// whole cleanup feature looks like when it is broken.
-    /// The element term is an autoclosure because obtaining it costs a blocking
-    /// cross-process AX message on the main run loop, and whenever the text answered at
-    /// all it cannot change the outcome. Evaluating it anyway held the run loop — and
-    /// with it the event tap — for a fifth of a second to compute something unused.
+    /// The legacy element term remains an autoclosure so callers do not pay for a
+    /// blocking cross-process AX query that cannot strengthen the text proof.
     static func rewriteMayDelete(
         typedTextStillBeforeCaret: Bool?,
-        sameElementStillFocused: @autoclosure () -> Bool?
+        sameElementStillFocused _: @autoclosure () -> Bool?
     ) -> Bool {
-        if let typedTextStillBeforeCaret { return typedTextStillBeforeCaret }
-        return sameElementStillFocused() != false
+        typedTextStillBeforeCaret == true
     }
 
-    /// The second guard's verdict, taken between two blocking AX reads where no test
-    /// can reach it — which is why it is here and not inline.
-    ///
-    /// `recheckedTextProof` is `nil` in two situations that look identical from here:
-    /// the control was never asked again, because one that published no range will not
-    /// publish one 200 ms later; or it was asked and timed out. Neither is a reason to
-    /// overturn a proof already in hand. Letting `nil` fall through to the element term
-    /// would refuse every app that rebuilds its accessibility tree around the text just
-    /// typed into it — a control that answered `true` a moment ago, refused because the
-    /// second look was slow. An explicit `false` from the re-read still refuses, which
-    /// is the whole reason the re-read exists.
+    /// Both reads must positively agree. A timeout on the second look is uncertainty,
+    /// not permission to act on a potentially stale first proof.
     static func rewriteMayStillDelete(
         firstTextProof: Bool?,
         recheckedTextProof: Bool?,
-        sameElementStillFocused: @autoclosure () -> Bool?
+        sameElementStillFocused _: @autoclosure () -> Bool?
     ) -> Bool {
-        rewriteMayDelete(
-            typedTextStillBeforeCaret: recheckedTextProof ?? firstTextProof,
-            sameElementStillFocused: sameElementStillFocused()
-        )
+        firstTextProof == true && recheckedTextProof == true
+    }
+
+    /// Interim hypotheses are allowed to revise text while the user is still speaking,
+    /// but that does not make their deletion any less destructive. Unlike final
+    /// cleanup, there is no compatibility fallback for an opaque AX control: live
+    /// typing is optional, while deleting pre-existing user text is irreversible.
+    /// Both reads must positively prove that the complete text we believe we typed is
+    /// still immediately before the caret.
+    static func interimRevisionMayDelete(
+        firstOwnershipProof: Bool,
+        recheckedOwnershipProof: Bool
+    ) -> Bool {
+        firstOwnershipProof && recheckedOwnershipProof
+    }
+
+    /// App identity is insufficient for a final suffix: focus can move between two
+    /// controls in one process without producing a foreign input event. Only positive
+    /// ownership of the field that received the partial text permits another write.
+    static func finalAdditionMayType(originalFieldOwnershipProof: Bool?) -> Bool {
+        originalFieldOwnershipProof == true
     }
 
     /// Ownership, not the previous utterance's presentation phase, decides whether a
@@ -463,7 +475,12 @@ final class DictationController {
             // short enough for the user to start their next sentence before it lands.
             // Start capturing so nothing is lost, but leave the phase alone — this
             // press may yet turn out to be an ordinary ⌘C.
-            guard phase == .idle || isErrorPhase || phase == .finalizing else { return }
+            guard phase == .idle || isErrorPhase || phase == .finalizing else {
+                // Silent until now, and this is the gate a wedged trigger key dies at:
+                // the press is delivered, dropped here, and nothing anywhere says so.
+                log.warning("armed ignored in phase \(String(describing: self.phase), privacy: .public)")
+                return
+            }
             // The user is about to speak *here* — move the pill to whichever screen
             // they are on. This event is the one signal that also covers queued
             // gestures, which never pass through `.arming`.
@@ -508,6 +525,11 @@ final class DictationController {
                 // may meanwhile be showing that utterance's error). This press has
                 // been buffering since `.armed`; freeze its identity now, not when
                 // the key eventually comes up.
+                //
+                // Logged because this is the other way the key goes quiet: if the
+                // utterance being waited on never settles, every later press lands
+                // here and returns, and the app looks deaf with nothing to show why.
+                log.info("long press queued behind an unsettled utterance")
                 freezeQueuedGestureIdentity()
                 return
             }
@@ -530,7 +552,10 @@ final class DictationController {
             // was finalizing keeps its phase untouched, so if that utterance fails
             // in the 200–500ms before the long press confirms, the phase is
             // `.error` here — rejecting it would silently drop this whole sentence.
-            guard phase == .arming || phase == .idle || isErrorPhase else { return }
+            guard phase == .arming || phase == .idle || isErrorPhase else {
+                log.warning("long press ignored in phase \(String(describing: self.phase), privacy: .public) queued=\(self.startWhenSettled, privacy: .public)")
+                return
+            }
             beginRecording()
 
         case .released:
@@ -616,6 +641,8 @@ final class DictationController {
                     partialText = ""
                     accumulatedPartial = ""
                     injectedText = ""
+                    liveInjectionSuppressed = false
+                    previousPartialSnapshot = ""
                     utteranceRoute = nil
                     injectionTarget = nil
                     utteranceIsRehearsal = false
@@ -730,6 +757,8 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        liveInjectionSuppressed = false
+        previousPartialSnapshot = ""
         pendingRawText = nil
         captureInterruptionNotice = nil
         // A fresh start clears a capture-failure marker from a gesture whose queue
@@ -829,50 +858,219 @@ final class DictationController {
 
     // MARK: - Transcript
 
-    private func handleDelta(_ delta: String) {
+    private func handlePartialSnapshot(_ snapshot: String) {
         guard phase == .recording || phase == .finalizing else { return }
-        accumulatedPartial += delta
+        accumulatedPartial = snapshot
         emitPartial()
     }
 
-    /// Types whatever part of the utterance is now settled but not yet on screen.
+    /// How much already-typed text one interim revision may take back.
+    ///
+    /// Revisions of a *stable* prefix are rare and short — the model reconsidering a
+    /// word, not a clause. A large one means the hypothesis was restructured, and the
+    /// honest response is to stop typing and let the final's `reconcile` do it, since
+    /// that path demands positive proof from the document before it deletes. This cap
+    /// is what keeps a wrong backspace count from ever reaching far into the user's
+    /// own text.
+    private static let maxLiveRevisionCharacters = 32
+
+    /// Types whatever part of the utterance has stopped moving but is not yet on screen.
+    ///
+    /// Both live models reach this now, by different routes. `gpt-live-transcribe`
+    /// accumulates append-only deltas, so its hypothesis only ever grows. Gemini's is a
+    /// revisable snapshot: measured against the live service, `好。` → `好,` → `好, 现在`
+    /// — it rewrites punctuation it already emitted, and SMART mode's whole job is to go
+    /// back and delete filler words and false starts.
+    ///
+    /// Two rules make that stream typeable. Only the prefix two consecutive hypotheses
+    /// agree on is typed, so most revisions land in text that was never on screen; and
+    /// when one does reach typed text, it is taken back with backspaces rather than
+    /// freezing injection for the rest of the sentence — freezing is what the user saw
+    /// as dictation "cutting out mid-word", with the missing half appearing only at the
+    /// end.
     private func emitPartial() {
-        var text = accumulatedPartial
         // The service tends to open an utterance with a leading space. Whether that
         // space is wanted depends on the language at the caret — see
         // `normalizeLeadingSpace`, which `normalize` mirrors so the final transcript
         // and the typed deltas never disagree about character zero (a mismatch there
         // would make `reconcile` rewrite the entire sentence).
-        text = Self.normalizeLeadingSpace(text)
+        let text = Self.normalizeLeadingSpace(accumulatedPartial)
+        partialText = Self.normalizeCJKTypography(text)
 
-        guard text.count > partialText.count else { return }
-        let addition = String(Array(text)[partialText.count...])
-        partialText = text
-        guard utteranceTypesWhileSpeaking, !injectionAbandoned else { return }
+        let previous = previousPartialSnapshot
+        previousPartialSnapshot = text
+        guard utteranceTypesWhileSpeaking,
+              !injectionAbandoned,
+              !liveInjectionSuppressed else { return }
+
+        // Trailing spaces are dropped rather than typed: a space between two Chinese
+        // characters is the interim's own artifact and would have to be deleted again
+        // one hypothesis later. If the next word is Latin, the space comes back as part
+        // of that word's addition.
+        let stable = Self.trimmingTrailingSpaces(
+            Self.normalizeCJKTypography(Self.stablePartialPrefix(previous, text))
+        )
+        guard stable != injectedText else { return }
+
+        let shared = Self.commonPrefixLength(injectedText, stable)
+        let deleteCount = injectedText.count - shared
+        guard deleteCount <= Self.maxLiveRevisionCharacters else {
+            log.info("interim rewrote \(deleteCount) typed characters; leaving the sentence to the final")
+            return
+        }
+        let addition = String(Array(stable)[shared...])
+        guard deleteCount > 0 || !addition.isEmpty else { return }
 
         // Deltas keep arriving for ~700ms after the key is released. If the user has
         // clicked elsewhere or started typing in that window, the caret is no longer
         // ours and the rest of the sentence would land in the wrong place — so stop
         // injecting rather than scattering text across their document.
         //
-        // The frozen AX element sharpens that check when the control publishes one, and
-        // is deliberately not required. A system-wide focused-element read answers
-        // `kAXErrorNoValue` for whole classes of editors; making it a precondition
-        // abandoned injection on the first delta of every sentence in those apps and
-        // sent the transcript to the clipboard instead.
-        guard let injectionAnchor,
-              let current = currentAnchor(),
-              Self.canContinueLiveInjection(
-                anchorUnchanged: injectionAnchor == current,
-                exactElementFocused: injectionTarget.map(TextInjector.targetIsStillFocused)
-              ) else {
+        // The frozen AX element is required for live typing. Some opaque editors do not
+        // publish it; those controls safely fall back to final paste instead of risking
+        // that partial speech is typed into a different field in the same app.
+        let exactElementFocused = injectionTarget.flatMap {
+            TextInjector.focusedElementMatches($0.element)
+        }
+        guard let injectionAnchor, let current = currentAnchor() else {
+            injectionAbandoned = true
+            log.info("the frozen app disappeared; stopping injection")
+            return
+        }
+        switch Self.liveInjectionFieldDisposition(
+            anchorUnchanged: injectionAnchor == current,
+            exactElementFocused: exactElementFocused
+        ) {
+        case .continueTyping:
+            break
+        case .deferToFinalPaste:
+            // No mutation has happened on this path. Preserve final delivery rather
+            // than classifying an opaque editor as a target we wrote to and then lost.
+            liveInjectionSuppressed = true
+            log.info("the target exposes no exact field identity; deferring to final paste")
+            return
+        case .abandonTarget:
             injectionAbandoned = true
             log.info("the frozen field moved or foreign input arrived; stopping injection")
             return
         }
 
-        TextInjector.type(addition)
-        injectedText += addition
+        if let injectionTarget, injectionTarget.selection != nil,
+           !TextInjector.matchesInjectedTextAtOriginalSelection(
+                injectedText,
+                target: injectionTarget
+           ) {
+            injectionAbandoned = true
+            log.info("the live insertion caret no longer owns its original range; stopping injection")
+            return
+        }
+
+        if deleteCount > 0 {
+            guard Permissions.hasAccessibility,
+                  !Permissions.isSecureInputEnabled,
+                  injectionAnchor.processIdentifier != nil,
+                  let injectionTarget else {
+                injectionAbandoned = true
+                log.warning("interim revision has no safe text-inspection path; stopping live injection")
+                return
+            }
+            // Verify ownership at the original selection, not merely an equal suffix.
+            // A user can type the same character after ours; suffix equality would then
+            // authorize Backspace against their character. Exact field, predicted caret,
+            // and original insertion range all have to agree twice.
+            let firstOwnershipProof = TextInjector.matchesInjectedTextAtOriginalSelection(
+                injectedText,
+                target: injectionTarget
+            )
+            let recheckedOwnershipProof = firstOwnershipProof
+                ? TextInjector.matchesInjectedTextAtOriginalSelection(
+                    injectedText,
+                    target: injectionTarget
+                )
+                : false
+            guard Self.interimRevisionMayDelete(
+                firstOwnershipProof: firstOwnershipProof,
+                recheckedOwnershipProof: recheckedOwnershipProof
+            ), Permissions.hasAccessibility,
+               !Permissions.isSecureInputEnabled,
+               injectionAnchor == currentAnchor() else {
+                injectionAbandoned = true
+                log.warning("the document cannot prove the interim text before the caret; stopping live injection")
+                return
+            }
+            TextInjector.deleteBackward(count: deleteCount)
+        }
+        if !addition.isEmpty { TextInjector.type(addition) }
+        injectedText = stable
+    }
+
+    /// The part of the hypothesis that has stopped moving: what two consecutive
+    /// interim snapshots agree on. Weak evidence, but it is the evidence a revisable
+    /// stream offers, and it keeps the still-volatile tail off the screen.
+    static func stablePartialPrefix(_ previous: String, _ current: String) -> String {
+        String(current.prefix(commonPrefixLength(previous, current)))
+    }
+
+    static func trimmingTrailingSpaces(_ text: String) -> String {
+        var result = text
+        while result.last == " " { result.removeLast() }
+        return result
+    }
+
+    /// Makes an interim hypothesis look like the sentence the final will produce.
+    ///
+    /// Measured: `gemini-3.5-transcribe-live` writes its interim with a space between
+    /// every word and with ASCII punctuation — `好 , 现在 测试 一下 效果 .` — and the
+    /// final rewrites both. Typing that verbatim is what the user reported as spaces
+    /// everywhere and punctuation that "makes no sense". The spacing half could not
+    /// even be repaired at the end: `reconcile` deliberately leaves whitespace-only
+    /// differences alone rather than rewriting a whole line for them, so those spaces
+    /// would have survived into the finished sentence.
+    ///
+    /// Both rules require a CJK neighbour, so Latin text keeps its ordinary spacing
+    /// and its ASCII punctuation — `用 GPT 测试` keeps both of its spaces.
+    static func normalizeCJKTypography(_ text: String) -> String {
+        let characters = Array(text)
+        var result = ""
+        result.reserveCapacity(characters.count)
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            if character == " ",
+               let previous = result.last, Self.isCJK(previous),
+               let next = characters[(index + 1)...].first(where: { $0 != " " }),
+               Self.isCJK(next) || Self.fullwidthPunctuation[next] != nil {
+                index += 1
+                continue
+            }
+            if let fullwidth = Self.fullwidthPunctuation[character],
+               let previous = result.last, Self.isCJK(previous) {
+                result.append(fullwidth)
+                index += 1
+                continue
+            }
+            result.append(character)
+            index += 1
+        }
+        return result
+    }
+
+    private static let fullwidthPunctuation: [Character: Character] = [
+        ",": "，", ".": "。", "?": "？", "!": "！", ":": "：", ";": "；",
+    ]
+
+    static func isCJK(_ character: Character) -> Bool {
+        guard let scalar = character.unicodeScalars.first else { return false }
+        switch scalar.value {
+        case 0x3000...0x303F,   // CJK punctuation
+             0x3040...0x30FF,   // kana
+             0x3400...0x4DBF,   // ideographs, extension A
+             0x4E00...0x9FFF,   // ideographs
+             0xFF00...0xFFEF:   // fullwidth forms
+            return true
+        default:
+            return false
+        }
     }
 
     private func handleCompleted(_ transcript: String) {
@@ -914,8 +1112,8 @@ final class DictationController {
             return
         }
 
-        guard settings.polishEnabled else {
-            finish(with: final)
+        if let route = utteranceRoute, !route.provider.requiresSeparatePolish {
+            finish(with: final, confirmsCleanup: true)
             return
         }
 
@@ -1189,6 +1387,8 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        liveInjectionSuppressed = false
+        previousPartialSnapshot = ""
         pendingRawText = nil
         utteranceGeneration += 1
         utteranceStart = Date()
@@ -1240,6 +1440,8 @@ final class DictationController {
             partialText = ""
             accumulatedPartial = ""
             injectedText = ""
+            liveInjectionSuppressed = false
+            previousPartialSnapshot = ""
             utteranceRoute = nil
             injectionTarget = nil
             utteranceIsRehearsal = false
@@ -1373,12 +1575,17 @@ final class DictationController {
         if deleteCount > 0 {
             // The PID-level anchor above cannot see a focus move *within* the app
             // (programmatic, or a click — no foreign keystroke involved), so deletion
-            // needs evidence about the field itself. Both sources are optional; see
-            // `rewriteMayDelete` for why the text outranks the element identity.
-            let typedTextProof = TextInjector.matchesTextImmediatelyBeforeCaret(
-                typed,
-                expectedProcessIdentifier: targetPID
-            )
+            // needs positive evidence about the exact text at its original insertion
+            // point; element identity alone cannot authorize destructive key events.
+            let hasOriginalSelectionProof = injectionTarget?.selection != nil
+            let typedTextProof: Bool? = hasOriginalSelectionProof
+                ? injectionTarget.map {
+                    TextInjector.matchesInjectedTextAtOriginalSelection(typed, target: $0)
+                }
+                : TextInjector.matchesTextImmediatelyBeforeCaret(
+                    typed,
+                    expectedProcessIdentifier: targetPID
+                )
             guard Self.rewriteMayDelete(
                 typedTextStillBeforeCaret: typedTextProof,
                 sameElementStillFocused: injectionTarget.flatMap {
@@ -1388,34 +1595,24 @@ final class DictationController {
                 // Either the target app transformed our keystrokes (smart quotes,
                 // autocorrect, input-method composition) so backspacing by our original
                 // count would cross into the user's text, or the control offers no text
-                // proof and the system says a different element holds focus.
+                // proof that can safely authorize deletion.
                 log.warning("the document no longer agrees that our text is before the caret; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
             }
-            if typedTextProof == nil {
-                // The anchor and focus guards are all that protect this path for
-                // controls that expose no range at all.
-                log.info("target does not expose AX text ranges; reconciling with anchor checks only")
-            }
             // The AX text query above can block for its full messaging timeout, so the
-            // verdict is re-taken immediately before the destructive key events, and it
-            // re-reads the *text*: with a text proof in hand the focus term cannot
-            // change the answer, so re-reading only the focus would confirm nothing.
-            //
-            // Two things keep that re-read from costing more than it is worth. A
-            // control that published no range the first time will not publish one 200 ms
-            // later, so it is not asked again. And a re-read that times out answers
-            // `nil`, which must not be allowed to overturn the `true` already in hand —
-            // falling back to identity there would refuse every app that rebuilds its
-            // accessibility tree, which is the failure this whole path exists to avoid.
-            // An explicit `false` from the re-read still refuses, which is the point.
+            // text verdict is re-taken immediately before the destructive key events.
+            // A timeout or missing range on either read fails closed.
             let recheckedTextProof = typedTextProof == nil
                 ? nil
-                : TextInjector.matchesTextImmediatelyBeforeCaret(
-                    typed,
-                    expectedProcessIdentifier: targetPID
-                )
+                : hasOriginalSelectionProof
+                    ? injectionTarget.map {
+                        TextInjector.matchesInjectedTextAtOriginalSelection(typed, target: $0)
+                    }
+                    : TextInjector.matchesTextImmediatelyBeforeCaret(
+                        typed,
+                        expectedProcessIdentifier: targetPID
+                    )
             guard Self.rewriteMayStillDelete(
                 firstTextProof: typedTextProof,
                 recheckedTextProof: recheckedTextProof,
@@ -1428,6 +1625,24 @@ final class DictationController {
                 return
             }
             TextInjector.deleteBackward(count: deleteCount)
+        }
+        if deleteCount == 0, !addition.isEmpty {
+            let ownershipProof: Bool? = injectionTarget.map { target in
+                if target.selection != nil {
+                    return TextInjector.matchesInjectedTextAtOriginalSelection(
+                        typed,
+                        target: target
+                    )
+                }
+                return TextInjector.focusedElementMatches(target.element) == true
+            }
+            guard Self.finalAdditionMayType(
+                originalFieldOwnershipProof: ownershipProof
+            ) else {
+                log.warning("the original field cannot be proven before final suffix typing; copying corrected transcript")
+                TextInjector.copyToClipboard(final)
+                return
+            }
         }
         if !addition.isEmpty {
             TextInjector.type(addition)
@@ -1488,6 +1703,8 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        liveInjectionSuppressed = false
+        previousPartialSnapshot = ""
         pendingRawText = nil
         utteranceRoute = nil
         injectionTarget = nil
@@ -1592,7 +1809,7 @@ final class DictationController {
     /// The UI is all-Chinese; translate the server errors people actually hit.
     /// Also used by the menu bar and settings pane for connection failures.
     static func friendlyMessage(_ message: String) -> String {
-        // Already Chinese — our own messages ("还没有设置 API Key") or ones framed
+        // Already Chinese — our own messages ("还没有设置设备 Token") or ones framed
         // like "连接中断：…". Matching English keywords against them would
         // mistranslate exactly those.
         guard message.range(of: "\\p{Han}", options: .regularExpression) == nil else {

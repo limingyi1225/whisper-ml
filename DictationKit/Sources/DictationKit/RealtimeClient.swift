@@ -3,7 +3,7 @@ import OSLog
 
 private let log = Logger(subsystem: "com.mingyili.Whisper", category: "realtime")
 
-/// A long-lived connection to OpenAI's Realtime transcription endpoint.
+/// A long-lived connection to the selected realtime transcription provider.
 ///
 /// Connecting and configuring a session measures ~2 s end to end, which is far too slow
 /// to do on keypress. So the socket is opened at launch, kept warm with pings, refreshed
@@ -34,8 +34,13 @@ public final class RealtimeClient {
 
     public private(set) var status: Status = .disconnected
 
-    /// Incremental transcript text. Append-only in practice.
+    /// Incremental transcript text, append-only. Only providers whose protocol is
+    /// genuinely incremental drive this; a revisable snapshot cannot be expressed
+    /// through it, so Gemini reports through `onPartialSnapshot` alone.
     public var onDelta: ((String) -> Void)?
+    /// The provider's latest complete interim hypothesis. Unlike `onDelta`, earlier
+    /// characters may change between calls.
+    public var onPartialSnapshot: ((String) -> Void)?
     /// The authoritative transcript for the utterance.
     public var onCompleted: ((String) -> Void)?
     /// Utterance could not be transcribed. The argument is user-facing.
@@ -60,6 +65,11 @@ public final class RealtimeClient {
     @ObservationIgnored private var pendingBytes = 0
     @ObservationIgnored private var utteranceActive = false
     @ObservationIgnored private var commitPending = false
+    /// `beginUtterance` happened before the current session became ready, so its
+    /// provider-side activity boundary still has to be sent. This cannot be inferred
+    /// from `pendingAudio`: the handshake may finish before the first capture callback.
+    @ObservationIgnored private var turnStartPending = false
+    @ObservationIgnored private var currentPartialSnapshot = ""
     /// Client event ids encode a local turn sequence. Realtime `error` events echo
     /// the offending client event's id when applicable; without this correlation, a
     /// delayed error from a cancelled turn can abort the sentence currently being
@@ -221,18 +231,16 @@ public final class RealtimeClient {
 
         var request = URLRequest(url: route.realtimeURL)
         request.setValue("Bearer \(route.credential)", forHTTPHeaderField: "Authorization")
-        if route.mode == .relay {
-            let identity = Self.clientAuditIdentity(
-                bundleIdentifier: Bundle.main.bundleIdentifier,
-                version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            )
-            request.setValue(identity.client, forHTTPHeaderField: "X-Whisper-Client")
-            request.setValue(identity.version, forHTTPHeaderField: "X-Whisper-Version")
-            request.setValue(
-                UUID().uuidString.lowercased(),
-                forHTTPHeaderField: "X-Whisper-Connection-ID"
-            )
-        }
+        let identity = Self.clientAuditIdentity(
+            bundleIdentifier: Bundle.main.bundleIdentifier,
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        )
+        request.setValue(identity.client, forHTTPHeaderField: "X-Whisper-Client")
+        request.setValue(identity.version, forHTTPHeaderField: "X-Whisper-Version")
+        request.setValue(
+            UUID().uuidString.lowercased(),
+            forHTTPHeaderField: "X-Whisper-Connection-ID"
+        )
 
         let task = urlSession.webSocketTask(with: request)
         socket = task
@@ -242,7 +250,7 @@ public final class RealtimeClient {
         sendSessionUpdate()
         startKeepAlive()
         startConnectionTimeout(generation: generation)
-        log.info("connecting via \(route.mode.rawValue, privacy: .public) (generation \(generation))")
+        log.info("connecting via relay (generation \(generation))")
     }
 
     /// Tears down the socket. Pass `retry: true` to schedule a reconnect with backoff.
@@ -258,11 +266,13 @@ public final class RealtimeClient {
         refreshTimer?.invalidate(); refreshTimer = nil
         clearResponseTimeout()
         sessionExpiry = nil
+        resetPartialState()
 
         // Buffered audio belongs to the session that just died. Carrying it into the
         // next one would transcribe an utterance the user has already moved on from.
         utteranceActive = false
         commitPending = false
+        turnStartPending = false
         currentItemID = nil
         currentTurnSequence = nil
         pendingAudio.removeAll()
@@ -328,10 +338,12 @@ public final class RealtimeClient {
         currentTurnSequence = nextTurnSequence
         utteranceActive = true
         commitPending = false
+        turnStartPending = !status.isReady
         currentItemID = nil
         pendingAudio.removeAll()
         pendingBytes = 0
         utteranceUploadedBytes = 0
+        resetPartialState()
         clearResponseTimeout()
 
         if status.isReady {
@@ -410,8 +422,10 @@ public final class RealtimeClient {
         guard utteranceActive else { return }
         utteranceActive = false
         commitPending = false
+        turnStartPending = false
         pendingAudio.removeAll()
         pendingBytes = 0
+        resetPartialState()
         clearResponseTimeout()
         guard status.isReady else {
             // Nothing ever reached the server; the local buffers above were the
@@ -420,28 +434,86 @@ public final class RealtimeClient {
             applyPendingRefreshIfSettled()
             return
         }
-        if currentItemID != nil {
+
+        let provider = activeRoute?.provider ?? settings.transcriptionModel.provider
+        switch Self.cancellationStrategy(
+            provider: provider,
+            hasKnownItemID: currentItemID != nil
+        ) {
+        case .clearCurrentTurn:
             retireCurrentTurn()
             send(["type": "input_audio_buffer.clear"])
             applyPendingRefreshIfSettled()
-        } else {
-            // Audio already reached the server, but no event has named this turn's
-            // item id yet, so there is nothing to retire a straggler against. The
-            // streaming model transcribes ahead of the commit — a late delta could
-            // still arrive after the clear, be adopted as the *next* turn's
-            // provisional id, type this cancelled sentence into it and shadow its
-            // real events. Same isolation the response timeout uses: only a fresh
-            // session closes that hole.
+        case .replaceSession:
+            // Gemini completions cannot be retired by item id. OpenAI also needs this
+            // path when no event has named the turn yet: a late delta could otherwise
+            // be adopted as the next turn's provisional id. Only a fresh session
+            // closes both holes. Reopen immediately so the next gesture finds a warm
+            // connection instead of waiting for Relay's close/backoff cycle.
             disconnect()
             reconnectAttempt = 0
             connectIfNeeded()
         }
     }
 
+    enum CancellationStrategy: Equatable {
+        case clearCurrentTurn
+        case replaceSession
+    }
+
+    /// Gemini finals do not identify the turn they belong to. Once any audio has
+    /// reached that provider, only a fresh session can prove that a late completion
+    /// is not from the cancelled sentence. Reconnect locally and immediately instead
+    /// of waiting for Relay to close the socket after a clear. OpenAI events do carry
+    /// item ids, so a known turn can still be retired in place.
+    static func cancellationStrategy(
+        provider: TranscriptionProvider,
+        hasKnownItemID: Bool
+    ) -> CancellationStrategy {
+        if provider == .gemini { return .replaceSession }
+        return hasKnownItemID ? .clearCurrentTurn : .replaceSession
+    }
+
+    enum ResponseTimeoutStrategy: Equatable {
+        case discardPendingCommit
+        case retireCurrentTurn
+        case replaceSession
+    }
+
+    /// A Gemini `item_id` is synthesized by Relay for client correlation; it does not
+    /// prove that Google's activity ended. If its final never arrives, retiring that id
+    /// only locally leaves Relay's turn open and makes the next activity boundary tear
+    /// down the socket. Replace and preheat the session immediately instead. OpenAI's
+    /// authoritative item ids still allow a known turn to be retired in place.
+    static func responseTimeoutStrategy(
+        provider: TranscriptionProvider,
+        commitPending: Bool,
+        hasKnownItemID: Bool
+    ) -> ResponseTimeoutStrategy {
+        if commitPending { return .discardPendingCommit }
+        if provider == .openAI, hasKnownItemID { return .retireCurrentTurn }
+        return .replaceSession
+    }
+
     // MARK: - Protocol
 
+    /// A session configuration belongs to the socket that carries it. Settings are
+    /// allowed to change while an utterance is buffered or in flight, but that change
+    /// moves to a new provider connection only at the next idle boundary. In particular,
+    /// an unsupported-field retry must not send Gemini's model to an OpenAI socket (or
+    /// vice versa) just because another host changed the shared preference meanwhile.
+    static func sessionTranscriptionModel(
+        activeRoute: ServiceRoute?,
+        liveSettingsModel: TranscriptionModel
+    ) -> TranscriptionModel {
+        activeRoute?.transcriptionModel ?? liveSettingsModel
+    }
+
     private func sendSessionUpdate() {
-        let model = settings.transcriptionModel
+        let model = Self.sessionTranscriptionModel(
+            activeRoute: activeRoute,
+            liveSettingsModel: settings.transcriptionModel
+        )
         var transcription: [String: Any] = ["model": model.rawValue]
 
         // `delay` controls how much audio the model hears before committing to words.
@@ -451,7 +523,7 @@ public final class RealtimeClient {
         // gpt-live-transcribe before the settings pane quotes them. It only exists on
         // the streaming model; the other rejects it, and eating that round trip on
         // every connect just delays the first sentence.
-        if model.supportsLiveTyping {
+        if model.supportsTranscriptionDelay {
             transcription["delay"] = settings.transcriptionDelay.rawValue
         }
         // The vocabulary, biasing recognition itself rather than repairing it after.
@@ -535,7 +607,16 @@ public final class RealtimeClient {
         case "conversation.item.input_audio_transcription.delta":
             guard utteranceActive, belongsToCurrentTurn(payload) else { return }
             if let delta = payload["delta"] as? String, !delta.isEmpty {
+                currentPartialSnapshot += delta
                 onDelta?(delta)
+                onPartialSnapshot?(currentPartialSnapshot)
+            }
+
+        case "whisper.input_audio_transcription.partial":
+            guard utteranceActive, belongsToCurrentTurn(payload) else { return }
+            if let transcript = payload["transcript"] as? String, !transcript.isEmpty {
+                currentPartialSnapshot = transcript
+                onPartialSnapshot?(transcript)
             }
 
         case "conversation.item.input_audio_transcription.completed":
@@ -549,7 +630,17 @@ public final class RealtimeClient {
             clearResponseTimeout()
             utteranceActive = false
             let transcript = payload["transcript"] as? String ?? ""
-            applyPendingRefreshIfSettled()
+            resetPartialState()
+            if Self.sessionReplacementRequired(in: payload) {
+                // Relay is retiring an uncertain Gemini boundary. A completion callback
+                // can synchronously start a queued utterance, so replace the transport
+                // before invoking it rather than waiting to observe Relay's close frame.
+                disconnect()
+                reconnectAttempt = 0
+                connectIfNeeded()
+            } else {
+                applyPendingRefreshIfSettled()
+            }
             onCompleted?(transcript)
 
         case "conversation.item.input_audio_transcription.failed":
@@ -557,6 +648,7 @@ public final class RealtimeClient {
             clearResponseTimeout()
             utteranceActive = false
             retireCurrentTurn()
+            resetPartialState()
             let message = ((payload["error"] as? [String: Any])?["message"] as? String) ?? "转写失败"
             applyPendingRefreshIfSettled()
             onFailure?(message)
@@ -621,15 +713,23 @@ public final class RealtimeClient {
 
             clearResponseTimeout()
             utteranceActive = false
-            let hadKnownItemID = currentItemID != nil
-            if hadKnownItemID {
-                retireCurrentTurn()
+            if Self.sessionReplacementRequired(in: detail ?? [:]) {
+                // Same callback-ordering fence as a flagged completion: the next queued
+                // utterance must see a new socket even if Relay's close is still in flight.
+                disconnect()
+                reconnectAttempt = 0
+                connectIfNeeded()
             } else {
-                // The failed turn has no server item id, so item-based retirement
-                // cannot isolate its late events from the next turn.
-                disconnect(retry: reconnectAttempt < 6, reason: message)
+                let hadKnownItemID = currentItemID != nil
+                if hadKnownItemID {
+                    retireCurrentTurn()
+                } else {
+                    // The failed turn has no server item id, so item-based retirement
+                    // cannot isolate its late events from the next turn.
+                    disconnect(retry: reconnectAttempt < 6, reason: message)
+                }
+                applyPendingRefreshIfSettled()
             }
-            applyPendingRefreshIfSettled()
             onFailure?(message)
 
         default:
@@ -663,19 +763,69 @@ public final class RealtimeClient {
         self.currentItemID = nil
     }
 
+    private func resetPartialState() {
+        currentPartialSnapshot = ""
+    }
+
+    /// Relay marks results whose provider-side turn boundary is uncertain. The wire
+    /// value is intentionally opt-in: older relays omit it and keep existing behavior.
+    static func sessionReplacementRequired(in payload: [String: Any]) -> Bool {
+        payload["session_replacement_required"] as? Bool == true
+    }
+
+    /// What a deferred flush has to put on the wire, and in what order.
+    ///
+    /// Split out from the socket so the ordering is testable: `beginUtterance` can only
+    /// send the turn boundary when the session is already up, and an utterance started
+    /// against a cold socket buffers its audio instead. Replaying that buffer without
+    /// the boundary first is what let a sentence land in the previous turn — audible to
+    /// the user as a transcript of two utterances run together.
+    enum BufferedFlushOperation: Equatable {
+        case clear
+        case append(Int)
+        case commit
+    }
+
+    static func bufferedFlushOperations(
+        audioChunkCount: Int,
+        commitPending: Bool,
+        turnStartPending: Bool
+    ) -> [BufferedFlushOperation] {
+        guard audioChunkCount > 0 || commitPending || turnStartPending else { return [] }
+        // Audio or a commit also imply a turn boundary defensively, even if future
+        // lifecycle changes accidentally lose the explicit pending flag.
+        var operations: [BufferedFlushOperation] = [.clear]
+        operations += (0..<audioChunkCount).map(BufferedFlushOperation.append)
+        if commitPending { operations.append(.commit) }
+        return operations
+    }
+
     private func flushPendingAudio() {
-        guard !pendingAudio.isEmpty || commitPending else { return }
-        for chunk in pendingAudio {
-            transmitAudioChunk(chunk)
+        let chunks = pendingAudio
+        let operations = Self.bufferedFlushOperations(
+            audioChunkCount: chunks.count,
+            commitPending: commitPending,
+            turnStartPending: turnStartPending
+        )
+        guard !operations.isEmpty else { return }
+
+        for operation in operations {
+            switch operation {
+            case .clear:
+                // `beginUtterance` could not send this while the socket was connecting.
+                // It is Gemini's explicit activity start and OpenAI's harmless reset.
+                send(["type": "input_audio_buffer.clear"])
+                turnStartPending = false
+            case .append(let index):
+                transmitAudioChunk(chunks[index])
+            case .commit:
+                commitPending = false
+                sendCommit()
+            }
         }
         log.info("flushed \(self.pendingBytes) buffered bytes")
         pendingAudio.removeAll()
         pendingBytes = 0
-
-        if commitPending {
-            commitPending = false
-            sendCommit()
-        }
     }
 
     // MARK: - Socket plumbing
@@ -968,7 +1118,6 @@ public final class RealtimeClient {
     /// never touched, because a working token never produces a 401.
     private func recoverWithBundledToken() -> Bool {
         guard !didTryBundledTokenRecovery,
-              activeRoute?.mode == .relay,
               let bundled = KeychainStore.bundledRelayToken,
               let rejectedCredential = activeRoute?.credential,
               bundled != rejectedCredential else { return false }
@@ -1000,12 +1149,10 @@ public final class RealtimeClient {
     /// should keep climbing. Split out from `transportFailure` so it is testable
     /// without a live socket.
     public nonisolated static func handshakeRejection(
-        statusCode: Int,
-        viaRelay: Bool
+        statusCode: Int
     ) -> TransportFailure {
-        let peer = viaRelay ? "转发服务器" : "OpenAI"
         switch statusCode {
-        case 403 where viaRelay:
+        case 403:
             // The relay itself never sends 403 — auth.js answers a bad token with 401,
             // and nothing else in it produces a 403 — so this is Cloudflare or nginx
             // having a moment in front of it. Treating it as a rejected credential once
@@ -1015,13 +1162,11 @@ public final class RealtimeClient {
                 message: "转发服务器前面的网关拒绝了连接（403），稍后会自动重试",
                 retryable: true
             )
-        case 401, 403:
+        case 401:
             // Retrying a rejected credential only burns the ladder. Not permanent: the
             // next dictation and any settings change both start a fresh attempt.
             return TransportFailure(
-                message: viaRelay
-                    ? "转发服务器拒绝了设备凭证（\(statusCode)），请在设置里更新"
-                    : "OpenAI 拒绝了 API Key（\(statusCode)），请在设置里重新填写",
+                message: "转发服务器拒绝了设备凭证（\(statusCode)），请在设置里更新",
                 retryable: false,
                 rejectedCredential: true
             )
@@ -1030,19 +1175,17 @@ public final class RealtimeClient {
             // holding their slots; the relay's heartbeat reaps them within a sweep
             // or two, so this one clears itself.
             return TransportFailure(
-                message: viaRelay
-                    ? "转发服务器：这台设备的连接数暂时用满了（429），正在重试"
-                    : "OpenAI 请求过于频繁（429），正在重试",
+                message: "转发服务器：这台设备的连接数暂时用满了（429），正在重试",
                 retryable: true
             )
         case 404:
             return TransportFailure(
-                message: "\(peer)上没有这个地址（404），App 和服务器的版本可能对不上",
+                message: "转发服务器上没有这个地址（404），App 和服务器的版本可能对不上",
                 retryable: false
             )
         default:
             return TransportFailure(
-                message: "\(peer)拒绝了连接（HTTP \(statusCode)）",
+                message: "转发服务器拒绝了连接（HTTP \(statusCode)）",
                 retryable: true
             )
         }
@@ -1065,19 +1208,10 @@ public final class RealtimeClient {
            nsError.code == NSURLErrorBadServerResponse,
            let http = socket?.response as? HTTPURLResponse,
            http.statusCode >= 400 {
-            return Self.handshakeRejection(
-                statusCode: http.statusCode,
-                viaRelay: activeRoute?.mode == .relay
-            )
-        }
-        if activeRoute?.mode == .relay {
-            return TransportFailure(
-                message: "转发服务器连接中断：\(error.localizedDescription)",
-                retryable: true
-            )
+            return Self.handshakeRejection(statusCode: http.statusCode)
         }
         return TransportFailure(
-            message: "连接中断：\(error.localizedDescription)",
+            message: "转发服务器连接中断：\(error.localizedDescription)",
             retryable: true
         )
     }
@@ -1161,24 +1295,29 @@ public final class RealtimeClient {
                 self.utteranceActive = false
                 self.responseTimeoutTimer = nil
                 self.responseTimeoutDeadline = nil
-                if self.commitPending {
+                let provider = self.activeRoute?.provider
+                    ?? self.settings.transcriptionModel.provider
+                switch Self.responseTimeoutStrategy(
+                    provider: provider,
+                    commitPending: self.commitPending,
+                    hasKnownItemID: self.currentItemID != nil
+                ) {
+                case .discardPendingCommit:
                     // The commit never went out; drop the local buffers too, or the
                     // audio of an utterance we just told the user failed would be
                     // uploaded and billed the moment the session comes up.
                     self.commitPending = false
+                    self.turnStartPending = false
                     self.pendingAudio.removeAll()
                     self.pendingBytes = 0
-                } else if self.currentItemID != nil {
+                case .retireCurrentTurn:
                     self.retireCurrentTurn()
-                } else {
-                    // The commit went out but we never learned the turn's item id,
-                    // so a late event could not be told apart from the next turn's —
-                    // it could end the next recording with this sentence's text.
-                    // Only a fresh session isolates it.
-                    self.disconnect(
-                        retry: self.reconnectAttempt < 6,
-                        reason: "等待转写结果超时"
-                    )
+                case .replaceSession:
+                    // This also covers an OpenAI commit whose item id never arrived:
+                    // a late event could not be distinguished from the next turn.
+                    self.disconnect()
+                    self.reconnectAttempt = 0
+                    self.connectIfNeeded()
                 }
                 self.applyPendingRefreshIfSettled()
                 self.onFailure?("等待转写结果超时")

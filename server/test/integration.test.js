@@ -16,11 +16,13 @@ import {
 } from "../src/enrollment.js";
 import { handlePolish } from "../src/polish.js";
 import { FixedWindowRateLimiter } from "../src/rate-limit.js";
+import { bridgeGeminiRealtime } from "../src/gemini-realtime.js";
 import { bridgeRealtime, revokeDownstream } from "../src/realtime.js";
 
 const token = "relay_integration-device-token";
 const baseConfig = loadConfig({
   OPENAI_API_KEY: "server-only-openai-key",
+  GEMINI_API_KEY: "server-only-gemini-key",
   RELAY_DEVICE_TOKEN_HASHES: tokenDigest(token),
 });
 
@@ -32,6 +34,24 @@ function listen(server) {
       resolve(server.address().port);
     });
   });
+}
+
+/// The app's own Gemini session frame, which the bridge's validator accepts.
+function geminiSessionUpdate(eventID) {
+  return {
+    type: "session.update",
+    event_id: eventID,
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: 24_000 },
+          transcription: { model: "gemini-3.5-transcribe-live" },
+          turn_detection: null,
+        },
+      },
+    },
+  };
 }
 
 function close(server) {
@@ -537,6 +557,818 @@ test("Realtime bridge queues the first session update and injects the server key
     await close(upstreamServer);
   }
 });
+
+test("Gemini bridge translates the app protocol and returns snapshot plus final", async () => {
+  const upstreamEvents = [];
+  let upstreamRequestURL = "";
+  let googleSocket;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket, request) => {
+    googleSocket = socket;
+    upstreamRequestURL = request.url;
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      upstreamEvents.push(event);
+      if (event.setup) socket.send(JSON.stringify({ setupComplete: {} }));
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      // Production deliberately waits 1.5 s for segmented final text. Keep this test
+      // quick while retaining enough room to prove a second segment resets the timer.
+      geminiFinalFallbackDelayMs: 300,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      event_id: "whisper-session-1",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: {
+              model: "gemini-3.5-transcribe-live",
+              keywords: ["李铭一", "Whisper"],
+            },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+    const created = downstreamEvents.find((event) => event.type === "session.created");
+    assert.ok(created.session.expires_at - Date.now() / 1000 > 590);
+    assert.ok(created.session.expires_at - Date.now() / 1000 <= 600);
+    assert.match(upstreamRequestURL, /[?&]key=server-only-gemini-key(?:&|$)/);
+    assert.deepEqual(upstreamEvents[0], {
+      setup: {
+        model: "models/gemini-3.5-transcribe-live",
+        generationConfig: { responseModalities: ["TEXT"] },
+        realtimeInputConfig: { automaticActivityDetection: { disabled: true } },
+        inputAudioTranscription: {
+          languageCodes: [],
+          mode: "SMART",
+          customVocabulary: ["李铭一", "Whisper"],
+        },
+      },
+    });
+
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-2",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-3",
+      audio: Buffer.from([1, 2, 3, 4]).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-4",
+    }));
+    assert.ok(await waitUntil(() => upstreamEvents.length >= 4));
+    assert.deepEqual(upstreamEvents.slice(1), [
+      { realtimeInput: { activityStart: {} } },
+      { realtimeInput: {
+        audio: {
+          data: Buffer.from([1, 2, 3, 4]).toString("base64"),
+          mimeType: "audio/pcm;rate=24000",
+        },
+      } },
+      { realtimeInput: { activityEnd: {} } },
+    ]);
+    assert.ok(downstreamEvents.some(
+      (event) => event.type === "input_audio_buffer.committed"
+        && event.item_id === "gemini-turn-1",
+    ));
+
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        interimInputTranscription: { text: "我们明天下午三点" },
+      },
+    }));
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        inputTranscription: { text: "我们星期三上午" },
+      },
+    }));
+    // Let most of the no-boundary quiet period elapse before the next segment starts.
+    // Its interim is provider activity and must reset that existing timer; otherwise
+    // the first segment completes while Gemini is visibly still answering the second.
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        interimInputTranscription: { text: "十点" },
+      },
+    }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "whisper.input_audio_transcription.partial"
+        && event.transcript === "我们星期三上午十点",
+    )), "a later interim snapshot must retain finalized segments");
+    // Total time since the first final now exceeds the configured 300 ms fallback.
+    // Only resetting it from the interim can keep this turn alive.
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.ok(!downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    ));
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        inputTranscription: { text: "十点开会。" },
+        turnComplete: true,
+      },
+    }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    )));
+    assert.ok(downstreamEvents.some(
+      (event) => event.type === "whisper.input_audio_transcription.partial"
+        && event.transcript === "我们明天下午三点",
+    ));
+    assert.ok(downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed"
+        && event.transcript === "我们星期三上午十点开会。"
+        && event.item_id === "gemini-turn-1",
+    ));
+
+    // turnComplete is itself the provider's authoritative turn boundary. Even when
+    // Google emits no transcription field for silence, settle the empty turn so the
+    // next push-to-talk does not inherit stale state or force a reconnect.
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-2-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-2-2",
+      audio: Buffer.from([5, 6]).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-2-3",
+    }));
+    assert.ok(await waitUntil(() => upstreamEvents.length >= 7));
+    googleSocket.send(JSON.stringify({ serverContent: { turnComplete: true } }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed"
+        && event.item_id === "gemini-turn-2",
+    )));
+    assert.ok(downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed"
+        && event.item_id === "gemini-turn-2"
+        && event.transcript === "",
+    ));
+    // Reconnect queues can contain audio without the earlier clear boundary. The
+    // bridge must supply activityStart before that first chunk rather than dropping
+    // the utterance with a protocol close.
+    const implicitAudio = Buffer.from([7, 8]).toString("base64");
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-3-1",
+      audio: implicitAudio,
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-3-2",
+    }));
+    assert.ok(await waitUntil(() => upstreamEvents.length >= 10));
+    assert.deepEqual(upstreamEvents.slice(7), [
+      { realtimeInput: { activityStart: {} } },
+      { realtimeInput: {
+        audio: { data: implicitAudio, mimeType: "audio/pcm;rate=24000" },
+      } },
+      { realtimeInput: { activityEnd: {} } },
+    ]);
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        inputTranscription: { text: "隐式开始也能完成。" },
+        turnComplete: true,
+      },
+    }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed"
+        && event.item_id === "gemini-turn-3"
+        && event.transcript === "隐式开始也能完成。",
+    )));
+    assert.equal(client.readyState, WebSocket.OPEN);
+  } finally {
+    client.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("an unanswered audio turn fails and retires its provider session", async () => {
+  // Both halves are measured behaviour of the live service:
+  //  - activityStart followed by activityEnd with no audio between them is answered
+  //    with a 1007 "Precondition check failed" close of the whole session;
+  //  - a turn carrying only silence is never answered at all — no inputTranscription,
+  //    no generationComplete, nothing, for as long as you care to wait.
+  // Either one used to strand the app until its own ~20 s response timeout.
+  const upstreamEvents = [];
+  let upstreamConnections = 0;
+  let lateAWasBlocked = false;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    upstreamConnections += 1;
+    const connection = upstreamConnections;
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) {
+        socket.send(JSON.stringify({ setupComplete: {} }));
+        return;
+      }
+      upstreamEvents.push(event);
+      if (!event.realtimeInput?.activityEnd) return;
+      if (connection === 1) {
+        // This is A: answer only after the Relay's timeout. The old provider socket
+        // must already be gone, making this result unable to reach a later B turn.
+        setTimeout(() => {
+          if (socket.readyState !== WebSocket.OPEN) {
+            lateAWasBlocked = true;
+            return;
+          }
+          socket.send(JSON.stringify({
+            serverContent: {
+              inputTranscription: { text: "迟到的 A" },
+              generationComplete: true,
+            },
+          }));
+        }, 450);
+        return;
+      }
+      socket.send(JSON.stringify({
+        serverContent: {
+          inputTranscription: { text: "新的 B" },
+          generationComplete: true,
+        },
+      }));
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      geminiSilentTurnTimeoutMs: 250,
+      geminiFinalFallbackDelayMs: 30_000,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  let clientClose = null;
+  client.on("close", (code) => { clientClose = code; });
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+
+  const completed = () => downstreamEvents.filter(
+    (event) => event.type === "conversation.item.input_audio_transcription.completed",
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      event_id: "whisper-session-1",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gemini-3.5-transcribe-live" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+
+    // A press that captured nothing at all must never reach the provider.
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-2",
+    }));
+    assert.ok(await waitUntil(() => completed().length === 1));
+    assert.equal(completed()[0].transcript, "");
+    assert.deepEqual(
+      upstreamEvents, [],
+      "an empty turn must send no activity pair upstream",
+    );
+    assert.equal(clientClose, null, "and must not cost the socket");
+
+    // A turn that did carry audio but draws no response at all has an uncertain
+    // provider boundary. It must fail and retire this transport, not fabricate an empty
+    // completion and leave a late provider result free to attach to the next turn.
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-2-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-2-2",
+      audio: Buffer.alloc(960, 0).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-2-3",
+    }));
+    const started = Date.now();
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "error"
+        && event.error?.code === "relay_gemini_turn_timeout",
+    )));
+    assert.equal(
+      downstreamEvents.find(
+        (event) => event.type === "error"
+          && event.error?.code === "relay_gemini_turn_timeout",
+      ).error.session_replacement_required,
+      true,
+    );
+    assert.ok(await waitUntil(() => clientClose === 1012));
+    assert.equal(completed().length, 1);
+    assert.ok(
+      Date.now() - started < 5_000,
+      "the silent turn must fail on its own timeout, not the app's",
+    );
+    assert.deepEqual(
+      upstreamEvents.map((event) => Object.keys(event.realtimeInput)[0]),
+      ["activityStart", "audio", "activityEnd"],
+      "a turn with audio still opens and closes its activity in order",
+    );
+    assert.equal(clientClose, 1012);
+
+    // B reconnects through an entirely new Relay and Gemini transport. The delayed A
+    // result must be fenced out rather than being adopted as B's transcript.
+    const secondClient = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+    const secondEvents = [];
+    secondClient.on("message", (data) => {
+      secondEvents.push(JSON.parse(data.toString("utf8")));
+    });
+    await new Promise((resolve, reject) => {
+      secondClient.once("open", resolve);
+      secondClient.once("error", reject);
+    });
+    secondClient.send(JSON.stringify(geminiSessionUpdate("whisper-session-2")));
+    assert.ok(await waitUntil(
+      () => secondEvents.some((event) => event.type === "session.updated"),
+    ));
+    secondClient.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-b-1",
+    }));
+    secondClient.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-b-2",
+      audio: Buffer.alloc(960, 1).toString("base64"),
+    }));
+    secondClient.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-b-3",
+    }));
+    assert.ok(await waitUntil(() => secondEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    )));
+    assert.equal(
+      secondEvents.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      ).transcript,
+      "新的 B",
+    );
+    assert.equal(upstreamConnections, 2);
+    assert.ok(await waitUntil(() => lateAWasBlocked));
+    assert.ok(!secondEvents.some((event) => event.transcript === "迟到的 A"));
+    secondClient.close();
+  } finally {
+    client.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+
+test("a fallback-finalized Gemini turn retires the uncertain provider boundary", async () => {
+  let upstreamConnections = 0;
+  let lateSegmentWasBlocked = false;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    upstreamConnections += 1;
+    const connection = upstreamConnections;
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) {
+        socket.send(JSON.stringify({ setupComplete: {} }));
+        return;
+      }
+      if (!event.realtimeInput?.activityEnd) return;
+      if (connection === 1) {
+        // A has a final transcription frame but no provider response boundary. The
+        // fallback may deliver it, but must then close this provider session.
+        socket.send(JSON.stringify({
+          serverContent: { inputTranscription: { text: "A 的第一段" } },
+        }));
+        setTimeout(() => {
+          if (socket.readyState !== WebSocket.OPEN) {
+            lateSegmentWasBlocked = true;
+            return;
+          }
+          socket.send(JSON.stringify({
+            serverContent: {
+              inputTranscription: { text: "A 的迟到第二段" },
+              generationComplete: true,
+            },
+          }));
+        }, 250);
+        return;
+      }
+      socket.send(JSON.stringify({
+        serverContent: {
+          inputTranscription: { text: "B 的结果" },
+          generationComplete: true,
+        },
+      }));
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      geminiSilentTurnTimeoutMs: 5_000,
+      geminiFinalFallbackDelayMs: 100,
+    });
+  });
+  const relayPort = await listen(relayServer);
+
+  const runTurn = async (sessionID, prefix) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+    const events = [];
+    let closeCode = null;
+    socket.on("message", (data) => events.push(JSON.parse(data.toString("utf8"))));
+    socket.on("close", (code) => { closeCode = code; });
+    await new Promise((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    socket.send(JSON.stringify(geminiSessionUpdate(sessionID)));
+    assert.ok(await waitUntil(() => events.some((event) => event.type === "session.updated")));
+    socket.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: `${prefix}-1`,
+    }));
+    socket.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: `${prefix}-2`,
+      audio: Buffer.alloc(960, 2).toString("base64"),
+    }));
+    socket.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: `${prefix}-3`,
+    }));
+    assert.ok(await waitUntil(() => events.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    )));
+    return { socket, events, closeCode: () => closeCode };
+  };
+
+  let first;
+  let second;
+  try {
+    first = await runTurn("whisper-session-a", "whisper-turn-a");
+    assert.equal(
+      first.events.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      ).transcript,
+      "A 的第一段",
+    );
+    assert.equal(
+      first.events.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      ).session_replacement_required,
+      true,
+      "the client must replace the socket before a completion callback starts B",
+    );
+    assert.ok(await waitUntil(() => first.closeCode() === 1012));
+
+    second = await runTurn("whisper-session-b", "whisper-turn-b");
+    assert.equal(
+      second.events.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      ).transcript,
+      "B 的结果",
+    );
+    assert.equal(upstreamConnections, 2);
+    assert.ok(await waitUntil(() => lateSegmentWasBlocked));
+    assert.ok(!second.events.some((event) => event.transcript?.includes("迟到")));
+  } finally {
+    first?.socket.close();
+    second?.socket.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+
+test("a Gemini response boundary waits for independently ordered final transcripts", async () => {
+  // Measured against the live service: gemini-3.5-transcribe-live closes a
+  // transcription response with generationComplete and never sends turnComplete.
+  // Treating only turnComplete as the end meant every sentence waited out the
+  // fallback timer with its final already in hand.
+  let googleSocket;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    googleSocket = socket;
+    socket.on("message", (data) => {
+      if (JSON.parse(data.toString("utf8")).setup) {
+        socket.send(JSON.stringify({ setupComplete: {} }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      // Long enough that a finish which relied on it would fail this test outright
+      // rather than merely being slow.
+      geminiFinalFallbackDelayMs: 30_000,
+      geminiBoundaryReorderGraceMs: 120,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      event_id: "whisper-session-1",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gemini-3.5-transcribe-live" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-2",
+      audio: Buffer.alloc(960, 3).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-3",
+    }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "input_audio_buffer.committed",
+    )));
+
+    // inputTranscription is explicitly independent of the model turn. Exercise the
+    // legal ordering that lost the whole sentence before: the response boundary first,
+    // then multiple finalized transcription frames already in flight.
+    googleSocket.send(JSON.stringify({
+      serverContent: { generationComplete: true },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.ok(!downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    ));
+    googleSocket.send(JSON.stringify({
+      serverContent: { inputTranscription: { text: "好，现在测试" } },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    googleSocket.send(JSON.stringify({
+      serverContent: { inputTranscription: { text: "一下效果。" } },
+    }));
+
+    const started = Date.now();
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "conversation.item.input_audio_transcription.completed",
+    )));
+    assert.ok(
+      Date.now() - started < 5_000,
+      "the ordered final must wait only for the boundary grace, not the fallback timer",
+    );
+    assert.equal(
+      downstreamEvents.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      ).transcript,
+      "好，现在测试一下效果。",
+    );
+  } finally {
+    client.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+
+test("the Gemini turn audit counts the audio each turn actually carried", async () => {
+  // The bridge's most likely failure is audio landing in a turn it does not belong to,
+  // and a transcript alone cannot show that. These counts can: a turn whose audio_bytes
+  // exceed what the user spoke was fed someone else's audio, and a turn that ends
+  // `abandoned` took audio and never returned a final for it.
+  let googleSocket;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    googleSocket = socket;
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) socket.send(JSON.stringify({ setupComplete: {} }));
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const turns = [];
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+    }, { onTurn: (record) => turns.push(record) });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+
+  const audio = Buffer.alloc(1_200, 7);
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify({
+      type: "session.update",
+      event_id: "whisper-session-1",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gemini-3.5-transcribe-live" },
+            turn_detection: null,
+          },
+        },
+      },
+    }));
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    for (const index of [0, 1]) {
+      client.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        event_id: `whisper-turn-1-${index + 2}`,
+        audio: audio.toString("base64"),
+      }));
+    }
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-4",
+    }));
+    assert.ok(await waitUntil(() => downstreamEvents.some(
+      (event) => event.type === "input_audio_buffer.committed",
+    )));
+
+    googleSocket.send(JSON.stringify({
+      serverContent: {
+        inputTranscription: { text: "我们星期三上午十点开会。" },
+        turnComplete: true,
+      },
+    }));
+    assert.ok(await waitUntil(() => turns.some((record) => record.event === "end")));
+
+    assert.deepEqual(
+      turns.map((record) => record.event),
+      ["open", "end"],
+    );
+    const completed = turns.find((record) => record.event === "end");
+    assert.equal(completed.item, "gemini-turn-1");
+    assert.equal(completed.outcome, "completed");
+    // Exactly the two appends, decoded — not the base64 length, and not a byte count
+    // left over from whichever event happened to be validated last.
+    assert.equal(completed.audioBytes, audio.length * 2);
+    assert.equal(completed.chars, 12);
+
+    // A second turn that takes audio and never gets a final must be visible as such
+    // rather than vanishing when the connection goes away.
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-2-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-2-2",
+      audio: audio.toString("base64"),
+    }));
+    assert.ok(await waitUntil(
+      () => turns.filter((record) => record.event === "open").length === 2,
+    ));
+    googleSocket.close();
+
+    assert.ok(await waitUntil(() => turns.length >= 4));
+    const abandoned = turns.at(-1);
+    assert.equal(abandoned.item, "gemini-turn-2");
+    assert.equal(abandoned.outcome, "abandoned");
+    assert.equal(abandoned.audioBytes, audio.length);
+  } finally {
+    client.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
 
 test("an illegal frame from a half-open peer does not free its connection slot", async () => {
   // The bookkeeping index.js uses. `ws` answers a protocol error with close(), not
@@ -1394,6 +2226,193 @@ test("a slow upstream throttles the client instead of dropping the utterance", a
     for (const socket of upstreamWSS.clients) socket.terminate();
     relayWSS.close();
     upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("a turn still being answered is not cut off by the silence watchdog", async () => {
+  // The watchdog exists for a turn the provider never answers. As an absolute deadline
+  // it also killed turns that *were* being answered: a long sentence whose first final
+  // segment lands after the timeout was completed as an empty transcript, the turn was
+  // cleared, and the real final arrived to find nothing to attach to — the app then
+  // deleted the text it had already typed live and the sentence was lost outright.
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) {
+        socket.send(JSON.stringify({ setupComplete: {} }));
+        return;
+      }
+      if (!event.realtimeInput?.activityEnd) return;
+      // Answer slowly, in the shape a long sentence produces: interim only for well
+      // past the watchdog's window, then the final.
+      const send = (object) => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(object));
+      };
+      setTimeout(() => send({
+        serverContent: { interimInputTranscription: { text: "好" } },
+      }), 80);
+      setTimeout(() => send({
+        serverContent: { interimInputTranscription: { text: "好，现在" } },
+      }), 160);
+      setTimeout(() => send({
+        serverContent: { interimInputTranscription: { text: "好，现在测试" } },
+      }), 240);
+      setTimeout(() => send({
+        serverContent: {
+          inputTranscription: { text: "好，现在测试一下效果。" },
+          generationComplete: true,
+        },
+      }), 320);
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      geminiSilentTurnTimeoutMs: 150,
+      geminiFinalFallbackDelayMs: 30_000,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+  const completed = () => downstreamEvents.filter(
+    (event) => event.type === "conversation.item.input_audio_transcription.completed",
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify(geminiSessionUpdate("whisper-session-1")));
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-2",
+      audio: Buffer.alloc(960, 7).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-3",
+    }));
+
+    assert.ok(await waitUntil(() => completed().length === 1));
+    assert.equal(
+      completed()[0].transcript, "好，现在测试一下效果。",
+      "the sentence must survive a response that outlasts the watchdog window",
+    );
+    assert.equal(completed().length, 1, "and must be delivered exactly once");
+  } finally {
+    client.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("audio sent before the provider finishes setup is delivered, not refused", async () => {
+  // The pre-open queue exists so a client that does not wait for `session.created`
+  // keeps its sentence. Replaying it the moment the upstream socket opened defeated
+  // that: `setupComplete` had not arrived yet, so every queued audio event hit the
+  // not-ready gate and closed the connection the queue was protecting.
+  const upstreamEvents = [];
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) {
+        // Deliberately slow, so the client's audio arrives while the provider socket
+        // is open but not yet configured.
+        setTimeout(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ setupComplete: {} }));
+          }
+        }, 120);
+        return;
+      }
+      upstreamEvents.push(event);
+      if (event.realtimeInput?.activityEnd) {
+        socket.send(JSON.stringify({
+          serverContent: {
+            inputTranscription: { text: "队列里的句子" },
+            generationComplete: true,
+          },
+        }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  let clientClose = null;
+  client.on("close", (code) => { clientClose = code; });
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+  const completed = () => downstreamEvents.filter(
+    (event) => event.type === "conversation.item.input_audio_transcription.completed",
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    // Everything at once, without waiting for `session.updated`.
+    client.send(JSON.stringify(geminiSessionUpdate("whisper-session-1")));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-2",
+      audio: Buffer.alloc(960, 3).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-3",
+    }));
+
+    assert.ok(await waitUntil(() => completed().length === 1));
+    assert.equal(completed()[0].transcript, "队列里的句子");
+    assert.deepEqual(
+      upstreamEvents.map((event) => Object.keys(event.realtimeInput)[0]),
+      ["activityStart", "audio", "activityEnd"],
+      "the queued turn reaches the provider in order once setup completes",
+    );
+    assert.equal(clientClose, null, "and the queue never costs the connection");
+  } finally {
+    client.close();
     await close(relayServer);
     await close(upstreamServer);
   }

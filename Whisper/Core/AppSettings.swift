@@ -1,27 +1,11 @@
 import DictationKit
 import Foundation
 
-// ConnectionMode, TranscriptionModel and TranscriptionDelay now live in
-// DictationKit, because ServiceRoute and RealtimeClient are the code that acts
-// on them. What stays here is everything the package has no business holding:
+// TranscriptionModel and TranscriptionDelay live in DictationKit, because
+// ServiceRoute and RealtimeClient are the code that acts on them. What stays here is everything the package has no business holding:
 // the display copy, which is localised, and Identifiable, which exists for
 // SwiftUI.
 
-extension ConnectionMode: @retroactive Identifiable {
-    public var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .direct: return "直连"
-        // Not "大陆模式": the point is that the device holds no OpenAI key, which is
-        // useful anywhere. Naming it after one reason to want it made people in the US
-        // assume it did not apply to them.
-        case .relay: return "代理模式"
-        }
-    }
-}
-
-/// Which physical key must be held down to dictate.
 enum TriggerKey: String, CaseIterable, Identifiable {
     case rightCommand, leftCommand, rightOption, leftOption
 
@@ -73,7 +57,13 @@ enum TriggerKey: String, CaseIterable, Identifiable {
 extension TranscriptionModel: @retroactive Identifiable {
     public var id: String { rawValue }
 
-    var displayName: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .geminiLive: "Gemini 3.5 Transcribe Live"
+        case .liveTranscribe: "OpenAI Live（备用）"
+        case .transcribe: "OpenAI Transcribe（备用）"
+        }
+    }
 }
 
 extension TranscriptionDelay: @retroactive Identifiable {
@@ -98,9 +88,6 @@ final class AppSettings: DictationSettingsProviding {
 
     private let store = UserDefaults.standard
 
-    var connectionMode: ConnectionMode {
-        didSet { store.set(connectionMode.rawValue, forKey: Key.connectionMode) }
-    }
     var triggerKey: TriggerKey { didSet { store.set(triggerKey.rawValue, forKey: Key.triggerKey) } }
     var transcriptionDelay: TranscriptionDelay { didSet { store.set(transcriptionDelay.rawValue, forKey: Key.transcriptionDelay) } }
     var transcriptionModel: TranscriptionModel { didSet { store.set(transcriptionModel.rawValue, forKey: Key.transcriptionModel) } }
@@ -109,7 +96,9 @@ final class AppSettings: DictationSettingsProviding {
     /// this. A streaming model types as you speak; the others cannot return a word
     /// before you let go, so they paste once at the end.
     var typesWhileSpeaking: Bool { transcriptionModel.supportsLiveTyping }
-    /// Clean up filler words and false starts after the key is released.
+    /// Legacy preference retained so older installed builds and Wink can still read
+    /// their previous setting. The current Whisper UI keeps cleanup on permanently:
+    /// Gemini does it in SMART mode and OpenAI fallback uses TranscriptPolisher.
     var polishEnabled: Bool { didSet { store.set(polishEnabled, forKey: Key.polishEnabled) } }
     /// Drop the full stop the models like to end every utterance with. Done in code
     /// rather than by prompting: the realtime transcriber adds one too, so a prompt
@@ -177,38 +166,35 @@ final class AppSettings: DictationSettingsProviding {
         return terms
     }
 
-    /// Whether the user has ever picked a connection mode, as opposed to living with
-    /// the default. The absence of the key is the only honest test for it.
-    ///
-    /// A personalised build wants to come up in 代理模式 on a fresh Mac, but "fresh"
-    /// cannot be inferred from a credential being absent: someone using 直连 with their
-    /// own API key has no relay token either, and flipping *them* to relay would reroute
-    /// their audio and their billing without being asked.
-    static var connectionModeWasChosen: Bool {
-        UserDefaults.standard.string(forKey: Key.connectionMode) != nil
-    }
-
     private enum Key {
-        static let connectionMode = "connectionMode"
         static let triggerKey = "triggerKey"
         static let transcriptionDelay = "transcriptionDelay"
         static let transcriptionModel = "transcriptionModel"
         static let polishEnabled = "polishEnabled"
+        static let adoptedGeminiDefault = "adoptedGeminiDefault"
         static let stripTrailingPeriod = "stripTrailingPeriod"
         static let vocabulary = "vocabulary"
     }
 
     private init() {
-        let mode = store.string(forKey: Key.connectionMode)
-        connectionMode = mode.flatMap(ConnectionMode.init(rawValue:)) ?? .direct
         let trigger = store.string(forKey: Key.triggerKey)
         triggerKey = trigger.flatMap(TriggerKey.init(rawValue:)) ?? .rightCommand
         let delay = store.string(forKey: Key.transcriptionDelay)
         transcriptionDelay = delay.flatMap(TranscriptionDelay.init(rawValue:)) ?? .low
         let model = store.string(forKey: Key.transcriptionModel)
-        transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .liveTranscribe
+        transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .geminiLive
         polishEnabled = store.object(forKey: Key.polishEnabled) as? Bool ?? true
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
         vocabulary = store.string(forKey: Key.vocabulary) ?? ""
+        adoptGeminiDefaultIfNeeded()
+    }
+
+    /// One intentional migration: an existing install moves to Gemini once, but
+    /// selecting an OpenAI fallback afterwards remains sticky on every later launch.
+    private func adoptGeminiDefaultIfNeeded() {
+        guard !store.bool(forKey: Key.adoptedGeminiDefault) else { return }
+        transcriptionModel = .geminiLive
+        polishEnabled = true
+        store.set(true, forKey: Key.adoptedGeminiDefault)
     }
 }

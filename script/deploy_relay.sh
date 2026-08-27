@@ -58,6 +58,29 @@ valid_model_list() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]
 }
 
+# EnvironmentFile is line-oriented. A carriage return is just as destructive as a
+# newline here: it leaves a visually plausible assignment whose value includes an
+# invisible byte. Keep this a function so the deploy decision tests execute the exact
+# guard used by the shipping script.
+valid_gemini_key_shape() {
+  [ -n "$1" ] \
+    && [ "${#1}" -le 512 ] \
+    && [[ "$1" != *$'\n'* ]] \
+    && [[ "$1" != *$'\r'* ]]
+}
+
+# `updated` means the rollback's EnvironmentFile snapshot contains a different value,
+# not merely that the operator exported GEMINI_API_KEY again. CI commonly supplies the
+# same secret on every run; calling that a change makes a pre-existing revoked key look
+# attributable to this artifact.
+gemini_key_provenance() {
+  case "$1" in
+    SAME) printf retained ;;
+    DIFFERENT) printf updated ;;
+    *) return 1 ;;
+  esac
+}
+
 # `date +%Y%m%d-%H%M%S` on a host we already trust, but it is captured from a remote
 # shell's entire stdout — a stray `echo` in a login file lands in it — and it is then
 # interpolated bare into every rollback path, the one place that has to work when
@@ -163,7 +186,11 @@ acquire_remote_lock() {
 
   local state=""
   local attempt
-  for attempt in $(seq 1 200); do
+  # TCP connect has its own 10 s deadline, but authentication and opening the first
+  # remote channel come afterwards. On the production host that whole handshake has
+  # measured 7-11 s, so a 10 s local poll could close a lease that was about to report
+  # LOCKED and then misleadingly print "ssh exit 0". This bounds the complete handshake.
+  for attempt in $(seq 1 400); do
     if [ -s "$REMOTE_LOCK_TEMP/status" ]; then
       state=$(sed -n '1p' "$REMOTE_LOCK_TEMP/status")
       break
@@ -413,10 +440,52 @@ if ! valid_model_list "$TRANSCRIPTION_MODELS"; then
 fi
 [ -n "$SMOKE_TOKEN" ] || echo "    RELAY_SKIP_SMOKE=1 — the smoke test will not run"
 
+# Supplied for the first Gemini deployment, then retained in the remote EnvironmentFile
+# on ordinary later deploys. It travels over the locked SSH channel's stdin and is never
+# interpolated into remote command text or printed.
+GEMINI_DEPLOY_KEY="${GEMINI_API_KEY:-}"
+GEMINI_KEY_PROVENANCE=retained
+if [ -n "$GEMINI_DEPLOY_KEY" ]; then
+  if ! valid_gemini_key_shape "$GEMINI_DEPLOY_KEY"; then
+    echo "!! GEMINI_API_KEY has an invalid shape" >&2
+    exit 2
+  fi
+fi
+
 # One owner covers the whole mutable transaction, including verification and any
 # rollback. A local-only lock cannot coordinate two release Macs, and locking each ssh
 # command separately still lets another deploy enter between upload and env/restart.
 acquire_remote_lock
+
+# Check the retained credential before taking a backup or changing any remote file.
+# This stays behind the deploy flock: a separate unlocked preflight SSH has a race with
+# another deploy replacing the EnvironmentFile between the check and lock acquisition.
+# REMOTE_DIRTY is still zero here, so failure exits clearly without a pointless rollback.
+if [ -n "$GEMINI_DEPLOY_KEY" ]; then
+  echo "==> comparing supplied Gemini credential with the retained value"
+  # The secret crosses stdin and is compared remotely. Only SAME/DIFFERENT comes back;
+  # neither argv nor stdout contains credential material.
+  GEMINI_KEY_MATCH=$(printf '%s\n' "$GEMINI_DEPLOY_KEY" | remote_ssh "set -e
+    IFS= read -r GEMINI_VALUE
+    if grep -Fqx -- \"GEMINI_API_KEY=\$GEMINI_VALUE\" $ENV_FILE; then
+      printf SAME
+    else
+      printf DIFFERENT
+    fi")
+  if ! GEMINI_KEY_PROVENANCE=$(gemini_key_provenance "$GEMINI_KEY_MATCH"); then
+    echo "!! could not determine whether GEMINI_API_KEY changes the retained value" >&2
+    false
+  fi
+  echo "    credential provenance: $GEMINI_KEY_PROVENANCE"
+else
+  echo "==> checking retained Gemini credential"
+  if ! remote_ssh "grep -q '^GEMINI_API_KEY=.' $ENV_FILE"; then
+    echo "!! no GEMINI_API_KEY was supplied and the remote EnvironmentFile has none" >&2
+    echo "   Set GEMINI_API_KEY for the first Gemini deployment." >&2
+    false
+  fi
+  echo "    existing remote credential found"
+fi
 
 echo "==> backing up current deployment on $HOST"
 # The manifests are part of the version. Backing up only src/ makes a "rollback" that
@@ -496,6 +565,19 @@ remote_ssh "set -e
   printf 'MAX_TOTAL_TRANSCRIPTION_SECONDS_PER_DAY=43200\n' >> $ENV_FILE
   printf 'MAX_POLISH_REQUESTS_PER_DEVICE_PER_DAY=1000\n' >> $ENV_FILE
   printf 'MAX_TOTAL_POLISH_REQUESTS_PER_DAY=6000\n' >> $ENV_FILE"
+
+echo "==> provisioning Gemini credential"
+if [ -n "$GEMINI_DEPLOY_KEY" ]; then
+  printf '%s\n' "$GEMINI_DEPLOY_KEY" | remote_ssh "set -e
+    umask 077
+    IFS= read -r GEMINI_VALUE
+    test -n \"\$GEMINI_VALUE\"
+    sed -i '/^GEMINI_API_KEY=/d' $ENV_FILE
+    printf 'GEMINI_API_KEY=%s\n' \"\$GEMINI_VALUE\" >> $ENV_FILE"
+  echo "    updated from this deploy's environment"
+else
+  echo "    existing remote credential retained"
+fi
 
 echo "==> provisioning the reloadable allowlist"
 # Asked before the file is touched, so a rollback knows whether removing it restores the
@@ -639,7 +721,8 @@ remote_ssh "set -e
 probe_with_retries() {
   local classify=$1
   local attempt classification rest verdict reason
-  local rollback_reason="" matches=0
+  local rollback_reason_1="" rollback_reason_2="" last_rollback_reason=""
+  local rollback_matches_1=0 rollback_matches_2=0
   PROBE_DECISION=""
   PROBE_REASON=""
   PROBE_BODY=""
@@ -656,18 +739,28 @@ probe_with_retries() {
       return 0
     fi
     if [ "$verdict" = rollback ]; then
-      if [ "$rollback_reason" = "$reason" ]; then
-        matches=$((matches + 1))
+      last_rollback_reason=$reason
+      if [ "$rollback_reason_1" = "$reason" ]; then
+        rollback_matches_1=$((rollback_matches_1 + 1))
+      elif [ "$rollback_reason_2" = "$reason" ]; then
+        rollback_matches_2=$((rollback_matches_2 + 1))
+      elif [ -z "$rollback_reason_1" ]; then
+        rollback_reason_1=$reason
+        rollback_matches_1=1
       else
-        rollback_reason=$reason
-        matches=1
+        rollback_reason_2=$reason
+        rollback_matches_2=1
       fi
     fi
     echo "    attempt $attempt: $reason" >&2
     [ "$attempt" -lt 3 ] && sleep 3
   done
-  PROBE_ROLLBACK_REASON=$rollback_reason
-  if [ "$matches" -ge 2 ]; then
+  PROBE_ROLLBACK_REASON=$last_rollback_reason
+  if [ "$rollback_matches_1" -ge 2 ]; then
+    PROBE_ROLLBACK_REASON=$rollback_reason_1
+    PROBE_DECISION=rollback
+  elif [ "$rollback_matches_2" -ge 2 ]; then
+    PROBE_ROLLBACK_REASON=$rollback_reason_2
     PROBE_DECISION=rollback
   else
     PROBE_DECISION=inconclusive
@@ -764,6 +857,24 @@ classify_polish_smoke() {
   printf '%s\t%s' "$verdict" "$body"
 }
 
+classify_gemini_setup_smoke() {
+  local result verdict reason
+  # The device token travels on stdin, never argv. The Node probe dials the same public
+  # WebSocket route as the app, sends the app's Gemini session.update, and reports pass
+  # only after the Relay has received Google's setupComplete and emitted session.updated.
+  result=$(printf '%s\n' "$SMOKE_TOKEN" \
+    | node "$ROOT_DIR/server/scripts/gemini-smoke.mjs" \
+      "$GEMINI_SMOKE_URL" "$GEMINI_KEY_PROVENANCE" || true)
+  verdict=${result%%$'\t'*}
+  reason=${result#*$'\t'}
+  case "$verdict" in
+    pass|rollback|inconclusive) ;;
+    *) verdict=inconclusive; reason=gemini-smoke-classifier-failed ;;
+  esac
+  [ -n "$reason" ] || reason=gemini-smoke-classifier-failed
+  printf '%s\t%s\t' "$verdict" "$reason"
+}
+
 echo "==> health check (public)"
 # The loopback check says the process is fine; only this one says the thing the app
 # actually dials is fine. It used to be `curl ... && echo`, where curl sits on the left
@@ -810,6 +921,26 @@ case "$PROBE_DECISION" in
 esac
 
 if [ -n "$SMOKE_TOKEN" ]; then
+  echo "==> smoke test (a real Gemini setup through the public Relay)"
+  GEMINI_SMOKE_URL="${PUBLIC_HEALTH%/healthz}/v1/realtime?intent=transcription&provider=gemini"
+  # No synthetic audio is needed to validate the credential. session.updated is emitted
+  # only after Google accepts the key, model and setup and returns setupComplete.
+  probe_with_retries classify_gemini_setup_smoke
+  case "$PROBE_DECISION" in
+    pass) echo "    Gemini setup ok (gemini-3.5-transcribe-live)" ;;
+    rollback)
+      echo "!! Gemini setup smoke repeatedly proved a bad deployment" >&2
+      echo "   ($PROBE_ROLLBACK_REASON)" >&2
+      false
+      ;;
+    *)
+      echo "!! Gemini setup smoke inconclusive after retries ($PROBE_REASON);" >&2
+      report_unreproduced_failure
+      echo "   local/public health and enrollment passed, so the deployment is kept." >&2
+      echo "   No rollback or second restart was performed." >&2
+      ;;
+  esac
+
   echo "==> smoke test (a real /v1/polish round trip)"
   SMOKE_URL="${PUBLIC_HEALTH%/healthz}/v1/polish"
   SMOKE_BODY=$(printf '{"model":"%s","messages":[{"role":"system","content":"只输出整理后的文本。"},{"role":"user","content":"<transcript>嗯 部署 冒烟 测试</transcript>"}],"reasoning_effort":"none"}' "$POLISH_MODEL")

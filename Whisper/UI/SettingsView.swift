@@ -9,10 +9,7 @@ struct SettingsView: View {
     let updater: AppUpdater
     @State private var selectedTab = InviteEnrollmentOnboarding.shouldPresentInvite(
         inviteEnrollmentEnabled: KeychainStore.inviteEnrollmentEnabled,
-        hasRelayToken: KeychainStore.hasRelayToken(),
-        hasAPIKey: KeychainStore.hasAPIKey(),
-        connectionModeWasChosen: AppSettings.connectionModeWasChosen,
-        connectionMode: AppSettings.shared.connectionMode
+        hasRelayToken: KeychainStore.hasRelayToken()
     ) ? SettingsTab.setup : .dictation
 
     private enum SettingsTab: Hashable {
@@ -42,14 +39,6 @@ private struct DictationSettingsTab: View {
     var body: some View {
         Form {
             Section {
-                Picker("连接", selection: $settings.connectionMode) {
-                    ForEach(ConnectionMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: settings.connectionMode) { controller.reconnect() }
-
                 Picker("触发键", selection: $settings.triggerKey) {
                     ForEach(TriggerKey.allCases) { key in
                         Text(key.displayName).tag(key)
@@ -77,7 +66,7 @@ private struct DictationSettingsTab: View {
                 }
                 .onChange(of: settings.transcriptionModel) { controller.reconnect() }
 
-                if settings.transcriptionModel.supportsLiveTyping {
+                if settings.transcriptionModel.supportsTranscriptionDelay {
                     Picker("延迟", selection: $settings.transcriptionDelay) {
                         ForEach(TranscriptionDelay.allCases) { delay in
                             Text(delay.displayName).tag(delay)
@@ -87,8 +76,7 @@ private struct DictationSettingsTab: View {
                 }
             }
 
-            Section("整理") {
-                Toggle("自动去口头禅、补标点", isOn: $settings.polishEnabled)
+            Section("文本") {
                 Toggle("去掉句尾句号", isOn: $settings.stripTrailingPeriod)
             }
 
@@ -277,11 +265,6 @@ private struct SetupSettingsTab: View {
     @State private var accessibilityGranted = Permissions.hasAccessibility
     @State private var microphoneStatus = Permissions.microphoneStatus
 
-    @State private var apiKeyField = ""
-    @State private var apiKeyStored = KeychainStore.hasAPIKey()
-    @State private var isEditingAPIKey = false
-    @State private var apiKeyError: String?
-
     @State private var inviteCodeField = ""
     @State private var legacyRelayTokenField = ""
     @State private var relayTokenStored = KeychainStore.hasRelayToken()
@@ -324,12 +307,7 @@ private struct SetupSettingsTab: View {
                     }
                 }
 
-                switch settings.connectionMode {
-                case .direct:
-                    directCredentialEditor
-                case .relay:
-                    relayCredentialEditor
-                }
+                relayCredentialEditor
             }
 
             UpdateSettingsSection(controller: controller, updater: updater)
@@ -338,7 +316,6 @@ private struct SetupSettingsTab: View {
         .defaultScrollAnchor(.top)
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
-            apiKeyStored = KeychainStore.hasAPIKey()
             relayTokenStored = KeychainStore.hasRelayToken()
         }
         .onReceive(refresh) { _ in
@@ -350,41 +327,6 @@ private struct SetupSettingsTab: View {
             relayEnrollmentTask = nil
             relayEnrollmentAttemptID = nil
             isActivatingRelay = false
-        }
-    }
-
-    @ViewBuilder
-    private var directCredentialEditor: some View {
-        if apiKeyStored && !isEditingAPIKey {
-            savedCredentialRow(title: "API Key") {
-                apiKeyField = ""
-                apiKeyError = nil
-                isEditingAPIKey = true
-            }
-        } else {
-            HStack(spacing: 8) {
-                SecureField("API Key", text: $apiKeyField, prompt: Text("sk-proj-…"))
-                    .onChange(of: apiKeyField) { apiKeyError = nil }
-                    .onSubmit { saveAPIKey() }
-
-                if apiKeyStored {
-                    Button("取消") {
-                        apiKeyField = ""
-                        apiKeyError = nil
-                        isEditingAPIKey = false
-                    }
-                }
-
-                Button(apiKeyStored ? "更新" : "保存", action: saveAPIKey)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-
-            if let apiKeyError {
-                Label(apiKeyError, systemImage: "exclamationmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(Color.red)
-            }
         }
     }
 
@@ -504,20 +446,6 @@ private struct SetupSettingsTab: View {
         }
     }
 
-    private func saveAPIKey() {
-        let key = apiKeyField.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return }
-        guard KeychainStore.saveAPIKey(key) else {
-            apiKeyError = "无法写入钥匙串"
-            return
-        }
-        apiKeyField = ""
-        apiKeyStored = true
-        isEditingAPIKey = false
-        apiKeyError = nil
-        controller.reconnect()
-    }
-
     private func activateRelay() {
         let invite = inviteCodeField.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !invite.isEmpty, !isActivatingRelay else { return }
@@ -546,7 +474,6 @@ private struct SetupSettingsTab: View {
                 inviteCodeField = ""
                 relayTokenStored = true
                 isEditingRelayToken = false
-                settings.connectionMode = .relay
                 controller.reconnect()
             } catch {
                 guard !Task.isCancelled else { return }
@@ -558,6 +485,10 @@ private struct SetupSettingsTab: View {
     private func saveLegacyRelayToken() {
         let token = legacyRelayTokenField.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { return }
+        guard KeychainStore.isGeneratedRelayToken(token) else {
+            relayTokenError = "设备 Token 格式不正确"
+            return
+        }
         guard KeychainStore.saveRelayToken(token) else {
             relayTokenError = "无法写入钥匙串"
             return

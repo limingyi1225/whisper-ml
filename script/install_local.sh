@@ -117,9 +117,9 @@ xcodebuild -exportArchive -archivePath "$ARCHIVE" \
   -exportOptionsPlist "$EXPORT_OPTIONS" \
   -exportPath "$EXPORT_DIR" -allowProvisioningUpdates >/dev/null
 
-# No relay token is baked in, which is what makes this the build for you rather than for
-# someone else: you connect direct with your own API key. A token in /Applications would
-# also be one nothing on the relay can revoke, because it was never registered.
+# No relay token is baked in. Local installs reuse the revocable device token already in
+# this Mac's Keychain; personalised copies are the only artifacts allowed to carry a
+# token in their bundle metadata.
 if /usr/libexec/PlistBuddy -c "Print :WhisperRelayToken" \
      "$BUILT/Contents/Info.plist" >/dev/null 2>&1; then
   echo "!! this build carries a relay token; that is package_release.sh's job, not this" >&2

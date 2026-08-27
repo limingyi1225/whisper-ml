@@ -32,14 +32,26 @@ export function classifyRelaySmoke(statusText, bodyText) {
   if (status === 404) return { verdict: "rollback", reason: "http-404" };
 
   const relayErrorCode = body?.error?.code;
+  // The smoke token comes from this Mac's Keychain and the live allowlist is mutable
+  // operational state. It can be revoked before an otherwise good deploy starts;
+  // restoring the previous source tree cannot authorize it again. Keep the explicit
+  // reason for the operator, but do not turn stale local state into a second restart.
+  if (relayErrorCode === "relay_unauthorized") {
+    return { verdict: "inconclusive", reason: "relay-device-token-rejected" };
+  }
+  // deploy_relay.sh never replaces OPENAI_API_KEY; it retains the EnvironmentFile
+  // value. A revoked/expired upstream key therefore predates this artifact, and the
+  // rollback restores the exact same bad credential while needlessly restarting all
+  // realtime sessions.
+  if (relayErrorCode === "relay_upstream_authentication") {
+    return { verdict: "inconclusive", reason: "retained-openai-credential-rejected" };
+  }
   const deterministicRelayErrors = new Set([
     "relay_body_too_large",
     "relay_internal_error",
     "relay_invalid_json",
     "relay_invalid_request",
     "relay_not_found",
-    "relay_unauthorized",
-    "relay_upstream_authentication",
   ]);
   if (deterministicRelayErrors.has(relayErrorCode)) {
     return { verdict: "rollback", reason: relayErrorCode };

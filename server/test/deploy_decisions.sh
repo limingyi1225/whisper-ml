@@ -30,7 +30,8 @@ lift() {
 }
 
 for fn in probe_with_retries probe_attempt_verdict valid_base_path valid_model_list \
-          valid_stamp capture_backup restore_script restore_backup; do
+          valid_gemini_key_shape gemini_key_provenance valid_stamp capture_backup \
+          restore_script restore_backup; do
   eval "$(lift "$fn")"
   [ "$(type -t "$fn")" = function ] || { echo "could not lift $fn" >&2; exit 1; }
 done
@@ -183,6 +184,14 @@ case "${1:-}" in
       case "$which" in
         base-path) if valid_base_path "$value"; then echo accept; else echo REJECT; fi ;;
         model)     if valid_model_list "$value"; then echo accept; else echo REJECT; fi ;;
+        gemini-key) if valid_gemini_key_shape "$value"; then echo accept; else echo REJECT; fi ;;
+        gemini-provenance)
+          if classification=$(gemini_key_provenance "$value"); then
+            echo "$classification"
+          else
+            echo REJECT
+          fi
+          ;;
         stamp)     if valid_stamp "$value"; then echo accept; else echo REJECT; fi ;;
         *)         echo "unknown validator: $which" >&2; exit 2 ;;
       esac

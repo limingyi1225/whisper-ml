@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { WebSocketServer } from "ws";
 
 import { authenticateRequest, tokenDigest } from "../src/auth.js";
 import {
@@ -28,6 +30,11 @@ import { routePath } from "../src/http.js";
 import { validatePolishBody } from "../src/polish.js";
 import { classifyRelaySmoke } from "../../script/relay_smoke_verdict.mjs";
 import {
+  classifyGeminiRelayEvent,
+  classifyGeminiSmokeHTTPStatus,
+  probeGeminiSetup,
+} from "../scripts/gemini-smoke.mjs";
+import {
   admitConnection,
   DailyUsageLimiter,
   FixedWindowRateLimiter,
@@ -37,6 +44,7 @@ import { clientEventID, safeCloseCode, validateRealtimeEvent } from "../src/real
 const token = "relay_test-device-token";
 const baseEnv = {
   OPENAI_API_KEY: "test-openai-key",
+  GEMINI_API_KEY: "test-gemini-key",
   RELAY_DEVICE_TOKEN_HASHES: tokenDigest(token),
 };
 
@@ -80,6 +88,32 @@ test("deploy mutations share the flock owner's SSH connection and fail closed", 
   // default changes; deploy reconciliation is the authoritative live setting.
   assert.match(script, /\/\^MAX_CONNECTIONS_PER_DEVICE=\/d/);
   assert.match(script, /MAX_CONNECTIONS_PER_DEVICE=5/);
+
+  // A missing retained Gemini credential is rejected while REMOTE_DIRTY is still zero:
+  // acquiring the shared lock is read-only, while backup/upload/npm/env reconciliation
+  // all come later. This avoids both an unlocked check race and a pointless rollback.
+  const lockAt = script.indexOf("acquire_remote_lock\n");
+  const keyCheckAt = script.indexOf("==> checking retained Gemini credential");
+  const backupAt = script.indexOf("==> backing up current deployment");
+  const dirtyAt = script.indexOf("REMOTE_DIRTY=1", lockAt);
+  assert.ok(lockAt >= 0 && lockAt < keyCheckAt);
+  assert.ok(keyCheckAt < backupAt && backupAt < dirtyAt);
+  assert.match(
+    script.slice(keyCheckAt, backupAt),
+    /no GEMINI_API_KEY was supplied and the remote EnvironmentFile has none/,
+  );
+
+  // The post-deploy checks must exercise the new default provider, not only HTTP
+  // health and the OpenAI polish fallback.
+  assert.match(script, /scripts\/gemini-smoke\.mjs/);
+  assert.match(script, /provider=gemini/);
+  assert.match(script, /GEMINI_KEY_PROVENANCE=retained/);
+  assert.match(script, /GEMINI_KEY_PROVENANCE=\$\(gemini_key_provenance/);
+  assert.match(
+    script,
+    /"\$GEMINI_SMOKE_URL"\s+"\$GEMINI_KEY_PROVENANCE"/,
+    "the smoke classifier must know whether this deploy changed the credential",
+  );
 });
 
 test("connection audit metadata is bounded and never logs credentials", () => {
@@ -108,6 +142,10 @@ test("connection audit metadata is bounded and never logs credentials", () => {
   assert.equal(auditDeviceID(digest), digest.slice(0, 12));
   assert.equal(auditDeviceID("raw-token"), "unknown");
   assert.equal(auditConnectionEnd("client went away"), "client-went-away");
+  assert.equal(auditConnectionEnd("gemini upstream closed"), "gemini-upstream-closed");
+  // Bridge reasons deliberately use a lowercase controlled vocabulary. A regression
+  // back to product-name casing must fail visibly instead of looking log-safe.
+  assert.equal(auditConnectionEnd("Gemini upstream closed"), "unknown");
   assert.equal(auditConnectionEnd("client closed\nforged=true"), "unknown");
 });
 
@@ -257,6 +295,12 @@ test("values spliced into a remote shell are checked before they get there", () 
     ["model", "gpt-5.6'; id > /tmp/OWNED; echo '", "REJECT"],
     ["model", "gpt-5.6 luna", "REJECT"],
     ["model", "", "REJECT"],
+    ["gemini-key", "ordinary-key_value", "accept"],
+    ["gemini-key", "key\rwith-hidden-return", "REJECT"],
+    ["gemini-key", "", "REJECT"],
+    ["gemini-provenance", "SAME", "retained"],
+    ["gemini-provenance", "DIFFERENT", "updated"],
+    ["gemini-provenance", "warning-on-stdout", "REJECT"],
     // Captured from a remote shell's whole stdout, so a stray echo in a login file
     // lands in it and then word-splits through every rollback command.
     ["stamp", "20260816-120000", "accept"],
@@ -288,8 +332,14 @@ test("deploy polish smoke separates bad artifacts from transient upstream failur
     classifyRelaySmoke("404", "<html>nginx route missing</html>"),
     { verdict: "rollback", reason: "http-404" },
   );
-  assert.equal(classifyRelaySmoke("401", '{"error":{"code":"relay_unauthorized"}}').verdict, "rollback");
-  assert.equal(classifyRelaySmoke("424", '{"error":{"code":"relay_upstream_authentication"}}').verdict, "rollback");
+  assert.deepEqual(
+    classifyRelaySmoke("401", '{"error":{"code":"relay_unauthorized"}}'),
+    { verdict: "inconclusive", reason: "relay-device-token-rejected" },
+  );
+  assert.deepEqual(
+    classifyRelaySmoke("424", '{"error":{"code":"relay_upstream_authentication"}}'),
+    { verdict: "inconclusive", reason: "retained-openai-credential-rejected" },
+  );
   assert.equal(classifyRelaySmoke("500", '{"error":{"code":"relay_internal_error"}}').verdict, "rollback");
   assert.equal(classifyRelaySmoke("400", '{"error":{"code":"model_not_found"}}').verdict, "rollback");
   assert.equal(
@@ -308,6 +358,104 @@ test("deploy polish smoke separates bad artifacts from transient upstream failur
     classifyRelaySmoke("500", '{"error":{"code":"server_error"}}').verdict,
     "inconclusive",
   );
+});
+
+test("Gemini deploy smoke requires provider setup and classifies credential failures", () => {
+  assert.deepEqual(
+    classifyGeminiRelayEvent({ type: "session.updated" }),
+    { verdict: "pass", reason: "gemini-setup-complete" },
+  );
+  assert.equal(classifyGeminiRelayEvent({ type: "session.created" }), null);
+  assert.deepEqual(
+    classifyGeminiRelayEvent({
+      type: "error",
+      error: { code: "relay_gemini_error", message: "API key not valid" },
+    }, { credentialUpdated: true }),
+    { verdict: "rollback", reason: "gemini-credential-rejected" },
+  );
+  assert.deepEqual(
+    classifyGeminiRelayEvent({
+      type: "error",
+      error: { code: "relay_gemini_error", message: "API key not valid" },
+    }),
+    { verdict: "inconclusive", reason: "gemini-retained-credential-rejected" },
+  );
+  assert.deepEqual(
+    classifyGeminiRelayEvent({
+      type: "error",
+      error: { code: "relay_invalid_event", message: "session rejected" },
+    }),
+    { verdict: "rollback", reason: "gemini-setup-rejected" },
+  );
+  assert.deepEqual(
+    classifyGeminiRelayEvent({
+      type: "error",
+      error: { code: "relay_upstream_unreachable", message: "temporary outage" },
+    }),
+    { verdict: "inconclusive", reason: "relay_upstream_unreachable" },
+  );
+  assert.deepEqual(
+    classifyGeminiSmokeHTTPStatus(401),
+    { verdict: "inconclusive", reason: "relay-device-token-rejected" },
+  );
+  assert.deepEqual(
+    classifyGeminiSmokeHTTPStatus(403),
+    { verdict: "inconclusive", reason: "edge-or-upstream-http-403" },
+  );
+  assert.deepEqual(
+    classifyGeminiSmokeHTTPStatus(404),
+    { verdict: "rollback", reason: "http-404" },
+  );
+  assert.deepEqual(
+    classifyGeminiSmokeHTTPStatus(400),
+    { verdict: "inconclusive", reason: "edge-or-smoke-http-400" },
+  );
+  assert.deepEqual(
+    classifyGeminiSmokeHTTPStatus(503),
+    { verdict: "inconclusive", reason: "edge-or-upstream-http-503" },
+  );
+});
+
+test("Gemini deploy smoke sends the app session shape and waits for session.updated", async () => {
+  assert.deepEqual(
+    await probeGeminiSetup("not a valid URL", token),
+    { verdict: "inconclusive", reason: "invalid-gemini-smoke-url" },
+  );
+
+  const httpServer = createServer();
+  const webSocketServer = new WebSocketServer({ server: httpServer });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  const address = httpServer.address();
+  assert.equal(typeof address, "object");
+
+  let receivedAuthorization;
+  let receivedSession;
+  webSocketServer.once("connection", (socket, request) => {
+    receivedAuthorization = request.headers.authorization;
+    socket.once("message", (data) => {
+      receivedSession = JSON.parse(data.toString("utf8"));
+      // session.created alone is not success: the production bridge emits updated only
+      // after Google's setupComplete, which is precisely what this probe must await.
+      socket.send(JSON.stringify({ type: "session.created", session: {} }));
+      socket.send(JSON.stringify({ type: "session.updated" }));
+    });
+  });
+
+  const result = await probeGeminiSetup(
+    `http://127.0.0.1:${address.port}/v1/realtime?intent=transcription&provider=gemini`,
+    "relay_smoke-token",
+    { timeoutMs: 2_000 },
+  );
+  assert.deepEqual(result, { verdict: "pass", reason: "gemini-setup-complete" });
+  assert.equal(receivedAuthorization, "Bearer relay_smoke-token");
+  assert.equal(receivedSession.type, "session.update");
+  assert.equal(
+    receivedSession.session.audio.input.transcription.model,
+    "gemini-3.5-transcribe-live",
+  );
+
+  await new Promise((resolve) => webSocketServer.close(resolve));
+  await new Promise((resolve) => httpServer.close(resolve));
 });
 
 test("configuration requires hashed device tokens", () => {
@@ -499,6 +647,14 @@ test("defaults are loopback-bound and derived from the client's audio buffer", (
   assert.equal(config.maxTotalTranscriptionBytesPerDay, 48_000 * 43_200);
   assert.equal(config.maxPolishRequestsPerDevicePerDay, 1_000);
   assert.equal(config.maxTotalPolishRequestsPerDay, 6_000);
+  assert.deepEqual(
+    [...config.allowedOpenAITranscriptionModels],
+    ["gpt-live-transcribe", "gpt-transcribe"],
+  );
+  assert.deepEqual(
+    [...config.allowedGeminiTranscriptionModels],
+    ["gemini-3.5-transcribe-live"],
+  );
 
   const overridden = loadConfig({
     ...baseEnv,
@@ -529,6 +685,10 @@ test("a malformed upstream URL fails at startup, not on the first user connectio
   );
   assert.throws(
     () => loadConfig({ ...baseEnv, OPENAI_POLISH_URL: "wss://api.openai.com/v1/x" }),
+    /must use one of/,
+  );
+  assert.throws(
+    () => loadConfig({ ...baseEnv, GEMINI_LIVE_URL: "https://example.com/live" }),
     /must use one of/,
   );
   assert.equal(
@@ -636,6 +796,47 @@ test("Realtime validation permits transcription but rejects arbitrary sessions",
       state,
     ),
     /unsupported field/,
+  );
+});
+
+test("Realtime model validation is scoped to the selected provider", () => {
+  const config = loadConfig(baseEnv);
+  const sessionUpdate = (model) => Buffer.from(JSON.stringify({
+    type: "session.update",
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: 24_000 },
+          transcription: { model },
+          turn_detection: null,
+        },
+      },
+    },
+  }));
+  const validateFor = (model, allowedModels) => validateRealtimeEvent(
+    sessionUpdate(model),
+    false,
+    config,
+    { turnAudioBytes: 0 },
+    allowedModels,
+  );
+
+  assert.equal(
+    validateFor("gpt-live-transcribe", config.allowedOpenAITranscriptionModels),
+    null,
+  );
+  assert.match(
+    validateFor("gemini-3.5-transcribe-live", config.allowedOpenAITranscriptionModels),
+    /session configuration is not allowed/,
+  );
+  assert.equal(
+    validateFor("gemini-3.5-transcribe-live", config.allowedGeminiTranscriptionModels),
+    null,
+  );
+  assert.match(
+    validateFor("gpt-live-transcribe", config.allowedGeminiTranscriptionModels),
+    /session configuration is not allowed/,
   );
 });
 

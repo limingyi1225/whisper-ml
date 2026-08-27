@@ -16,6 +16,7 @@ import {
   handleEnrollmentAdmin,
 } from "./enrollment.js";
 import { errorBody, routePath, writeJSON } from "./http.js";
+import { bridgeGeminiRealtime } from "./gemini-realtime.js";
 import { handlePolish } from "./polish.js";
 import {
   admitConnection,
@@ -236,8 +237,10 @@ const webSocketServer = new WebSocketServer({
 
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url || "/", "http://relay.invalid");
+  const provider = url.searchParams.get("provider") || "openai";
   if (routePath(url, config.basePath) !== "/v1/realtime"
-      || url.searchParams.get("intent") !== "transcription") {
+      || url.searchParams.get("intent") !== "transcription"
+      || !new Set(["openai", "gemini"]).has(provider)) {
     socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     return;
   }
@@ -270,6 +273,7 @@ server.on("upgrade", (request, socket, head) => {
       + ` client=${metadata.client}`
       + ` version=${metadata.version}`
       + ` connection=${metadata.connectionID}`
+      + ` provider=${provider}`
       + ` device_open=${active}`
       + ` device_limit=${config.maxConnectionsPerDevice}`
       + ` total_open=${downstreamSockets.size}`
@@ -291,6 +295,7 @@ server.on("upgrade", (request, socket, head) => {
       ...metadata,
       connectedAt,
       end: "unsettled",
+      provider,
     };
     downstreamSockets.set(downstream, session);
     process.stdout.write(
@@ -299,6 +304,7 @@ server.on("upgrade", (request, socket, head) => {
       + ` client=${metadata.client}`
       + ` version=${metadata.version}`
       + ` connection=${metadata.connectionID}`
+      + ` provider=${provider}`
       + ` device_open=${active + 1}`
       + ` total_open=${downstreamSockets.size}\n`,
     );
@@ -316,6 +322,7 @@ server.on("upgrade", (request, socket, head) => {
         + ` client=${metadata.client}`
         + ` version=${metadata.version}`
         + ` connection=${metadata.connectionID}`
+        + ` provider=${provider}`
         + ` close_code=${Number.isInteger(closeCode) ? closeCode : 1011}`
         + ` end=${end}`
         + ` age_ms=${Math.max(0, Date.now() - connectedAt)}`
@@ -340,9 +347,28 @@ server.on("upgrade", (request, socket, head) => {
     // dies and every other user's session goes with it. One bad connection should cost
     // one connection.
     try {
-      session.upstream = bridgeRealtime(downstream, config, {
+      const bridge = provider === "gemini" ? bridgeGeminiRealtime : bridgeRealtime;
+      session.upstream = bridge(downstream, config, {
         consumeAudio: (bytes) => transcriptionDailyUsage.take(deviceID, bytes),
         onEnd: (reason) => { session.end = auditConnectionEnd(reason); },
+        // Per-turn audit for the Gemini path. A turn that ends `abandoned`, or one
+        // whose audio_bytes do not match how long the user actually spoke, is the
+        // evidence that separates a bad transcript from audio put in the wrong turn.
+        // The bridge passes counts only; nothing here may widen that to content.
+        onTurn: (record) => process.stdout.write(
+          `realtime turn ${record.event}`
+          + ` device=${auditID}`
+          + ` connection=${metadata.connectionID}`
+          + ` provider=${provider}`
+          + ` item=${record.item}`
+          + (record.event === "end"
+            ? ` outcome=${record.outcome}`
+              + ` audio_bytes=${record.audioBytes}`
+              + ` age_ms=${record.ageMs}`
+              + ` chars=${record.chars}`
+            : "")
+          + "\n",
+        ),
       });
       // Register after the bridge's own close listener. It assigns the controlled
       // internal reason first; this listener then releases the counted slot and logs
@@ -350,7 +376,7 @@ server.on("upgrade", (request, socket, head) => {
       downstream.once("close", (code) => release(code));
     } catch (error) {
       process.stderr.write(`bridge failed to start: ${error.message}\n`);
-      downstream.close(1011, "relay could not reach OpenAI");
+      downstream.close(1011, "relay could not reach transcription provider");
       release(1011, "bridge-start-failed");
     }
   });
