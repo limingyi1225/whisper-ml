@@ -9,6 +9,20 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.12</title>
+            <pubDate>Thu, 27 Aug 2026 13:35:35 -0400</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.12</link>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>1.12</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[## 修复
+
+- **第一句话不出字**：刚启动或刚换窗口时，系统还没准备好告诉我们光标在哪个输入框里。以前这一次「不知道」就等于这句话的判决，边说边打整句都不启动，要松手才一次性冒出来。现在会在 0.35 秒后再看几次，中途重新认出输入框也能接着往下打。
+- **有些编辑器（微信、Electron/网页类）整句被丢进剪贴板**：这类应用会在你刚打进去的文字周围重建自己的界面信息，导致我们「认不出」原来那个输入框。以前这会让整句话只落到剪贴板上，还得自己按一次 ⌘V。现在这种情况只停掉边说边打，最后仍然照常粘贴进去。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.12/Whisper-1.12-13.dmg" length="3310989" type="application/octet-stream" sparkle:edSignature="fB2jbLrperUyQCQZnvTXkpiAuTUzxpGB1nOtgM0+N7mT81XZKf3SW2mcQ3yfxTeFC0CVkgHeyfLvBR50R/ttDg=="/>
+        </item>
+        <item>
             <title>1.11</title>
             <pubDate>Thu, 27 Aug 2026 12:37:48 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.11</link>
@@ -124,6 +138,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: J77HBdRJHydBzqfQEmaGOe3kHNkPLr8lXwugWcQGgiiU2qYPO7UtddKOk7yMUthnuDISylHL+e5U+CHHr40PBw==
-length: 9454
+edSignature: K+CkPEkMY3UXYEtuEeixb/jUg5UD8+RnDkLm+Fvqrq56Ebh1wD1Q2aKrU1XbkZxQsQE1RNC+nnYAa1OxtqnSAg==
+length: 10939
 -->
