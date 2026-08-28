@@ -46,10 +46,18 @@ const AUDIO_BYTES_PER_MS = 48;
 const SHORT_TURN_AUDIO_MS = 2_000;
 const DEFAULT_SHORT_TURN_TIMEOUT_MS = 1_800;
 const DEFAULT_SHORT_UNCERTAIN_TURN_TIMEOUT_MS = 3_000;
-// About -54 dBFS. This is deliberately permissive: uncertain room noise is treated as
-// possible speech and takes the ordinary timeout rather than risking a swallowed word.
-// A non-empty provider transcription is independent, conclusive speech evidence.
-const QUIET_TURN_MAX_RMS = 64;
+// About -30 dBFS. Set from the deployed relay's own `audio_rms` readings rather than
+// from a dB figure that sounded conservative: an accidental tap in a real room measured
+// 524, 658 and 866, while the shortest turns that carried a word measured 1247 and 2947.
+// The first guess at this constant was 64 — eight times below the quietest silence
+// anyone actually records — so nothing ever qualified as quiet and the accidental tap
+// still ended in an error, three seconds in instead of five.
+//
+// The gap between those two populations is narrow, which is why this is not the only
+// condition. A turn only completes empty if Gemini also returned no interim and no final
+// text, and for real speech it always does. Losing a word therefore takes quiet audio
+// *and* a provider that failed to answer real speech, not either one alone.
+const QUIET_TURN_MAX_RMS = 1_000;
 
 function accumulatePCM16Energy(turn, base64Audio) {
   const pcm = Buffer.from(base64Audio, "base64");
