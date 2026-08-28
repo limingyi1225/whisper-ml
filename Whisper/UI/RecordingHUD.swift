@@ -374,6 +374,11 @@ struct RecordingHUDView: View {
         switch state {
         case .polishing, .settled:
             PolishPill(landedAt: controller.settledAt)
+        case .failed, .failedQuiet:
+            FailurePill(
+                failedAt: controller.lastErrorAt,
+                message: state == .failedQuiet ? nil : (controller.lastError ?? "出错了")
+            )
         default:
             content
                 .frame(width: width, height: height)
@@ -419,20 +424,21 @@ struct RecordingHUDView: View {
                 .opacity(waveformVisible ? 1 : 0)
         case .polishing, .settled:
             Color.clear
-        case .failed:
-            Text(controller.lastError ?? "出错了")
-                .font(.system(size: 10, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(.white.opacity(0.8))
-                .padding(.horizontal, 10)
+        // Both failure states draw themselves; `FailurePill` owns their whole
+        // timeline, shell included, the way `PolishPill` owns the settled one.
+        case .failed, .failedQuiet:
+            Color.clear
         }
     }
 
     // MARK: - Appearance per state
 
     private enum HUDState: Equatable {
-        case idle, arming, listening, transcribing, polishing, settled, failed
+        case idle, arming, listening, transcribing, polishing, settled
+        /// A failure with something to say: the words, and the same shake.
+        case failed
+        /// A failure with nothing to say — the shake alone.
+        case failedQuiet
     }
 
     private var state: HUDState {
@@ -445,19 +451,19 @@ struct RecordingHUDView: View {
         // first is over in a blink, the second takes long enough to wonder about
         // and ends by rewriting text that is already on screen.
         case .finalizing: return controller.isPolishing ? .polishing : .transcribing
-        case .error: return .failed
+        case .error: return controller.lastErrorIsWordless ? .failedQuiet : .failed
         }
     }
 
     private var isFailed: Bool {
-        if case .failed = state { true } else { false }
+        state == .failed || state == .failedQuiet
     }
 
     private var fillOpacity: Double {
         switch state {
         case .idle, .arming, .listening, .transcribing:
             return 0.48 + 0.32 * Double(shellExpansion)
-        case .polishing, .settled, .failed:
+        case .polishing, .settled, .failed, .failedQuiet:
             return 0.8
         }
     }
@@ -469,7 +475,7 @@ struct RecordingHUDView: View {
         case .idle, .arming, .listening, .transcribing:
             let restingAmount = min(max(1 - shellExpansion, 0), 1)
             return 0.4 * Double(restingAmount)
-        case .polishing, .settled, .failed:
+        case .polishing, .settled, .failed, .failedQuiet:
             return 0
         }
     }
@@ -484,6 +490,7 @@ struct RecordingHUDView: View {
         // at this font — a truncated error is a message nobody can act on. Stays
         // inside the 260pt panel with room for the capsule's own margins.
         case .failed: return 230
+        case .failedQuiet: return 84
         }
     }
 
@@ -494,6 +501,7 @@ struct RecordingHUDView: View {
         case .polishing, .settled:
             return 12
         case .failed: return 18
+        case .failedQuiet: return 12
         }
     }
 
@@ -527,7 +535,10 @@ struct RecordingHUDView: View {
             withAnimation(.timingCurve(0.65, 0, 0.35, 1, duration: 0.34)) {
                 shellExpansion = 0
             }
-        case .failed:
+        case .failed, .failedQuiet:
+            // The shell underneath is prepared at rest, so replacing the failure pill
+            // when the error clears cannot jump back open — the wordless one has
+            // already animated down to exactly this by then.
             shellExpansion = 0
             waveformVisible = false
         }
@@ -709,4 +720,143 @@ private struct PolishPill: View {
         startPoint: .leading,
         endPoint: .trailing
     )
+}
+
+/// What a failed sentence looks like: one shake of the head, at the size the pill was
+/// waiting at when the answer did not come.
+///
+/// The gesture is the same for both kinds of failure, because from the user's side they
+/// are the same event — that sentence did not happen. What differs is whether anything
+/// is owed afterwards. A failure they can act on keeps its words and holds them up
+/// (`message`); one they cannot keeps nothing and comes to rest, so the last thing on
+/// screen is the same resting line as always rather than a sentence about a service that
+/// is already working again by the time it is read. See
+/// `DictationController.failureIsWordless`.
+///
+/// Both timelines run off `failedAt` rather than SwiftUI transitions: two failures in a
+/// row carrying the same words are one changed date and no changed view, and the shake
+/// has to start again for the second one.
+private struct FailurePill: View {
+    let failedAt: Date?
+    /// `nil` for a failure with nothing to say.
+    let message: String?
+
+    /// Where the pill waits for an answer — `.polishing`'s size, which is also where
+    /// `.transcribing` has grown to by the time an answer is late.
+    private static let openWidth: CGFloat = 84
+    private static let openHeight: CGFloat = 12
+    private static let restingWidth: CGFloat = 54
+    private static let restingHeight: CGFloat = 5
+    /// Sized for the longest message the app can produce, as the error pill always was.
+    private static let spokenWidth: CGFloat = 230
+    private static let spokenHeight: CGFloat = 18
+
+    /// A damped swing, ~2.5 passes through centre. The amplitude is small on purpose:
+    /// this happens at the bottom edge of vision while the user is looking somewhere
+    /// else, and it only has to read as "no", not as an animation to wait out.
+    private static let amplitude: CGFloat = 2.5
+    private static let swingPeriod: Double = 0.17
+    private static let decay: Double = 0.13
+    private static let shakeDuration: Double = 0.44
+    /// A wordless failure goes home once the shake has stopped moving.
+    private static let settleAt: Double = 0.46
+    private static let settleDuration: Double = 0.34
+    /// A spoken one grows into its words instead. It used to arrive at full width in
+    /// one frame, held open by a spring on the state change; the pill now owns its own
+    /// timeline, so the opening is part of it.
+    private static let openDuration: Double = 0.3
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60)) { timeline in
+            let elapsed = failedAt.map { max(0, timeline.date.timeIntervalSince($0)) } ?? 0
+            let settled = settleProgress(at: elapsed)
+            let opened = openProgress(at: elapsed)
+
+            label
+                .opacity(opened)
+                .frame(
+                    width: width(settled: settled, opened: opened),
+                    height: height(settled: settled, opened: opened)
+                )
+                .background {
+                    Capsule(style: .continuous)
+                        .fill(Color(white: 0.1).opacity(Self.mix(0.8, 0.48, settled)))
+                        .overlay {
+                            // Fades in to exactly the resting outline, so the swap back
+                            // to the ordinary shell when the error clears is invisible.
+                            Capsule(style: .continuous)
+                                .stroke(.white.opacity(0.4 * settled), lineWidth: 0.75)
+                                .padding(-0.375)
+                        }
+                }
+                .offset(x: Self.shakeOffset(at: elapsed))
+        }
+    }
+
+    @ViewBuilder
+    private var label: some View {
+        if let message {
+            Text(message)
+                .font(.system(size: 10, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(.white.opacity(0.8))
+                .padding(.horizontal, 10)
+        } else {
+            Color.clear
+        }
+    }
+
+    /// 0 while the pill is still open, 1 once a wordless failure has come to rest. A
+    /// spoken one never settles: its words stay up until the error clears.
+    private func settleProgress(at elapsed: Double) -> Double {
+        guard message == nil else { return 0 }
+        let linear = min(1, max(0, (elapsed - Self.settleAt) / Self.settleDuration))
+        return Self.easeInOut(linear)
+    }
+
+    /// 0 to 1 as a spoken failure grows from the waiting size into its words. A
+    /// wordless one has nothing to open into and stays at 1 throughout.
+    private func openProgress(at elapsed: Double) -> Double {
+        guard message != nil else { return 1 }
+        return Self.easeOut(min(1, max(0, elapsed / Self.openDuration)))
+    }
+
+    private func width(settled: Double, opened: Double) -> CGFloat {
+        message == nil
+            ? Self.mix(Self.openWidth, Self.restingWidth, settled)
+            : Self.mix(Self.openWidth, Self.spokenWidth, opened)
+    }
+
+    private func height(settled: Double, opened: Double) -> CGFloat {
+        message == nil
+            ? Self.mix(Self.openHeight, Self.restingHeight, settled)
+            : Self.mix(Self.openHeight, Self.spokenHeight, opened)
+    }
+
+    /// A decaying sine, which is what a head shake is: the first swing is the one that
+    /// carries, and the rest is the pill agreeing to stop.
+    static func shakeOffset(at elapsed: Double) -> CGFloat {
+        guard elapsed >= 0, elapsed < shakeDuration else { return 0 }
+        let envelope = exp(-elapsed / decay)
+        return amplitude * CGFloat(envelope * sin(2 * .pi * elapsed / swingPeriod))
+    }
+
+    private static func easeOut(_ value: Double) -> Double {
+        1 - pow(1 - value, 3)
+    }
+
+    private static func easeInOut(_ value: Double) -> Double {
+        value < 0.5
+            ? 4 * value * value * value
+            : 1 - pow(-2 * value + 2, 3) / 2
+    }
+
+    private static func mix(_ from: CGFloat, _ to: CGFloat, _ progress: Double) -> CGFloat {
+        from + (to - from) * CGFloat(progress)
+    }
+
+    private static func mix(_ from: Double, _ to: Double, _ progress: Double) -> Double {
+        from + (to - from) * progress
+    }
 }

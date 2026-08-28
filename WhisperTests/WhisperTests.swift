@@ -618,6 +618,46 @@ import Testing
     }
 }
 
+@Suite struct WordlessFailureTests {
+    @Test func failuresNobodyCanActOnGetTheGestureWithoutTheWords() {
+        // Verbatim from the relay: Gemini took a committed turn and never answered it.
+        #expect(DictationController.failureIsWordless(
+            "Gemini 没有及时返回转写结果（Gemini transcription timed out）"
+        ))
+        // Ours, for this sentence and for one queued behind it.
+        #expect(DictationController.failureIsWordless("等待转写结果超时"))
+        #expect(DictationController.failureIsWordless("等待上一句转写结果超时"))
+        // A tap of the trigger key with nothing said, once it has been translated.
+        #expect(DictationController.failureIsWordless(
+            DictationController.friendlyMessage("input buffer too small for commit")
+        ))
+    }
+
+    @Test func failuresOnlyTheUserCanClearKeepTheirWords() {
+        // Each of these keeps failing the same way until somebody does something, and
+        // the words are the only way to know what.
+        for message in [
+            "还没有设置设备 Token",
+            "API Key 无效或没有权限",
+            "OpenAI 额度不足，去检查账单",
+            "没有麦克风权限",
+            "当前输入框启用了安全输入，无法听写",
+            "麦克风不可用，录音已中断",
+            "转发服务器拒绝了设备凭证（401），请在设置里更新",
+            "当前听写没有可用的网络路由",
+        ] {
+            #expect(!DictationController.failureIsWordless(message), "\(message)")
+        }
+    }
+
+    @Test func aCleanupNoticeIsNeverSilenced() {
+        // It is said once per session and never repeated, and the sentence it is about
+        // was delivered — a silent one would simply never be seen. Even when the reason
+        // it carries is itself a wordless one.
+        #expect(!DictationController.failureIsWordless("整理没生效：录音太短，没有听到内容"))
+    }
+}
+
 // MARK: - Keyboard event chunking
 
 @Suite struct ChunkedUnicodeTests {

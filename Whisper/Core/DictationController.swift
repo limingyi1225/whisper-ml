@@ -36,6 +36,14 @@ final class DictationController {
     private(set) var partialText: String = ""
     private(set) var history: [TranscriptEntry] = []
     private(set) var lastError: String?
+    /// When the failure now on the pill happened, for as long as the pill is marking
+    /// it. The *moment* rather than a flag, for the same reason as `settledAt`: the
+    /// pill's gesture is a timeline, and two failures in a row with the same words
+    /// have to start it twice.
+    private(set) var lastErrorAt: Date?
+    /// Whether that failure is one the user can do nothing about. Those get the
+    /// gesture without the words — see `failureIsWordless`.
+    private(set) var lastErrorIsWordless = false
     private(set) var isHotKeyActive = false
     /// True while the cleanup pass is running, as opposed to merely waiting for the
     /// tail of the transcript. From the outside the two look identical — nothing on
@@ -2211,7 +2219,7 @@ final class DictationController {
         utteranceRoute = nil
         injectionTarget = nil
         utteranceIsRehearsal = false
-        showError(displayMessage)
+        showError(displayMessage, wordless: Self.failureIsWordless(displayMessage))
         let epoch = errorEpoch
 
         // Do not strand a dictation queued behind the one that just failed — but
@@ -2248,8 +2256,10 @@ final class DictationController {
     /// must be set through here (or `handleFailure`) — a bare `phase = .error(...)`
     /// assignment never auto-dismisses, leaving the error pill and the menu-bar
     /// warning icon up until the next key press.
-    private func showError(_ display: String) {
+    private func showError(_ display: String, wordless: Bool = false) {
         lastError = display
+        lastErrorAt = Date()
+        lastErrorIsWordless = wordless
         phase = .error(display)
         errorEpoch += 1
         let epoch = errorEpoch
@@ -2306,6 +2316,37 @@ final class DictationController {
         // A speculative capture died with nothing depending on it; the frozen queue
         // segments are safe, and the next gesture retries the engine from scratch.
         log.warning("capture failed outside an active recording; ignoring")
+    }
+
+    /// Whether a failure has anything worth saying to the person who just spoke.
+    ///
+    /// Some do: a token that was never set, a permission that was never granted, an
+    /// account out of credit. Those keep failing the same way until someone acts, and
+    /// the words are the only way to know what to act on.
+    ///
+    /// These do not. The provider took the audio and never answered it, the transcript
+    /// never arrived, the press was too short to carry a sentence — the only available
+    /// response is to say it again, and reading a line about a service that is already
+    /// fine by the time you finish reading changes nothing. They get the same gesture
+    /// as the others without the words. The sentence itself is not lost: it stays in
+    /// `lastError` and the menu bar shows it for anyone who goes looking.
+    ///
+    /// Takes the display message, so it is matched against the Chinese the user would
+    /// have read rather than whatever the provider happened to send.
+    static func failureIsWordless(_ display: String) -> Bool {
+        // Not a failure of dictation at all — the sentence was delivered, and the
+        // notice is about what did not happen to it afterwards. Never wordless: it
+        // is reported once and only once, so a silent one would never be seen.
+        guard !display.hasPrefix("整理没生效") else { return false }
+        let wordless = [
+            // Relay, when Gemini takes a committed turn and never answers it.
+            "没有及时返回转写结果",
+            // Ours, when a transcript never arrives — for this sentence or the one
+            // this sentence is queued behind.
+            "转写结果超时",
+            "录音太短",
+        ]
+        return wordless.contains { display.localizedCaseInsensitiveContains($0) }
     }
 
     /// The UI is all-Chinese; translate the server errors people actually hit.
