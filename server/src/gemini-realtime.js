@@ -28,8 +28,10 @@ const DEFAULT_BOUNDARY_REORDER_GRACE_MS = 250;
 // Without a bound here the turn hangs until the app's own ~20 s response timeout, which
 // the user sees as the HUD stuck transcribing and the trigger key going dead.
 const DEFAULT_SILENT_TURN_TIMEOUT_MS = 5_000;
-// A turn too short to hold a sentence gets a tighter deadline and a gentler ending.
-// The audio is 24 kHz mono 16-bit PCM, so one millisecond is 48 bytes.
+// A short turn that is also locally quiet gets a tighter deadline and a gentler
+// ending. Duration alone can never establish silence: "好的" and other real commands
+// routinely fit below two seconds. The audio is 24 kHz mono 16-bit PCM, so one
+// millisecond is 48 bytes.
 //
 // Measured over 187 answered turns: the reply lands 288 ms after the commit at the
 // median and 487 ms at p90. Every reply slower than 2.7 s came from a turn carrying
@@ -43,6 +45,36 @@ const DEFAULT_SILENT_TURN_TIMEOUT_MS = 5_000;
 const AUDIO_BYTES_PER_MS = 48;
 const SHORT_TURN_AUDIO_MS = 2_000;
 const DEFAULT_SHORT_TURN_TIMEOUT_MS = 1_800;
+const DEFAULT_SHORT_UNCERTAIN_TURN_TIMEOUT_MS = 3_000;
+// About -54 dBFS. This is deliberately permissive: uncertain room noise is treated as
+// possible speech and takes the ordinary timeout rather than risking a swallowed word.
+// A non-empty provider transcription is independent, conclusive speech evidence.
+const QUIET_TURN_MAX_RMS = 64;
+
+function accumulatePCM16Energy(turn, base64Audio) {
+  const pcm = Buffer.from(base64Audio, "base64");
+  for (let offset = 0; offset + 1 < pcm.length; offset += 2) {
+    const sample = pcm.readInt16LE(offset);
+    turn.audioSquareSum += sample * sample;
+    turn.audioSampleCount += 1;
+  }
+}
+
+function turnAudioRMS(turn) {
+  if (!turn?.audioSampleCount) return 0;
+  return Math.sqrt(turn.audioSquareSum / turn.audioSampleCount);
+}
+
+export function geminiSilentTurnDeadlineMs({
+  audioMs,
+  provenQuiet,
+  quietShortMs = DEFAULT_SHORT_TURN_TIMEOUT_MS,
+  uncertainShortMs = DEFAULT_SHORT_UNCERTAIN_TURN_TIMEOUT_MS,
+  fullMs = DEFAULT_SILENT_TURN_TIMEOUT_MS,
+}) {
+  if (audioMs >= SHORT_TURN_AUDIO_MS) return fullMs;
+  return Math.min(provenQuiet ? quietShortMs : uncertainShortMs, fullMs);
+}
 
 function relayError(message, code, eventID, sessionReplacementRequired = false) {
   const error = { message, type: "relay_error", code };
@@ -126,6 +158,7 @@ export function bridgeGeminiRealtime(
       item: turn.itemID,
       outcome,
       audioBytes: turn.audioBytes,
+      audioRMS: Math.round(turnAudioRMS(turn)),
       ageMs: Math.max(0, Date.now() - turn.openedAt),
       chars,
     });
@@ -220,14 +253,23 @@ export function bridgeGeminiRealtime(
     isolateProvider = false,
     outcome = "completed",
     closeReason = "gemini turn boundary uncertain",
+    fallbackToInterim = false,
   } = {}) => {
     clearTimeout(finalTimer);
     finalTimer = null;
     clearTimeout(silentTurnTimer);
     silentTurnTimer = null;
     if (!turn?.committed || turn.cancelled) return;
-    const transcript = turn.finalParts.join("");
-    reportTurnEnd(outcome, [...transcript].length);
+    const authoritativeTranscript = turn.finalParts.join("");
+    const usedInterimFallback = fallbackToInterim
+      && turn.latestInterimSnapshot !== null;
+    const transcript = usedInterimFallback
+      ? turn.latestInterimSnapshot
+      : authoritativeTranscript;
+    reportTurnEnd(
+      usedInterimFallback ? "partial_fallback" : outcome,
+      [...transcript].length,
+    );
     const completed = turn;
     turn = null;
     sendDownstream({
@@ -248,18 +290,28 @@ export function bridgeGeminiRealtime(
     }
   };
 
-  /// How long this turn may stay silent before it is given up on. See
-  /// `SHORT_TURN_AUDIO_MS` for why a short turn does not wait as long.
+  const turnHasSpeechEvidence = () => turn?.latestInterimSnapshot !== null
+    || turn?.finalParts.some((part) => part.length > 0)
+    || turnAudioRMS(turn) >= QUIET_TURN_MAX_RMS;
+  const turnIsProvenQuietAndShort = () =>
+    (turn?.audioBytes ?? 0) / AUDIO_BYTES_PER_MS < SHORT_TURN_AUDIO_MS
+    && !turnHasSpeechEvidence();
+
+  /// How long this turn may stay silent before it is given up on. Duration changes only
+  /// the wait, never the outcome: a short uncertain turn fails after three seconds,
+  /// while only a short locally quiet turn may complete empty after 1.8 seconds.
   const silentTurnTimeoutMs = () => {
     const full = config.geminiSilentTurnTimeoutMs ?? DEFAULT_SILENT_TURN_TIMEOUT_MS;
-    if (!turnIsTooShortToHoldSpeech()) return full;
-    const short = config.geminiShortTurnTimeoutMs ?? DEFAULT_SHORT_TURN_TIMEOUT_MS;
-    // Never longer than the general deadline: a deployment that shortens the latter
-    // must not find the short path waiting past it.
-    return Math.min(short, full);
+    return geminiSilentTurnDeadlineMs({
+      audioMs: (turn?.audioBytes ?? 0) / AUDIO_BYTES_PER_MS,
+      provenQuiet: turnIsProvenQuietAndShort(),
+      quietShortMs: config.geminiShortTurnTimeoutMs
+        ?? DEFAULT_SHORT_TURN_TIMEOUT_MS,
+      uncertainShortMs: config.geminiShortUncertainTurnTimeoutMs
+        ?? DEFAULT_SHORT_UNCERTAIN_TURN_TIMEOUT_MS,
+      fullMs: full,
+    });
   };
-  const turnIsTooShortToHoldSpeech = () =>
-    (turn?.audioBytes ?? 0) / AUDIO_BYTES_PER_MS < SHORT_TURN_AUDIO_MS;
   /// Bounds a committed turn the provider never answers — re-armed by every frame it
   /// does send, so it measures silence rather than elapsed time. As an absolute
   /// deadline it cut off turns that were still being answered: a long sentence whose
@@ -271,9 +323,21 @@ export function bridgeGeminiRealtime(
     clearTimeout(silentTurnTimer);
     silentTurnTimer = setTimeout(() => {
       if (!turn?.committed || turn.cancelled) return;
-      if (turnIsTooShortToHoldSpeech()) {
-        // Too short to have held a sentence, so the silence is the answer: nothing was
-        // said. `finishTurn` delivers the empty transcript and sets
+      if (turn?.latestInterimSnapshot !== null) {
+        // Gemini heard speech and exposed it to the user, but never finalized it. Keep
+        // that last complete snapshot rather than authoritatively replacing visible
+        // words with an empty completion. The provider session is still retired because
+        // a late final cannot be assigned safely to another turn.
+        finishTurn({
+          isolateProvider: true,
+          fallbackToInterim: true,
+          closeReason: "gemini turn finalized from interim fallback",
+        });
+        return;
+      }
+      if (turnIsProvenQuietAndShort()) {
+        // Short, locally quiet audio with no transcription evidence is an accidental
+        // trigger. `finishTurn` delivers the empty transcript and sets
         // `session_replacement_required` on it, which retires this provider session
         // exactly as the error did — the app is told to reconnect, not that it failed.
         // Reporting this as an error made every accidental tap of the trigger key cost
@@ -285,10 +349,10 @@ export function bridgeGeminiRealtime(
         });
         return;
       }
-      // A turn that carried real speech and went unanswered is a fault, and an empty
-      // completion would also make the app reuse this provider session even though its
-      // result may merely be late. Fail it explicitly and close the transport; the next
-      // utterance must use a fresh Gemini session.
+      // Anything not proven to be a short quiet tap may contain speech, and an empty
+      // completion would make the app erase or orphan what it already displayed. Fail
+      // it explicitly and close the transport; the next utterance must use a fresh
+      // Gemini session.
       sendDownstream({
         type: "error",
         error: {
@@ -303,16 +367,21 @@ export function bridgeGeminiRealtime(
     }, silentTurnTimeoutMs());
     silentTurnTimer.unref?.();
   };
-  const scheduleTurnFinish = ({ isolateProvider, delayMs }) => {
+  const scheduleTurnFinish = ({
+    isolateProvider,
+    delayMs,
+    fallbackToInterim = false,
+  }) => {
     clearTimeout(finalTimer);
     finalTimer = setTimeout(
-      () => finishTurn({ isolateProvider }),
+      () => finishTurn({ isolateProvider, fallbackToInterim }),
       delayMs,
     );
   };
   const scheduleFallbackFinish = () => scheduleTurnFinish({
     isolateProvider: true,
     delayMs: config.geminiFinalFallbackDelayMs ?? DEFAULT_FINAL_FALLBACK_DELAY_MS,
+    fallbackToInterim: true,
   });
   const scheduleProviderBoundaryFinish = () => {
     if (!turn) return;
@@ -320,6 +389,7 @@ export function bridgeGeminiRealtime(
     scheduleTurnFinish({
       isolateProvider: false,
       delayMs: config.geminiBoundaryReorderGraceMs ?? DEFAULT_BOUNDARY_REORDER_GRACE_MS,
+      fallbackToInterim: true,
     });
   };
   const scheduleLocalEmptyFinish = () => scheduleTurnFinish({
@@ -334,8 +404,11 @@ export function bridgeGeminiRealtime(
       committed: false,
       cancelled: false,
       finalParts: [],
+      latestInterimSnapshot: null,
       lastEventID: eventID,
       audioBytes: 0,
+      audioSquareSum: 0,
+      audioSampleCount: 0,
       openedAt: Date.now(),
       reported: false,
       responseBoundarySeen: false,
@@ -420,6 +493,7 @@ export function bridgeGeminiRealtime(
         sendUpstream(geminiRealtimeInput({ activityStart: {} }));
       }
       turn.audioBytes += audioBytes;
+      accumulatePCM16Energy(turn, event.audio);
       turn.lastEventID = event.event_id;
       sendUpstream(geminiRealtimeInput({
         audio: { data: event.audio, mimeType: "audio/pcm;rate=24000" },
@@ -549,8 +623,9 @@ export function bridgeGeminiRealtime(
     if (!content || !turn || turn.cancelled) return;
     const responseComplete = content.turnComplete === true
       || content.generationComplete === true;
-    // Evidence that this turn is being answered. Interim counts: it is the only signal
-    // a long sentence gives before its first final segment arrives.
+    // A response boundary stops the no-response watchdog immediately. Other frames
+    // re-arm it only after their transcription evidence has been recorded below, so a
+    // short spoken turn gets the ordinary deadline rather than the quiet-tap deadline.
     if (turn.committed) {
       if (responseComplete) {
         // The provider answered and declared its response boundary. From here the
@@ -559,8 +634,6 @@ export function bridgeGeminiRealtime(
         clearTimeout(silentTurnTimer);
         silentTurnTimer = null;
         turn.responseBoundarySeen = true;
-      } else {
-        armSilentTurnTimeout();
       }
     }
     const interim = content.interimInputTranscription?.text;
@@ -569,6 +642,7 @@ export function bridgeGeminiRealtime(
       // suffix after those finalized segments, while the app callback is explicitly a
       // complete utterance snapshot. Preserve the immutable prefix on the wire.
       const snapshot = turn.finalParts.join("") + interim;
+      turn.latestInterimSnapshot = snapshot;
       sendDownstream({
         type: "whisper.input_audio_transcription.partial",
         item_id: turn.itemID,
@@ -591,11 +665,15 @@ export function bridgeGeminiRealtime(
     const finalText = content.inputTranscription?.text;
     if (typeof finalText === "string") {
       turn.finalParts.push(finalText);
+      // A final segment supersedes the mutable interim suffix. A later interim will
+      // rebuild the whole snapshot from this now-authoritative prefix.
+      turn.latestInterimSnapshot = null;
       if (turn.responseBoundarySeen) scheduleProviderBoundaryFinish();
       else scheduleFallbackFinish();
     } else if (responseComplete) {
       scheduleProviderBoundaryFinish();
     }
+    if (turn?.committed && !responseComplete) armSilentTurnTimeout();
   });
 
   upstream.on("unexpected-response", (_request, response) => {

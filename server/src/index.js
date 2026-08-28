@@ -364,6 +364,7 @@ server.on("upgrade", (request, socket, head) => {
           + (record.event === "end"
             ? ` outcome=${record.outcome}`
               + ` audio_bytes=${record.audioBytes}`
+              + ` audio_rms=${record.audioRMS}`
               + ` age_ms=${record.ageMs}`
               + ` chars=${record.chars}`
             : "")

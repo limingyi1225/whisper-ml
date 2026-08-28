@@ -1460,6 +1460,29 @@ import Testing
         #expect(DictationController.pointerInputStayedUnchanged(since: nil, now: frozen))
     }
 
+    @Test func destructiveWriteRequiresEveryPostAXInputCheck() {
+        #expect(DictationController.destructiveWriteStillAuthorized(
+            anchorUnchanged: true,
+            inputSinceAXWorkUnchanged: true,
+            pointerSinceUtteranceUnchanged: true
+        ))
+        #expect(!DictationController.destructiveWriteStillAuthorized(
+            anchorUnchanged: false,
+            inputSinceAXWorkUnchanged: true,
+            pointerSinceUtteranceUnchanged: true
+        ))
+        #expect(!DictationController.destructiveWriteStillAuthorized(
+            anchorUnchanged: true,
+            inputSinceAXWorkUnchanged: false,
+            pointerSinceUtteranceUnchanged: true
+        ))
+        #expect(!DictationController.destructiveWriteStillAuthorized(
+            anchorUnchanged: true,
+            inputSinceAXWorkUnchanged: true,
+            pointerSinceUtteranceUnchanged: false
+        ))
+    }
+
     @Test func repeatedSuffixCannotStandInForTheOriginalInsertionPosition() {
         let original = CFRange(location: 10, length: 0)
         #expect(TextInjector.selectionMatches(

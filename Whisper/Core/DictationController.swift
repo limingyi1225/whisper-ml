@@ -225,6 +225,27 @@ final class DictationController {
         return frozen.pointerOnly == current.pointerOnly
     }
 
+    /// The last look before a backspace goes out, and the only one taken after every
+    /// blocking call above it has returned.
+    ///
+    /// An AX query can block for its full 200 ms messaging timeout, and a click or a key
+    /// that lands inside that wait is invisible to any verdict taken before it. Both
+    /// destructive paths used to decide on evidence gathered before their final AX call:
+    /// the interim revision computed `hardwareInputUnchanged` above a guard that then
+    /// made another AX call inside an autoclosure, and the final rewrite re-read the
+    /// document but never the input.
+    ///
+    /// Nothing this app posts happens between the two readings, so unlike the epoch kept
+    /// across an utterance this one can compare the keyboard counters too — which is
+    /// what catches a ⇥ or ⌘F moving focus inside the target app during the wait.
+    static func destructiveWriteStillAuthorized(
+        anchorUnchanged: Bool,
+        inputSinceAXWorkUnchanged: Bool,
+        pointerSinceUtteranceUnchanged: Bool
+    ) -> Bool {
+        anchorUnchanged && inputSinceAXWorkUnchanged && pointerSinceUtteranceUnchanged
+    }
+
     struct QueuedGestureIdentity {
         let anchor: InjectionAnchor?
         let target: TextInjectionTarget?
@@ -644,6 +665,28 @@ final class DictationController {
     private func freezeQueuedGestureIdentity() {
         guard queuedGestureIdentity == nil else { return }
         queuedGestureIdentity = captureCurrentGestureIdentity()
+    }
+
+    /// Gathers the three terms `destructiveWriteStillAuthorized` weighs. Every read here
+    /// is cheap: counters and the frontmost app, no cross-process AX messaging.
+    private func destructiveWriteIsStillAuthorized(
+        epochBeforeAXWork: LiveInjectionInputEpoch
+    ) -> Bool {
+        // Read the anchor first and the system counters last. If input lands between the
+        // two cheap reads, the independent counter is the one most likely to see it.
+        let anchorUnchanged = injectionAnchor != nil && injectionAnchor == currentAnchor()
+        let now = Self.currentLiveInjectionInputEpoch()
+        return Self.destructiveWriteStillAuthorized(
+            anchorUnchanged: anchorUnchanged,
+            inputSinceAXWorkUnchanged: Self.liveInjectionInputStayedUnchanged(
+                before: epochBeforeAXWork,
+                after: now
+            ),
+            pointerSinceUtteranceUnchanged: Self.pointerInputStayedUnchanged(
+                since: injectionPointerEpoch,
+                now: now
+            )
+        )
     }
 
     /// Snapshot of where synthetic text is currently going.
@@ -1383,18 +1426,12 @@ final class DictationController {
                     TextInjector.matchesInjectedTextAtOriginalSelection(injectedText, target: $0)
                 } ?? false
                 : false
-            // The epoch to compare against is the one taken before this turn's blocking
-            // AX work, when there was any. A turn that made no such call — an opaque
-            // field past its probe cap — has no window to re-verify, and reading the
-            // counters now makes that explicit rather than failing closed on a gap that
-            // does not exist. Foreign input across the whole utterance is the anchor's
-            // job, and the anchor is checked immediately below.
-            let epochBeforeProofs = inputEpochBeforeBlockingAXQuery
+            // The baseline for the input re-check is the reading taken before this
+            // turn's blocking AX work, when there was any. A turn that made no such call
+            // has no window to re-verify, and reading the counters now makes that
+            // explicit rather than failing closed on a gap that does not exist.
+            let epochBeforeAXWork = inputEpochBeforeBlockingAXQuery
                 ?? Self.currentLiveInjectionInputEpoch()
-            let hardwareInputUnchanged = Self.liveInjectionInputStayedUnchanged(
-                before: epochBeforeProofs,
-                after: Self.currentLiveInjectionInputEpoch()
-            )
             guard Self.interimRevisionMayDelete(
                 fieldPublishesTextRange: provableTarget != nil,
                 firstOwnershipProof: firstOwnershipProof,
@@ -1403,11 +1440,15 @@ final class DictationController {
                     TextInjector.focusedElementMatches($0.element)
                 }
             ), Permissions.hasAccessibility,
-               !Permissions.isSecureInputEnabled,
-               injectionAnchor == currentAnchor(),
-               hardwareInputUnchanged else {
+               !Permissions.isSecureInputEnabled else {
                 injectionAbandoned = true
                 log.warning("the document cannot prove the interim text before the caret; stopping live injection")
+                return
+            }
+            // Last, because the guard above can block inside its own autoclosure.
+            guard destructiveWriteIsStillAuthorized(epochBeforeAXWork: epochBeforeAXWork) else {
+                injectionAbandoned = true
+                log.warning("input arrived while the interim delete was being authorized; stopping live injection")
                 return
             }
             TextInjector.deleteBackward(count: deleteCount)
@@ -2025,6 +2066,7 @@ final class DictationController {
             // (programmatic, or a click — no foreign keystroke involved), so deletion
             // needs positive evidence about the exact text at its original insertion
             // point; element identity alone cannot authorize destructive key events.
+            let epochBeforeAXWork = Self.currentLiveInjectionInputEpoch()
             let hasOriginalSelectionProof = injectionTarget?.selection != nil
             let typedTextProof: Bool? = hasOriginalSelectionProof
                 ? injectionTarget.map {
@@ -2069,6 +2111,11 @@ final class DictationController {
                 }
             ) else {
                 log.warning("focus moved while the document was being read; copying corrected transcript")
+                TextInjector.copyToClipboard(final)
+                return
+            }
+            guard destructiveWriteIsStillAuthorized(epochBeforeAXWork: epochBeforeAXWork) else {
+                log.warning("input arrived while the final delete was being authorized; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
             }
