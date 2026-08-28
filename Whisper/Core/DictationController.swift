@@ -1304,7 +1304,10 @@ final class DictationController {
                 // in one edit at release. Abandoning here would forfeit that and hand
                 // the user a clipboard instead.
                 liveInjectionSuppressed = true
-                log.info("interim revision cannot be proven in an opaque field; leaving the rest to the final")
+                // Also `notice`: this is the other half of the same measurement — how
+                // often an opaque field's live typing stops early because the model
+                // revised text it had already put on screen.
+                log.notice("interim revision cannot be proven in an opaque field; leaving the rest to the final")
                 return
             }
             // Verify ownership at the original selection, not merely an equal suffix.
@@ -1929,7 +1932,15 @@ final class DictationController {
         let shared = Self.commonPrefixLength(typed, final)
         let deleteCount = typed.count - shared
         let addition = String(Array(final)[shared...])
-        log.info("rewriting from char \(shared): -\(deleteCount) +\(addition.count)")
+        // `notice`, not `info`: this is the one line that settles whether the blind
+        // delete an opaque field permits is actually needed, and `info` lives in a
+        // memory ring buffer that `log show` loses within hours. `opaque` marks the
+        // field that had no capturable identity — the case where `deleteCount > 0`
+        // means backspacing on the anchor alone. If that stays rare, the cheaper
+        // append-only rule would have done; if it is the norm, refusing the delete
+        // would send most sentences to the clipboard.
+        let opaqueField = injectionTarget == nil
+        log.notice("rewriting from char \(shared): -\(deleteCount) +\(addition.count) opaque=\(opaqueField)")
 
         if deleteCount > 0 {
             // The PID-level anchor above cannot see a focus move *within* the app
