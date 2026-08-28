@@ -9,6 +9,25 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.16</title>
+            <pubDate>Fri, 28 Aug 2026 14:02:56 -0400</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.16</link>
+            <sparkle:version>17</sparkle:version>
+            <sparkle:shortVersionString>1.16</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[听不成的那一句，改成摇一下头。
+
+以前不管哪种失败，胶囊都撑开成一条 230 点宽的字。有些失败配得上那行字——设备 Token 没设、没有麦克风权限、额度用完了——不读那行字就不知道该去动什么，它们也会一直用同样的方式失败下去，直到有人去动。
+
+有些配不上。Gemini 收下了这句音频却始终没有回答，转写结果一直没有来，按得太短装不下一句话：这几种你唯一能做的就是再说一遍，而等你读完那行字，那个服务通常已经好了。
+
+现在它们只摇一下头，回到平时那条静止线，一个字也不留。要你处理的那些照旧把原文举起来，也跟着摇一下——同一个动作的两档：摇头是「这句没成」，带不带字是「要不要你动手」。
+
+被省下的那句话没有丢，菜单栏那几秒仍然照常写着原因。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.16/Whisper-1.16-17.dmg" length="3321741" type="application/octet-stream" sparkle:edSignature="wSiePKcOEjoAw5JFJWiw1o7gxDTOqjDmhEAX6Jkp+ZHbACvnz5XM30/EpJNqG32KjLaacJVSmf1lOgRA2np7Bg=="/>
+        </item>
+        <item>
             <title>1.15</title>
             <pubDate>Fri, 28 Aug 2026 11:06:09 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.15</link>
@@ -183,6 +202,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: XTwQPrjUPyaKuxD8tPGAi9S2qySIZWp9sxxUiLNSoEzWyRBTaURR5GzQWZT9jt9ket8eL8bFTDXTSpZ9zWpdBw==
-length: 14691
+edSignature: iN/rb3dbataf1xzJnnRU7oJKTLWhYW4UAodPoGJCQtNv/K31+eDxQTpVvEGIHmgV9Jbq4AF03iYVjfCM1l/DDg==
+length: 16378
 -->
