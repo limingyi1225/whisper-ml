@@ -838,16 +838,6 @@ import Testing
             == ["Kevin", "李铭一", "Anthropic"])
     }
 
-    @Test func theSeedIsAnOfferOnceNotAStandingRule() {
-        // A fresh install still gets the name typed for it.
-        #expect(AppSettings.vocabularySeeded(into: "") == "李铭一")
-        // An install that already lists it gains nothing — no second copy, and no
-        // rewrite of a box that the parser would have edited on the way through.
-        #expect(AppSettings.vocabularySeeded(into: "李铭一\nGavi") == nil)
-        let essay = String(repeating: "词", count: AppSettings.vocabularyTermLengthLimit + 1)
-        #expect(AppSettings.vocabularySeeded(into: "Gavi\n\(essay)") == "Gavi\n\(essay)\n李铭一")
-    }
-
     @Test func termsThatWouldBeRejectedUpstreamNeverLeave() {
         // This list is now part of the Realtime session config, so an unacceptable term
         // does not cost one word — it fails `session.update` and takes dictation down

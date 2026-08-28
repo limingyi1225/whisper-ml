@@ -111,20 +111,14 @@ final class AppSettings: DictationSettingsProviding {
     /// now rather than the primary — see `RealtimeClient.sendSessionUpdate` — and it
     /// stays because bias is not a guarantee.
     ///
-    /// This box is the whole list. Nothing is added behind it, because biasing has a
-    /// cost the user has to be able to pay back: `customVocabulary` raises a term's
-    /// prior, so a noisy or clipped stretch of audio that merely sounds close gets
-    /// pulled onto it, and neither Gemini nor OpenAI exposes a strength knob to soften
-    /// that. A term the user can see is a term they can delete when it starts firing
-    /// on words they never said; a hidden one leaves them editing a box that is not
-    /// the thing misbehaving.
+    /// This box is the whole list — nothing rides behind it, and the app never writes
+    /// into it on its own initiative. Biasing is not free: `customVocabulary` raises a
+    /// term's prior, so a noisy or clipped stretch of audio that merely sounds close
+    /// gets pulled onto it, and neither Gemini nor OpenAI exposes a strength knob to
+    /// soften that. Only a term the user typed is worth that cost, and only a term they
+    /// can see is one they can delete once it starts firing on words nobody said. An
+    /// empty box biases nothing.
     var vocabulary: String { didSet { store.set(vocabulary, forKey: Key.vocabulary) } }
-
-    /// Seeded into the box once, not forced on every launch — see
-    /// `seedVocabularyIfNeeded`. Nobody thinks to add the spelling of their own name
-    /// until they have already seen it come out wrong a dozen times, so the first
-    /// launch supplies it; from then on it is an ordinary line like any other.
-    static let seededVocabulary = ["李铭一"]
 
     /// The vocabulary as the transcription session and the cleanup pass see it.
     var vocabularyTerms: [String] { Self.parseVocabulary(vocabulary) }
@@ -172,7 +166,6 @@ final class AppSettings: DictationSettingsProviding {
         static let transcriptionModel = "transcriptionModel"
         static let polishEnabled = "polishEnabled"
         static let adoptedGeminiDefault = "adoptedGeminiDefault"
-        static let seededVocabulary = "seededVocabulary"
         static let stripTrailingPeriod = "stripTrailingPeriod"
         static let vocabulary = "vocabulary"
     }
@@ -188,32 +181,6 @@ final class AppSettings: DictationSettingsProviding {
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
         vocabulary = store.string(forKey: Key.vocabulary) ?? ""
         adoptGeminiDefaultIfNeeded()
-        seedVocabularyIfNeeded()
-    }
-
-    /// Moves the formerly built-in names into the box, once. An install that already
-    /// lists a seeded name keeps its own line rather than gaining a second copy, and
-    /// an install that deletes one afterwards stays deleted — that is the entire point
-    /// of the move, so the flag is written whether or not anything was appended.
-    ///
-    private func seedVocabularyIfNeeded() {
-        guard !store.bool(forKey: Key.seededVocabulary) else { return }
-        store.set(true, forKey: Key.seededVocabulary)
-        guard let seeded = Self.vocabularySeeded(into: vocabulary) else { return }
-        vocabulary = seeded
-    }
-
-    /// The box with the seeded names appended, or `nil` when it already covers them.
-    ///
-    /// Appends to the stored text rather than rewriting it from `parseVocabulary`:
-    /// re-serialising the parsed list would quietly delete any line the parser rejects,
-    /// and a launch that was only supposed to add a name is the wrong moment to throw
-    /// away something the user typed.
-    static func vocabularySeeded(into raw: String) -> String? {
-        let existing = parseVocabulary(raw)
-        let missing = seededVocabulary.filter { !existing.contains($0) }
-        guard !missing.isEmpty else { return nil }
-        return ([raw] + missing).filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     /// One intentional migration: an existing install moves to Gemini once, but
