@@ -93,10 +93,12 @@ import Testing
         #expect(TextInjector.checkedAXElement(from: application) != nil)
     }
 
-    /// Live typing is optional, while targeting the wrong same-app control leaks speech.
-    /// Missing exact-field evidence therefore falls back to final paste.
-    @Test func liveDeltasRequirePositiveExactFieldProof() {
-        #expect(!DictationController.canContinueLiveInjection(
+    /// Targeting the wrong same-app control leaks speech, so an element the system
+    /// names *instead of* ours stops live typing. Naming nothing at all is not that
+    /// claim: whole classes of editors never publish a focused element, and refusing
+    /// them bought no safety the anchor was not already providing.
+    @Test func onlyAContradictedFieldStopsLiveDeltas() {
+        #expect(DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: nil
         ))
@@ -287,9 +289,13 @@ import Testing
         ))
     }
 
-    /// Focus identity cannot prove which text Backspace will consume. Only a positive
-    /// document read can authorize a destructive rewrite.
-    @Test func aRewriteDeletesOnlyWithPositiveTextProof() {
+    /// Focus identity cannot prove which text Backspace will consume, so a document
+    /// that answers at all outranks it in both directions — including the `false` that
+    /// catches an app which transformed our keystrokes. Only when the control publishes
+    /// no range does the element term decide, and there its own silence is not denial:
+    /// refusing would leave the uncorrected live text on screen and strand the corrected
+    /// sentence on the clipboard. The count deleted never exceeds what we typed.
+    @Test func aRewriteDeletesOnTextProofOrUncontradictedIdentity() {
         for element in [nil, true, false] as [Bool?] {
             #expect(!DictationController.rewriteMayDelete(
                 typedTextStillBeforeCaret: false,
@@ -299,11 +305,19 @@ import Testing
                 typedTextStillBeforeCaret: true,
                 sameElementStillFocused: element
             ))
-            #expect(!DictationController.rewriteMayDelete(
-                typedTextStillBeforeCaret: nil,
-                sameElementStillFocused: element
-            ))
         }
+        #expect(DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: nil
+        ))
+        #expect(DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: true
+        ))
+        #expect(!DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: false
+        ))
     }
 
     /// A stale first proof must not survive an inconclusive second read immediately
@@ -320,15 +334,17 @@ import Testing
         #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: true, recheckedTextProof: false, sameElementStillFocused: true
         ))
-        #expect(!DictationController.rewriteMayStillDelete(
+        // A control with no range answers nil twice, and is not asked a third time.
+        #expect(DictationController.rewriteMayStillDelete(
             firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: nil
         ))
         #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: nil, recheckedTextProof: nil, sameElementStillFocused: false
         ))
 
-        // The element term is never evaluated: it cannot strengthen text ownership and
-        // costs a blocking cross-process message on the main run loop.
+        // With a text proof in hand the element term is never evaluated: it cannot
+        // strengthen text ownership and costs a blocking cross-process message on the
+        // main run loop.
         var elementReads = 0
         _ = DictationController.rewriteMayStillDelete(
             firstTextProof: true,

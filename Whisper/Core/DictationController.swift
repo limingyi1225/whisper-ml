@@ -333,10 +333,13 @@ final class DictationController {
         anchorUnchanged: Bool,
         exactElementFocused: Bool?
     ) -> Bool {
-        // Live typing is optional and can expose spoken text to the wrong control.
-        // Absence of exact element evidence therefore fails closed; the final result
-        // still uses the clipboard/paste recovery path.
-        anchorUnchanged && exactElementFocused == true
+        // `nil` is the system naming nothing, not a statement that focus moved. Whole
+        // classes of editors — WeChat's message box among them — never publish a
+        // system-wide focused element, and failing closed on that silence disabled live
+        // typing in them entirely. The anchor is the guard that actually tracks focus:
+        // it carries the frontmost PID and the timestamp of the last foreign key or
+        // click, so every way the user moves focus themselves is already caught here.
+        anchorUnchanged && exactElementFocused != false
     }
 
     enum LiveInjectionFieldDisposition: Equatable {
@@ -345,12 +348,27 @@ final class DictationController {
         case abandonTarget
     }
 
+    /// Silence and a downgraded verdict both arrive here as `nil`, and they are not the
+    /// same claim. A control that never publishes identity is not evidence of anything,
+    /// and treating that as refusal cost live typing in every opaque editor — WeChat's
+    /// message box among them. A control that *did* answer, and whose answer the caller
+    /// then softened — an explicit mismatch it declined to trust, or a candidate found
+    /// this turn that has not been confirmed yet — is a real open question, and waiting
+    /// for the next partial costs only latency. `identityAwaitingConfirmation` is how
+    /// the caller says which one it is.
+    ///
+    /// The residual risk the silent case accepts is the one `canContinueLiveInjection`
+    /// documents: an app that moves focus between its own controls with no key and no
+    /// click. Nothing else reaches here with the anchor still unchanged.
     static func liveInjectionFieldDisposition(
         anchorUnchanged: Bool,
-        exactElementFocused: Bool?
+        exactElementFocused: Bool?,
+        identityAwaitingConfirmation: Bool
     ) -> LiveInjectionFieldDisposition {
         guard anchorUnchanged else { return .abandonTarget }
-        guard let exactElementFocused else { return .deferToFinalPaste }
+        guard let exactElementFocused else {
+            return identityAwaitingConfirmation ? .deferToFinalPaste : .continueTyping
+        }
         return exactElementFocused ? .continueTyping : .abandonTarget
     }
 
@@ -448,28 +466,46 @@ final class DictationController {
 
     /// Whether the destructive half of a cleanup rewrite may post its backspaces.
     ///
-    /// Backspace is destructive, so only positive proof that the exact text is still
-    /// at the captured insertion point can authorize it. Element identity alone is not
-    /// enough: a focus move can race between that read and the key event, and an opaque
-    /// editor gives us no way to prove what those backspaces would consume.
+    /// Backspace is destructive, so a control that *can* answer must answer positively:
+    /// an app that transformed our keystrokes (smart quotes, autocorrect, IME
+    /// composition) would otherwise have its own text eaten by a backspace count
+    /// computed from ours.
     ///
-    /// The legacy element term remains an autoclosure so callers do not pay for a
-    /// blocking cross-process AX query that cannot strengthen the text proof.
+    /// A control that publishes no text range at all answers `nil`, and refusing on that
+    /// does not protect anything — it strands the corrected sentence on the clipboard
+    /// while leaving the uncorrected live text on screen, which is what the whole
+    /// feature looks like when it is broken. There the anchor and the element term are
+    /// the protection, and `nil` from the element term is silence, not denial. The
+    /// deletion is bounded either way: the count never exceeds what this utterance
+    /// itself typed.
+    ///
+    /// The element term is an autoclosure because obtaining it costs a blocking
+    /// cross-process AX message on the main run loop, and whenever the text answered at
+    /// all it cannot change the outcome.
     static func rewriteMayDelete(
         typedTextStillBeforeCaret: Bool?,
-        sameElementStillFocused _: @autoclosure () -> Bool?
+        sameElementStillFocused: @autoclosure () -> Bool?
     ) -> Bool {
-        typedTextStillBeforeCaret == true
+        if let typedTextStillBeforeCaret { return typedTextStillBeforeCaret }
+        return sameElementStillFocused() != false
     }
 
-    /// Both reads must positively agree. A timeout on the second look is uncertainty,
-    /// not permission to act on a potentially stale first proof.
+    /// The re-read taken immediately before the destructive key events.
+    ///
+    /// A control that answered the first time must answer positively again: a timeout
+    /// there is uncertainty, not permission to act on a proof that may already be stale.
+    /// A control that answered nothing both times was never going to, and falls back to
+    /// the same element term `rewriteMayDelete` uses — otherwise the opaque case would
+    /// pass the first guard and fail this one, which is no different from refusing it.
     static func rewriteMayStillDelete(
         firstTextProof: Bool?,
         recheckedTextProof: Bool?,
-        sameElementStillFocused _: @autoclosure () -> Bool?
+        sameElementStillFocused: @autoclosure () -> Bool?
     ) -> Bool {
-        firstTextProof == true && recheckedTextProof == true
+        if firstTextProof == nil, recheckedTextProof == nil {
+            return sameElementStillFocused() != false
+        }
+        return firstTextProof == true && recheckedTextProof == true
     }
 
     /// Interim hypotheses are allowed to revise text while the user is still speaking,
@@ -485,11 +521,16 @@ final class DictationController {
         firstOwnershipProof && recheckedOwnershipProof
     }
 
-    /// App identity is insufficient for a final suffix: focus can move between two
-    /// controls in one process without producing a foreign input event. Only positive
-    /// ownership of the field that received the partial text permits another write.
+    /// A field that can be proven must prove itself before a final suffix: focus can
+    /// move between two controls in one process without producing a foreign input
+    /// event, and `false` here names exactly that.
+    ///
+    /// `nil` means no field was ever captured, because the target publishes no
+    /// system-wide focused element. Refusing there sends a sentence the app would have
+    /// accepted to the clipboard instead, for the same silence that already permitted
+    /// the live typing this suffix completes.
     static func finalAdditionMayType(originalFieldOwnershipProof: Bool?) -> Bool {
-        originalFieldOwnershipProof == true
+        originalFieldOwnershipProof != false
     }
 
     /// Ownership, not the previous utterance's presentation phase, decides whether a
@@ -1082,6 +1123,7 @@ final class DictationController {
         var performedStagedConfirmation = false
         var recoveredCandidateToStage: TextInjectionTarget?
         var stagedCandidateToAdopt: TextInjectionTarget?
+        var identityAwaitingConfirmation = false
 
         if let existingTarget = injectionTarget {
             // Once an utterance has captured a field, never replace that identity merely
@@ -1173,6 +1215,7 @@ final class DictationController {
             // back into uncertainty and, if the cap permits, look again later.
             pendingLiveInjectionTarget = nil
             exactElementFocused = nil
+            identityAwaitingConfirmation = true
             liveInjectionRetryNotBeforeUptime = Self.liveInjectionRetryDeadline(
                 afterProbeAt: ProcessInfo.processInfo.systemUptime
             )
@@ -1188,6 +1231,7 @@ final class DictationController {
             // A successful discovery is not yet authority to type. Turn it back into
             // an inconclusive result until a later partial confirms the same element.
             exactElementFocused = nil
+            identityAwaitingConfirmation = true
             liveInjectionRetryNotBeforeUptime = Self.liveInjectionRetryDeadline(
                 afterProbeAt: ProcessInfo.processInfo.systemUptime
             )
@@ -1209,15 +1253,16 @@ final class DictationController {
         }
         switch Self.liveInjectionFieldDisposition(
             anchorUnchanged: true,
-            exactElementFocused: exactElementFocused
+            exactElementFocused: exactElementFocused,
+            identityAwaitingConfirmation: identityAwaitingConfirmation
         ) {
         case .continueTyping:
             break
         case .deferToFinalPaste:
             if injectedText.isEmpty {
-                // Absence is uncertainty, not disproof. A later partial may retry after
-                // the cooldown; a persistently opaque editor still reaches final paste.
-                log.info("the target exposes no exact field identity yet; deferring this partial")
+                // A field identity is in question, not absent. The next partial resolves
+                // it; skipping this one costs latency and nothing else.
+                log.info("the target's field identity is not yet confirmed; deferring this partial")
             } else {
                 // Once text exists, a later recapture could bless another same-app field.
                 // Stop live mutation permanently for this sentence and let final
@@ -1245,10 +1290,21 @@ final class DictationController {
         if deleteCount > 0 {
             guard Permissions.hasAccessibility,
                   !Permissions.isSecureInputEnabled,
-                  injectionAnchor.processIdentifier != nil,
-                  let injectionTarget else {
+                  injectionAnchor.processIdentifier != nil else {
                 injectionAbandoned = true
                 log.warning("interim revision has no safe text-inspection path; stopping live injection")
+                return
+            }
+            guard let injectionTarget else {
+                // A target that publishes no field identity can be typed into but not
+                // proof-checked, and a mid-sentence backspace is the one live mutation
+                // that needs a proof. Stop mutating rather than abandoning: the text
+                // already on screen stays owned by this utterance, and the final
+                // reconciliation — which re-verifies the app anchor itself — repairs it
+                // in one edit at release. Abandoning here would forfeit that and hand
+                // the user a clipboard instead.
+                liveInjectionSuppressed = true
+                log.info("interim revision cannot be proven in an opaque field; leaving the rest to the final")
                 return
             }
             // Verify ownership at the original selection, not merely an equal suffix.
@@ -1937,7 +1993,11 @@ final class DictationController {
                         target: target
                     )
                 }
-                return TextInjector.focusedElementMatches(target.element) == true
+                // `!= false`, not `== true`: this control published no range, so the
+                // element read is all there is, and collapsing its silence into a denial
+                // would refuse a suffix for a slow AX reply. An explicit mismatch still
+                // refuses. See `finalAdditionMayType`.
+                return TextInjector.focusedElementMatches(target.element) != false
             }
             guard Self.finalAdditionMayType(
                 originalFieldOwnershipProof: ownershipProof

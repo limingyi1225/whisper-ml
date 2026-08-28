@@ -1403,50 +1403,66 @@ import Testing
         ))
     }
 
-    @Test func liveTypingRequiresPositiveExactFieldEvidence() {
+    @Test func silentFieldIdentityStillTypesButAContradictedOneDoesNot() {
+        // WeChat's message box publishes no system-wide focused element. Reading that
+        // silence as refusal disabled live typing there outright, while the anchor —
+        // frontmost PID plus the last foreign key or click — was unmoved throughout.
+        #expect(DictationController.canContinueLiveInjection(
+            anchorUnchanged: true,
+            exactElementFocused: nil
+        ))
         #expect(DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: true
         ))
-        #expect(!DictationController.canContinueLiveInjection(
-            anchorUnchanged: true,
-            exactElementFocused: nil
-        ))
+        // An explicit `false` is the system naming some other element. That still stops.
         #expect(!DictationController.canContinueLiveInjection(
             anchorUnchanged: true,
             exactElementFocused: false
         ))
         #expect(DictationController.liveInjectionFieldDisposition(
             anchorUnchanged: true,
-            exactElementFocused: nil
+            exactElementFocused: nil,
+            identityAwaitingConfirmation: false
+        ) == .continueTyping)
+        // The same `nil` means something else when the caller downgraded a real answer:
+        // a mismatch it declined to trust, or a candidate discovered this turn. That is
+        // an open question, and the next partial settles it.
+        #expect(DictationController.liveInjectionFieldDisposition(
+            anchorUnchanged: true,
+            exactElementFocused: nil,
+            identityAwaitingConfirmation: true
         ) == .deferToFinalPaste)
         #expect(DictationController.liveInjectionFieldDisposition(
             anchorUnchanged: true,
-            exactElementFocused: false
+            exactElementFocused: false,
+            identityAwaitingConfirmation: false
         ) == .abandonTarget)
+        // The anchor is the one input with no third state, and it still governs.
         #expect(DictationController.liveInjectionFieldDisposition(
             anchorUnchanged: false,
-            exactElementFocused: nil
+            exactElementFocused: nil,
+            identityAwaitingConfirmation: false
         ) == .abandonTarget)
     }
 
-    @Test func finalSuffixTypingRequiresPositiveOriginalFieldOwnership() {
+    @Test func finalSuffixTypingRefusesOnlyAContradictedField() {
         #expect(DictationController.finalAdditionMayType(
             originalFieldOwnershipProof: true
         ))
         #expect(!DictationController.finalAdditionMayType(
             originalFieldOwnershipProof: false
         ))
-        #expect(!DictationController.finalAdditionMayType(
+        // No field was ever captured, because the target publishes none. The same
+        // silence already permitted the live typing this suffix completes; refusing
+        // here would send an accepted sentence to the clipboard instead.
+        #expect(DictationController.finalAdditionMayType(
             originalFieldOwnershipProof: nil
         ))
     }
 
-    @Test func finalBackspaceRequiresTwoPositiveDocumentProofs() {
-        #expect(!DictationController.rewriteMayDelete(
-            typedTextStillBeforeCaret: nil,
-            sameElementStillFocused: nil
-        ))
+    @Test func finalBackspaceRequiresTwoPositiveDocumentProofsWhenTheFieldHasThem() {
+        // A control that answers must keep answering: a slow second read is uncertainty.
         #expect(!DictationController.rewriteMayStillDelete(
             firstTextProof: true,
             recheckedTextProof: nil,
@@ -1456,6 +1472,17 @@ import Testing
             firstTextProof: true,
             recheckedTextProof: true,
             sameElementStillFocused: true
+        ))
+        // A control that publishes no range answers nil twice and never will. Both
+        // guards then rest on the element term, and its own silence is not a denial.
+        #expect(DictationController.rewriteMayDelete(
+            typedTextStillBeforeCaret: nil,
+            sameElementStillFocused: nil
+        ))
+        #expect(DictationController.rewriteMayStillDelete(
+            firstTextProof: nil,
+            recheckedTextProof: nil,
+            sameElementStillFocused: nil
         ))
     }
 }
