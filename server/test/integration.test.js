@@ -897,9 +897,11 @@ test("an unanswered audio turn fails and retires its provider session", async ()
     );
     assert.equal(clientClose, null, "and must not cost the socket");
 
-    // A turn that did carry audio but draws no response at all has an uncertain
-    // provider boundary. It must fail and retire this transport, not fabricate an empty
-    // completion and leave a late provider result free to attach to the next turn.
+    // A turn that carried enough audio to hold a sentence and draws no response at all
+    // has an uncertain provider boundary. It must fail and retire this transport, not
+    // fabricate an empty completion and leave a late provider result free to attach to
+    // the next turn. (A turn too short for that is the accidental-tap case and is
+    // covered separately; see the short-silent-turn test.)
     client.send(JSON.stringify({
       type: "input_audio_buffer.clear",
       event_id: "whisper-turn-2-1",
@@ -907,7 +909,9 @@ test("an unanswered audio turn fails and retires its provider session", async ()
     client.send(JSON.stringify({
       type: "input_audio_buffer.append",
       event_id: "whisper-turn-2-2",
-      audio: Buffer.alloc(960, 0).toString("base64"),
+      // 24 kHz mono 16-bit is 48 bytes per millisecond, so this is 2.5 s of audio —
+      // past the boundary where silence is read as "nothing was said".
+      audio: Buffer.alloc(120_000, 0).toString("base64"),
     }));
     client.send(JSON.stringify({
       type: "input_audio_buffer.commit",
@@ -2321,6 +2325,96 @@ test("a turn still being answered is not cut off by the silence watchdog", async
       "the sentence must survive a response that outlasts the watchdog window",
     );
     assert.equal(completed().length, 1, "and must be delivered exactly once");
+  } finally {
+    client.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
+
+test("a short turn Gemini never answers ends quietly, not as a failure", async () => {
+  // An accidental tap of the trigger key sends a fraction of a second of room tone.
+  // Gemini answers such a turn with nothing at all — no interim, no generationComplete
+  // — so the relay's own deadline is the only thing that ends it. Reporting that as an
+  // error charged the user a full spinner and a message about a service that did
+  // nothing wrong. It is now an empty transcript, which puts the app back to idle,
+  // still carrying the session replacement the uncertain boundary requires.
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.setup) socket.send(JSON.stringify({ setupComplete: {} }));
+      // Everything else is met with silence, which is the case under test.
+    });
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+      geminiSilentTurnTimeoutMs: 5_000,
+      geminiShortTurnTimeoutMs: 150,
+      geminiFinalFallbackDelayMs: 30_000,
+    });
+  });
+  const relayPort = await listen(relayServer);
+  const client = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+  const downstreamEvents = [];
+  let clientClose = null;
+  client.on("close", (code) => { clientClose = code; });
+  client.on("message", (data) => {
+    downstreamEvents.push(JSON.parse(data.toString("utf8")));
+  });
+  const completed = () => downstreamEvents.filter(
+    (event) => event.type === "conversation.item.input_audio_transcription.completed",
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    client.send(JSON.stringify(geminiSessionUpdate("whisper-session-1")));
+    assert.ok(await waitUntil(
+      () => downstreamEvents.some((event) => event.type === "session.updated"),
+    ));
+
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.clear",
+      event_id: "whisper-turn-1-1",
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      event_id: "whisper-turn-1-2",
+      // 0.3 s at 48 bytes per millisecond: audio really was sent, so this is not the
+      // captured-nothing path, and it is far too short to hold a sentence.
+      audio: Buffer.alloc(14_400, 0).toString("base64"),
+    }));
+    client.send(JSON.stringify({
+      type: "input_audio_buffer.commit",
+      event_id: "whisper-turn-1-3",
+    }));
+
+    const started = Date.now();
+    assert.ok(await waitUntil(() => completed().length === 1));
+    assert.equal(completed()[0].transcript, "");
+    assert.equal(
+      completed()[0].session_replacement_required, true,
+      "the boundary is still uncertain, so the provider session must be retired",
+    );
+    assert.ok(
+      !downstreamEvents.some((event) => event.type === "error"),
+      "an accidental tap is not a failure and must not be reported as one",
+    );
+    assert.ok(await waitUntil(() => clientClose === 1012));
+    assert.ok(
+      Date.now() - started < 5_000,
+      "and it must not wait out the deadline meant for turns that carried speech",
+    );
   } finally {
     client.close();
     await close(relayServer);

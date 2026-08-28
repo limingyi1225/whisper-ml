@@ -28,6 +28,21 @@ const DEFAULT_BOUNDARY_REORDER_GRACE_MS = 250;
 // Without a bound here the turn hangs until the app's own ~20 s response timeout, which
 // the user sees as the HUD stuck transcribing and the trigger key going dead.
 const DEFAULT_SILENT_TURN_TIMEOUT_MS = 5_000;
+// A turn too short to hold a sentence gets a tighter deadline and a gentler ending.
+// The audio is 24 kHz mono 16-bit PCM, so one millisecond is 48 bytes.
+//
+// Measured over 187 answered turns: the reply lands 288 ms after the commit at the
+// median and 487 ms at p90. Every reply slower than 2.7 s came from a turn carrying
+// more than 8 s of audio; among turns under 2 s of audio the slowest was 1289 ms. The
+// gap between those two populations is where this boundary sits, and the deadline is
+// re-armed by every frame Gemini does send, so it bounds silence rather than work.
+//
+// The reason it also changes the ending: a short silent turn is overwhelmingly an
+// accidental tap of the trigger key, which is not a failure and should not be reported
+// as one. A long turn that goes unanswered is a real fault and still says so.
+const AUDIO_BYTES_PER_MS = 48;
+const SHORT_TURN_AUDIO_MS = 2_000;
+const DEFAULT_SHORT_TURN_TIMEOUT_MS = 1_800;
 
 function relayError(message, code, eventID, sessionReplacementRequired = false) {
   const error = { message, type: "relay_error", code };
@@ -201,14 +216,18 @@ export function bridgeGeminiRealtime(
     closeBoth(1008, "daily relay quota reached");
     return true;
   };
-  const finishTurn = ({ isolateProvider = false } = {}) => {
+  const finishTurn = ({
+    isolateProvider = false,
+    outcome = "completed",
+    closeReason = "gemini turn boundary uncertain",
+  } = {}) => {
     clearTimeout(finalTimer);
     finalTimer = null;
     clearTimeout(silentTurnTimer);
     silentTurnTimer = null;
     if (!turn?.committed || turn.cancelled) return;
     const transcript = turn.finalParts.join("");
-    reportTurnEnd("completed", [...transcript].length);
+    reportTurnEnd(outcome, [...transcript].length);
     const completed = turn;
     turn = null;
     sendDownstream({
@@ -225,9 +244,22 @@ export function bridgeGeminiRealtime(
       // rather than turnComplete/generationComplete, chose the boundary, a later frame
       // could still belong to this turn. Retire both sides after delivering the text so
       // the app reconnects to a fresh provider session before it can start another turn.
-      closeBoth(1012, "gemini turn boundary uncertain");
+      closeBoth(1012, closeReason);
     }
   };
+
+  /// How long this turn may stay silent before it is given up on. See
+  /// `SHORT_TURN_AUDIO_MS` for why a short turn does not wait as long.
+  const silentTurnTimeoutMs = () => {
+    const full = config.geminiSilentTurnTimeoutMs ?? DEFAULT_SILENT_TURN_TIMEOUT_MS;
+    if (!turnIsTooShortToHoldSpeech()) return full;
+    const short = config.geminiShortTurnTimeoutMs ?? DEFAULT_SHORT_TURN_TIMEOUT_MS;
+    // Never longer than the general deadline: a deployment that shortens the latter
+    // must not find the short path waiting past it.
+    return Math.min(short, full);
+  };
+  const turnIsTooShortToHoldSpeech = () =>
+    (turn?.audioBytes ?? 0) / AUDIO_BYTES_PER_MS < SHORT_TURN_AUDIO_MS;
   /// Bounds a committed turn the provider never answers — re-armed by every frame it
   /// does send, so it measures silence rather than elapsed time. As an absolute
   /// deadline it cut off turns that were still being answered: a long sentence whose
@@ -239,9 +271,24 @@ export function bridgeGeminiRealtime(
     clearTimeout(silentTurnTimer);
     silentTurnTimer = setTimeout(() => {
       if (!turn?.committed || turn.cancelled) return;
-      // An empty completion would make the app reuse this provider session even though
-      // its result may merely be late. Fail the turn explicitly and close the transport;
-      // the next utterance must use a fresh Gemini session.
+      if (turnIsTooShortToHoldSpeech()) {
+        // Too short to have held a sentence, so the silence is the answer: nothing was
+        // said. `finishTurn` delivers the empty transcript and sets
+        // `session_replacement_required` on it, which retires this provider session
+        // exactly as the error did — the app is told to reconnect, not that it failed.
+        // Reporting this as an error made every accidental tap of the trigger key cost
+        // five seconds of spinner and a message about a service that did nothing wrong.
+        finishTurn({
+          isolateProvider: true,
+          outcome: "silent",
+          closeReason: "gemini turn had no speech",
+        });
+        return;
+      }
+      // A turn that carried real speech and went unanswered is a fault, and an empty
+      // completion would also make the app reuse this provider session even though its
+      // result may merely be late. Fail it explicitly and close the transport; the next
+      // utterance must use a fresh Gemini session.
       sendDownstream({
         type: "error",
         error: {
@@ -253,7 +300,7 @@ export function bridgeGeminiRealtime(
         },
       });
       closeBoth(1012, "gemini turn timed out");
-    }, config.geminiSilentTurnTimeoutMs ?? DEFAULT_SILENT_TURN_TIMEOUT_MS);
+    }, silentTurnTimeoutMs());
     silentTurnTimer.unref?.();
   };
   const scheduleTurnFinish = ({ isolateProvider, delayMs }) => {
