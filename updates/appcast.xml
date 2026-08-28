@@ -9,6 +9,23 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.15</title>
+            <pubDate>Fri, 28 Aug 2026 11:06:09 -0400</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.15</link>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>1.15</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[微信里恢复实时上屏。
+
+微信的输入框不向系统发布焦点控件身份。从换 Gemini 那次起，这种「什么都没说」被当成了「没有证据，不能打字」，于是在微信里说话时一个字都不出，松手后整段才贴进去。
+
+沉默不等于焦点动了。真正盯着焦点的是另一道检查——前台 app 有没有变、说话期间有没有按键或点鼠标——它一直在工作。现在只有系统明确指认了「别的控件」才会停止上屏。
+
+同一句话中途的修订如果无法验证，会停止继续敲字，但松手时的最终整理仍然会就地把整句修好，而不是丢给剪贴板。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.15/Whisper-1.15-16.dmg" length="3311501" type="application/octet-stream" sparkle:edSignature="WAqK3NDtmXyJ0Nur2xUcDHaSaeuT/VXVoi0YcfyGpKCVrizinOej1YUwqa5kYvFzXyIkw1KT9VQryeNtrDk/Cg=="/>
+        </item>
+        <item>
             <title>1.14</title>
             <pubDate>Fri, 28 Aug 2026 10:42:56 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.14</link>
@@ -166,6 +183,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: a8AT91F72JKZjdEjomrs4KgUbXhhUymefzWlkXbKKtFDzqaVPLNVxQuRWHbvsYFpmyUCEnJbCTnuKdCjERP1Dg==
-length: 13249
+edSignature: XTwQPrjUPyaKuxD8tPGAi9S2qySIZWp9sxxUiLNSoEzWyRBTaURR5GzQWZT9jt9ket8eL8bFTDXTSpZ9zWpdBw==
+length: 14691
 -->
