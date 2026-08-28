@@ -9,6 +9,21 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.13</title>
+            <pubDate>Fri, 28 Aug 2026 10:37:56 -0400</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.13</link>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>1.13</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[词汇表里的内置名字现在可以删除了。
+
+之前 `李铭一` 被硬编码进每一次转写会话，设置里看不到也删不掉。关键词偏置会抬高这些词的先验概率，声音相近的片段会被吸过去——所以一个乱触发的词必须是用户能删掉的词。
+
+现在它只在首次启动时被写进「常用词汇」框，之后就是普通的一行：删掉就不会再回来。已经在框里列过它的安装不会多出一份。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.13/Whisper-1.13-14.dmg" length="3312013" type="application/octet-stream" sparkle:edSignature="6SF4BUaS34Q20oBz5G0oSIc+8OD+HA0O2FvBrfS4fUx9lqEqYMeLbiYokXqJddkE23ZYaY2CaCKJFh2eHoQvAA=="/>
+        </item>
+        <item>
             <title>1.12</title>
             <pubDate>Thu, 27 Aug 2026 13:35:35 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.12</link>
@@ -138,6 +153,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: K+CkPEkMY3UXYEtuEeixb/jUg5UD8+RnDkLm+Fvqrq56Ebh1wD1Q2aKrU1XbkZxQsQE1RNC+nnYAa1OxtqnSAg==
-length: 10939
+edSignature: WvO3rIV2rq7PUM0YW6cp0DbVR6rdmne4U5q6EVJTG3KnkPKvqAE9ijnEX0RTUPvdHZ+WAEYCEvdUFajGXreGBQ==
+length: 12184
 -->
