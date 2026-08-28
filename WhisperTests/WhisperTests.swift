@@ -1363,32 +1363,101 @@ import Testing
         // `false` covers both transformations of our typed text (such as autocorrect)
         // and a synthetic write that only partly reached the target.
         #expect(!DictationController.interimRevisionMayDelete(
-            fieldPublishesOwnership: true,
+            fieldPublishesTextRange: true,
             firstOwnershipProof: false,
-            recheckedOwnershipProof: false
+            recheckedOwnershipProof: false,
+            sameElementStillFocused: true
         ))
         #expect(!DictationController.interimRevisionMayDelete(
-            fieldPublishesOwnership: true,
+            fieldPublishesTextRange: true,
             firstOwnershipProof: true,
-            recheckedOwnershipProof: false
+            recheckedOwnershipProof: false,
+            sameElementStillFocused: true
         ))
         #expect(DictationController.interimRevisionMayDelete(
-            fieldPublishesOwnership: true,
+            fieldPublishesTextRange: true,
             firstOwnershipProof: true,
-            recheckedOwnershipProof: true
+            recheckedOwnershipProof: true,
+            sameElementStillFocused: true
+        ))
+        // A range that answers outranks the element in both directions: the element is
+        // never even read, because obtaining it costs a blocking cross-process message.
+        var elementReads = 0
+        _ = DictationController.interimRevisionMayDelete(
+            fieldPublishesTextRange: true,
+            firstOwnershipProof: true,
+            recheckedOwnershipProof: true,
+            sameElementStillFocused: { elementReads += 1; return false }()
+        )
+        #expect(elementReads == 0)
+    }
+
+    @Test func aFieldWithNoRangeToPublishIsNotRefusedMidSentence() {
+        // Refusing here froze the visible text for the rest of the sentence and moved
+        // the identical delete to release, where it is uncapped. The caller still
+        // requires the app anchor and the pointer counters, and the 32-character cap
+        // applies only to this path.
+        //
+        // The test is the range, not the target. A target can exist with no range at
+        // all — Electron and WebView controls publish an element and nothing else — and
+        // for those the element is what decides.
+        #expect(DictationController.interimRevisionMayDelete(
+            fieldPublishesTextRange: false,
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false,
+            sameElementStillFocused: true
+        ))
+        // Nothing was captured at all: the fully opaque field, where the anchor and the
+        // pointer counters are the whole guard.
+        #expect(DictationController.interimRevisionMayDelete(
+            fieldPublishesTextRange: false,
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false,
+            sameElementStillFocused: nil
+        ))
+        // The system naming another element is the one answer that still refuses.
+        #expect(!DictationController.interimRevisionMayDelete(
+            fieldPublishesTextRange: false,
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false,
+            sameElementStillFocused: false
         ))
     }
 
-    @Test func aFieldWithNoOwnershipToPublishIsNotRefusedMidSentence() {
-        // Refusing here froze the visible text for the rest of the sentence and moved
-        // the identical delete to release, where it is uncapped and the WindowServer
-        // counters are not consulted. The caller still requires the app anchor and
-        // those counters, and the 32-character cap applies only to this path.
-        #expect(DictationController.interimRevisionMayDelete(
-            fieldPublishesOwnership: false,
-            firstOwnershipProof: false,
-            recheckedOwnershipProof: false
+    @Test func aClickDuringTheUtteranceStopsInjectionEvenIfTheTapIsBehind() {
+        let frozen = DictationController.LiveInjectionInputEpoch(
+            keyDown: 10, leftMouseDown: 3, rightMouseDown: 1, otherMouseDown: 0
+        )
+        // Our own typing moves the keyDown counter — measured, in every source state —
+        // so a reading kept across an injection must ignore it or it would abandon every
+        // sentence it typed.
+        #expect(DictationController.pointerInputStayedUnchanged(
+            since: frozen,
+            now: DictationController.LiveInjectionInputEpoch(
+                keyDown: 99, leftMouseDown: 3, rightMouseDown: 1, otherMouseDown: 0
+            )
         ))
+        // A click cannot come from us, and is the way focus moves inside one app.
+        #expect(!DictationController.pointerInputStayedUnchanged(
+            since: frozen,
+            now: DictationController.LiveInjectionInputEpoch(
+                keyDown: 10, leftMouseDown: 4, rightMouseDown: 1, otherMouseDown: 0
+            )
+        ))
+        #expect(!DictationController.pointerInputStayedUnchanged(
+            since: frozen,
+            now: DictationController.LiveInjectionInputEpoch(
+                keyDown: 10, leftMouseDown: 3, rightMouseDown: 2, otherMouseDown: 0
+            )
+        ))
+        #expect(!DictationController.pointerInputStayedUnchanged(
+            since: frozen,
+            now: DictationController.LiveInjectionInputEpoch(
+                keyDown: 10, leftMouseDown: 3, rightMouseDown: 1, otherMouseDown: 1
+            )
+        ))
+        // No frozen reading is no evidence of a click, not evidence of one.
+        #expect(DictationController.pointerInputStayedUnchanged(since: nil, now: frozen))
     }
 
     @Test func repeatedSuffixCannotStandInForTheOriginalInsertionPosition() {

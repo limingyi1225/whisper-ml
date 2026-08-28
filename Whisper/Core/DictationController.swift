@@ -74,6 +74,8 @@ final class DictationController {
     /// Retrying then could resume in another same-app control, so live typing stays off
     /// until the authoritative final reconciles the text already emitted.
     @ObservationIgnored private var liveInjectionSuppressed = false
+    /// Frozen with `injectionAnchor`; see `pointerInputStayedUnchanged`.
+    @ObservationIgnored private var injectionPointerEpoch: LiveInjectionInputEpoch?
     /// A cold Electron/WebView accessibility tree can publish no focused element for the
     /// first query after Whisper relaunches, then answer normally a moment later. Before
     /// this utterance has mutated anything, retry that optional evidence at a bounded
@@ -183,6 +185,44 @@ final class DictationController {
         let leftMouseDown: UInt32
         let rightMouseDown: UInt32
         let otherMouseDown: UInt32
+
+        /// The half of this reading our own writes cannot move.
+        ///
+        /// Measured: a `CGEvent.post` to `.cghidEventTap` increments the keyDown counter
+        /// in `.hidSystemState` as well as `.combinedSessionState` — five synthetic key
+        /// pairs moved both by five — so no source state distinguishes our typing from
+        /// the user's. Bracketing a single AX query is unaffected, since we do not type
+        /// inside one. A reading kept *across* our own injection is, and only the
+        /// pointer counters survive it: `TextInjector` posts keyboard events exclusively.
+        var pointerOnly: LiveInjectionInputEpoch {
+            LiveInjectionInputEpoch(
+                keyDown: 0,
+                leftMouseDown: leftMouseDown,
+                rightMouseDown: rightMouseDown,
+                otherMouseDown: otherMouseDown
+            )
+        }
+    }
+
+    /// Whether the user has physically clicked since this utterance froze its anchor.
+    ///
+    /// The anchor's own `lastForeignInputAt` comes from our event tap, which delivers on
+    /// the main run loop — the same run loop this injection runs on. A click that landed
+    /// a moment ago may not have been dequeued yet, so the anchor can still look clean
+    /// while focus has already moved. The WindowServer counters are written by the
+    /// system and answer that question without waiting for our tap.
+    ///
+    /// It has to be kept across partials to mean anything. Read and compared in the same
+    /// breath it only ever covers the microseconds between two adjacent lines, which is
+    /// the shape the per-query bracket needs and no protection at all for a click
+    /// between one hypothesis and the next — a window that stays open for roughly the
+    /// 700 ms of deltas that arrive after the key is released.
+    static func pointerInputStayedUnchanged(
+        since frozen: LiveInjectionInputEpoch?,
+        now current: LiveInjectionInputEpoch
+    ) -> Bool {
+        guard let frozen else { return true }
+        return frozen.pointerOnly == current.pointerOnly
     }
 
     struct QueuedGestureIdentity {
@@ -515,19 +555,27 @@ final class DictationController {
     /// believe we typed is still immediately before the caret: `false` catches an app
     /// that transformed our keystrokes, and a synthetic write that only partly landed.
     ///
-    /// A field that publishes nothing cannot answer, and refusing it is not the
+    /// A field that publishes no range cannot answer, and refusing it is not the
     /// conservative choice it looks like. The same utterance's final reconciliation
-    /// already deletes in that field on the app anchor alone, and this delete is the
-    /// safer of the two: it is capped at `maxLiveRevisionCharacters` where the final's
-    /// is bounded only by the whole utterance, and it is additionally gated on the
-    /// WindowServer input counters, which the final does not consult. Refusing here
-    /// only froze the visible text mid-sentence and moved the identical risk to release.
+    /// already deletes in that field without a range proof, and this delete is the safer
+    /// of the two: it is capped at `maxLiveRevisionCharacters` where the final's is
+    /// bounded only by the whole utterance. Refusing here only froze the visible text
+    /// mid-sentence and moved the identical risk to release.
+    ///
+    /// What such a field can still offer is its identity, and that is what decides it —
+    /// the same fallback `rewriteMayDelete` uses, and the reason the test is the *range*
+    /// rather than the target. A target can exist with `selection == nil`: Electron and
+    /// WebView controls publish an element and no range, and reading them as
+    /// range-publishing left them failing both text proofs and freezing exactly as
+    /// WeChat did. `nil` from the element term is the fully opaque case, where nothing
+    /// was captured at all; `false` is the system naming another element, and refuses.
     static func interimRevisionMayDelete(
-        fieldPublishesOwnership: Bool,
+        fieldPublishesTextRange: Bool,
         firstOwnershipProof: Bool,
-        recheckedOwnershipProof: Bool
+        recheckedOwnershipProof: Bool,
+        sameElementStillFocused: @autoclosure () -> Bool?
     ) -> Bool {
-        guard fieldPublishesOwnership else { return true }
+        guard fieldPublishesTextRange else { return sameElementStillFocused() != false }
         return firstOwnershipProof && recheckedOwnershipProof
     }
 
@@ -947,6 +995,7 @@ final class DictationController {
         // edit the user made mid-sentence be masked by the next delta, and the later
         // rewrite would then chew through their change.
         injectionAnchor = identity.anchor
+        injectionPointerEpoch = Self.currentLiveInjectionInputEpoch()
         injectionTarget = identity.target
         injectionAbandoned = false
 
@@ -1109,6 +1158,14 @@ final class DictationController {
         guard anchorUnchanged else {
             injectionAbandoned = true
             log.info("the frozen field moved or foreign input arrived; stopping injection")
+            return
+        }
+        guard Self.pointerInputStayedUnchanged(
+            since: injectionPointerEpoch,
+            now: Self.currentLiveInjectionInputEpoch()
+        ) else {
+            injectionAbandoned = true
+            log.info("a click landed during this utterance; stopping injection")
             return
         }
 
@@ -1310,15 +1367,19 @@ final class DictationController {
             // authorize Backspace against their character. Exact field, predicted caret,
             // and original insertion range all have to agree twice.
             //
-            // A field that publishes no identity has none of this to offer, and the
-            // anchor and input-counter checks below are what stand in for it — the same
-            // trade the final reconciliation already makes for that field, under a
-            // tighter cap. See `interimRevisionMayDelete`.
-            let firstOwnershipProof = injectionTarget.map {
+            // A field with no range has none of this to offer, and its identity — or,
+            // where not even that was captured, the anchor and the pointer counters —
+            // stands in for it. See `interimRevisionMayDelete`. The proofs are computed
+            // only where they can answer: `matchesInjectedTextAtOriginalSelection`
+            // returns `false` for a missing range after paying for an AX call first.
+            let provableTarget = injectionTarget.flatMap {
+                $0.selection == nil ? nil : $0
+            }
+            let firstOwnershipProof = provableTarget.map {
                 TextInjector.matchesInjectedTextAtOriginalSelection(injectedText, target: $0)
             } ?? false
             let recheckedOwnershipProof = firstOwnershipProof
-                ? injectionTarget.map {
+                ? provableTarget.map {
                     TextInjector.matchesInjectedTextAtOriginalSelection(injectedText, target: $0)
                 } ?? false
                 : false
@@ -1335,9 +1396,12 @@ final class DictationController {
                 after: Self.currentLiveInjectionInputEpoch()
             )
             guard Self.interimRevisionMayDelete(
-                fieldPublishesOwnership: injectionTarget != nil,
+                fieldPublishesTextRange: provableTarget != nil,
                 firstOwnershipProof: firstOwnershipProof,
-                recheckedOwnershipProof: recheckedOwnershipProof
+                recheckedOwnershipProof: recheckedOwnershipProof,
+                sameElementStillFocused: injectionTarget.flatMap {
+                    TextInjector.focusedElementMatches($0.element)
+                }
             ), Permissions.hasAccessibility,
                !Permissions.isSecureInputEnabled,
                injectionAnchor == currentAnchor(),
@@ -1758,6 +1822,7 @@ final class DictationController {
         utteranceStart = Date()
         utteranceRoute = route
         injectionAnchor = anchor
+        injectionPointerEpoch = Self.currentLiveInjectionInputEpoch()
         // The target and rehearsal identity describe where this sentence was spoken.
         // Re-capturing either now would let a later focus move or guide close retarget it.
         injectionTarget = target
@@ -1948,6 +2013,14 @@ final class DictationController {
         log.notice("rewriting from char \(shared): -\(deleteCount) +\(addition.count) opaque=\(opaqueField)")
 
         if deleteCount > 0 {
+            guard Self.pointerInputStayedUnchanged(
+                since: injectionPointerEpoch,
+                now: Self.currentLiveInjectionInputEpoch()
+            ) else {
+                log.warning("a click landed during this utterance; copying corrected transcript")
+                TextInjector.copyToClipboard(final)
+                return
+            }
             // The PID-level anchor above cannot see a focus move *within* the app
             // (programmatic, or a click — no foreign keystroke involved), so deletion
             // needs positive evidence about the exact text at its original insertion
