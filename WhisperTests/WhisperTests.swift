@@ -830,16 +830,22 @@ import Testing
         #expect(AppSettings.parseVocabulary(many).count == AppSettings.vocabularyTermLimit)
     }
 
-    @Test func builtInNamesRideAlongWithAnEmptyBox() {
-        // The names of the people using the app are never typed into Settings, so an
-        // empty box still has to reach the cleanup model with something in it.
-        #expect(AppSettings.vocabularyTerms(userList: "") == AppSettings.builtInVocabulary)
+    @Test func nothingIsBiasedBehindTheBox() {
+        // Keyword biasing fires on audio that merely sounds close, so every term has to
+        // be one the user can delete. An emptied box means exactly that: bias nothing.
+        #expect(AppSettings.parseVocabulary("") == [])
+        #expect(AppSettings.parseVocabulary("Kevin\n李铭一\nAnthropic")
+            == ["Kevin", "李铭一", "Anthropic"])
     }
 
-    @Test func builtInNamesComeFirstAndAreNotDuplicated() {
-        let terms = AppSettings.vocabularyTerms(userList: "Kevin\n李铭一\nAnthropic")
-        #expect(terms == AppSettings.builtInVocabulary + ["Kevin", "Anthropic"])
-        #expect(terms.count { $0 == "李铭一" } == 1)
+    @Test func theSeedIsAnOfferOnceNotAStandingRule() {
+        // A fresh install still gets the name typed for it.
+        #expect(AppSettings.vocabularySeeded(into: "") == "李铭一")
+        // An install that already lists it gains nothing — no second copy, and no
+        // rewrite of a box that the parser would have edited on the way through.
+        #expect(AppSettings.vocabularySeeded(into: "李铭一\nGavi") == nil)
+        let essay = String(repeating: "词", count: AppSettings.vocabularyTermLengthLimit + 1)
+        #expect(AppSettings.vocabularySeeded(into: "Gavi\n\(essay)") == "Gavi\n\(essay)\n李铭一")
     }
 
     @Test func termsThatWouldBeRejectedUpstreamNeverLeave() {
