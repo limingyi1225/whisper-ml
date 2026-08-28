@@ -508,17 +508,27 @@ final class DictationController {
         return firstTextProof == true && recheckedTextProof == true
     }
 
-    /// Interim hypotheses are allowed to revise text while the user is still speaking,
-    /// but that does not make their deletion any less destructive. Unlike final
-    /// cleanup, there is no compatibility fallback for an opaque AX control: live
-    /// typing is optional, while deleting pre-existing user text is irreversible.
-    /// Both reads must positively prove that the complete text we believe we typed is
-    /// still immediately before the caret.
+    /// Whether the document authorizes an interim revision's backspaces. The caller
+    /// applies the app anchor and the WindowServer input counters on top of this.
+    ///
+    /// A field that publishes a text range must prove twice that the complete text we
+    /// believe we typed is still immediately before the caret: `false` catches an app
+    /// that transformed our keystrokes, and a synthetic write that only partly landed.
+    ///
+    /// A field that publishes nothing cannot answer, and refusing it is not the
+    /// conservative choice it looks like. The same utterance's final reconciliation
+    /// already deletes in that field on the app anchor alone, and this delete is the
+    /// safer of the two: it is capped at `maxLiveRevisionCharacters` where the final's
+    /// is bounded only by the whole utterance, and it is additionally gated on the
+    /// WindowServer input counters, which the final does not consult. Refusing here
+    /// only froze the visible text mid-sentence and moved the identical risk to release.
     static func interimRevisionMayDelete(
+        fieldPublishesOwnership: Bool,
         firstOwnershipProof: Bool,
         recheckedOwnershipProof: Bool
     ) -> Bool {
-        firstOwnershipProof && recheckedOwnershipProof
+        guard fieldPublishesOwnership else { return true }
+        return firstOwnershipProof && recheckedOwnershipProof
     }
 
     /// A field that can be proven must prove itself before a final suffix: focus can
@@ -1295,42 +1305,37 @@ final class DictationController {
                 log.warning("interim revision has no safe text-inspection path; stopping live injection")
                 return
             }
-            guard let injectionTarget else {
-                // A target that publishes no field identity can be typed into but not
-                // proof-checked, and a mid-sentence backspace is the one live mutation
-                // that needs a proof. Stop mutating rather than abandoning: the text
-                // already on screen stays owned by this utterance, and the final
-                // reconciliation — which re-verifies the app anchor itself — repairs it
-                // in one edit at release. Abandoning here would forfeit that and hand
-                // the user a clipboard instead.
-                liveInjectionSuppressed = true
-                // Also `notice`: this is the other half of the same measurement — how
-                // often an opaque field's live typing stops early because the model
-                // revised text it had already put on screen.
-                log.notice("interim revision cannot be proven in an opaque field; leaving the rest to the final")
-                return
-            }
             // Verify ownership at the original selection, not merely an equal suffix.
             // A user can type the same character after ours; suffix equality would then
             // authorize Backspace against their character. Exact field, predicted caret,
             // and original insertion range all have to agree twice.
-            let firstOwnershipProof = TextInjector.matchesInjectedTextAtOriginalSelection(
-                injectedText,
-                target: injectionTarget
-            )
-            let recheckedOwnershipProof = firstOwnershipProof
-                ? TextInjector.matchesInjectedTextAtOriginalSelection(
-                    injectedText,
-                    target: injectionTarget
-                )
-                : false
-            let hardwareInputUnchanged = inputEpochBeforeBlockingAXQuery.map {
-                Self.liveInjectionInputStayedUnchanged(
-                    before: $0,
-                    after: Self.currentLiveInjectionInputEpoch()
-                )
+            //
+            // A field that publishes no identity has none of this to offer, and the
+            // anchor and input-counter checks below are what stand in for it — the same
+            // trade the final reconciliation already makes for that field, under a
+            // tighter cap. See `interimRevisionMayDelete`.
+            let firstOwnershipProof = injectionTarget.map {
+                TextInjector.matchesInjectedTextAtOriginalSelection(injectedText, target: $0)
             } ?? false
+            let recheckedOwnershipProof = firstOwnershipProof
+                ? injectionTarget.map {
+                    TextInjector.matchesInjectedTextAtOriginalSelection(injectedText, target: $0)
+                } ?? false
+                : false
+            // The epoch to compare against is the one taken before this turn's blocking
+            // AX work, when there was any. A turn that made no such call — an opaque
+            // field past its probe cap — has no window to re-verify, and reading the
+            // counters now makes that explicit rather than failing closed on a gap that
+            // does not exist. Foreign input across the whole utterance is the anchor's
+            // job, and the anchor is checked immediately below.
+            let epochBeforeProofs = inputEpochBeforeBlockingAXQuery
+                ?? Self.currentLiveInjectionInputEpoch()
+            let hardwareInputUnchanged = Self.liveInjectionInputStayedUnchanged(
+                before: epochBeforeProofs,
+                after: Self.currentLiveInjectionInputEpoch()
+            )
             guard Self.interimRevisionMayDelete(
+                fieldPublishesOwnership: injectionTarget != nil,
                 firstOwnershipProof: firstOwnershipProof,
                 recheckedOwnershipProof: recheckedOwnershipProof
             ), Permissions.hasAccessibility,

@@ -1363,27 +1363,31 @@ import Testing
         // `false` covers both transformations of our typed text (such as autocorrect)
         // and a synthetic write that only partly reached the target.
         #expect(!DictationController.interimRevisionMayDelete(
+            fieldPublishesOwnership: true,
             firstOwnershipProof: false,
             recheckedOwnershipProof: false
         ))
         #expect(!DictationController.interimRevisionMayDelete(
-            firstOwnershipProof: true,
-            recheckedOwnershipProof: false
-        ))
-    }
-
-    @Test func unknownAXTextEvidenceFailsClosedForInterimBackspace() {
-        #expect(!DictationController.interimRevisionMayDelete(
-            firstOwnershipProof: false,
-            recheckedOwnershipProof: false
-        ))
-        #expect(!DictationController.interimRevisionMayDelete(
+            fieldPublishesOwnership: true,
             firstOwnershipProof: true,
             recheckedOwnershipProof: false
         ))
         #expect(DictationController.interimRevisionMayDelete(
+            fieldPublishesOwnership: true,
             firstOwnershipProof: true,
             recheckedOwnershipProof: true
+        ))
+    }
+
+    @Test func aFieldWithNoOwnershipToPublishIsNotRefusedMidSentence() {
+        // Refusing here froze the visible text for the rest of the sentence and moved
+        // the identical delete to release, where it is uncapped and the WindowServer
+        // counters are not consulted. The caller still requires the app anchor and
+        // those counters, and the 32-character cap applies only to this path.
+        #expect(DictationController.interimRevisionMayDelete(
+            fieldPublishesOwnership: false,
+            firstOwnershipProof: false,
+            recheckedOwnershipProof: false
         ))
     }
 
