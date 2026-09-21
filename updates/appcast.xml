@@ -9,6 +9,19 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.17</title>
+            <pubDate>Mon, 21 Sep 2026 19:38:47 -0400</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.17</link>
+            <sparkle:version>18</sparkle:version>
+            <sparkle:shortVersionString>1.17</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[Multiline dictation now uses a single clipboard paste for final replacements to avoid text becoming reordered in rich editors. Replacement events are prepared before a fresh input and focus check, and a failed check preserves the existing text and keeps the complete transcript available for recovery.
+
+Adds optional local dictation diagnostics, disabled by default, with bounded log rotation for troubleshooting text delivery.
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.17/Whisper-1.17-18.dmg" length="3359117" type="application/octet-stream" sparkle:edSignature="9PvqIkP4FqEsAH657TMdVerJfy4KySxvP4LuLQa4To66exyNPWXckgbRxImjmyx5F9wnG17khTSQPAAoxCsNBA=="/>
+        </item>
+        <item>
             <title>1.16</title>
             <pubDate>Fri, 28 Aug 2026 14:02:56 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.16</link>
@@ -202,6 +215,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: iN/rb3dbataf1xzJnnRU7oJKTLWhYW4UAodPoGJCQtNv/K31+eDxQTpVvEGIHmgV9Jbq4AF03iYVjfCM1l/DDg==
-length: 16378
+edSignature: qu8ebHbF/r17zOVQ5CPAVnGaedHUvKbmvF17xdnAtCrVukAeC3YerkhNkWI+fJKXrA+6CIE5pFtRLdmH0t4PCA==
+length: 17577
 -->
