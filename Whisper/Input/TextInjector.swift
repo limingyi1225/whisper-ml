@@ -61,8 +61,20 @@ enum TextInjector {
 
     // MARK: - Typing
 
+    static func requiresPaste(_ text: String) -> Bool {
+        text.unicodeScalars.contains { CharacterSet.newlines.contains($0) }
+    }
+
     static func type(_ text: String) {
         guard !text.isEmpty else { return }
+        // Multiline Unicode events can leave a rich editor's caret before the end
+        // of the event. Never re-enter that path, including clipboard fallbacks.
+        guard !requiresPaste(text) else {
+            DictationDiagnostics.record("multiline_unicode_refused")
+            copyToClipboard(text)
+            return
+        }
+        DictationDiagnostics.record("unicode_type_requested", texts: ["text": text])
         for chunk in chunked(Array(text.utf16)) {
             postUnicode(chunk)
         }
@@ -72,12 +84,41 @@ enum TextInjector {
     /// clusters so that CJK text and emoji delete one visible character per press.
     static func deleteBackward(count: Int) {
         guard count > 0 else { return }
+        DictationDiagnostics.record("backspace_requested", fields: ["count": String(count)])
+        var posted = 0
         for _ in 0..<count {
-            postKey(deleteKeyCode)
+            if postKey(deleteKeyCode) { posted += 1 }
         }
+        DictationDiagnostics.record("backspace_posted_unverified", fields: ["count": String(posted)])
     }
 
     // MARK: - Pasting
+
+    struct PasteReplacement {
+        let deletedText: String
+        let fallbackText: String
+        let authorize: () -> Bool
+    }
+
+    /// A replacement is prepared before anything is deleted. Ordinary single-line
+    /// pastes can retain their Unicode fallback; replacements and multiline text cannot.
+    static func pasteMayUseUnicodeFallback(_ text: String, isReplacement: Bool) -> Bool {
+        !isReplacement && !requiresPaste(text)
+    }
+
+    static func replacementSelection(_ selection: CFRange, deletedUTF16: Int) -> CFRange? {
+        guard selection.length == 0, deletedUTF16 >= 0, selection.location >= deletedUTF16 else { return nil }
+        return CFRange(location: selection.location - deletedUTF16, length: deletedUTF16)
+    }
+
+    /// The same ordering is exercised without posting real keyboard events in tests.
+    static func commitPreparedPaste<Prepared>(
+        prepare: () -> Prepared?, authorize: () -> Bool, post: (Prepared) -> Void
+    ) -> Bool {
+        guard let prepared = prepare(), authorize() else { return false }
+        post(prepared)
+        return true
+    }
 
     /// A clipboard restore that has been scheduled but not yet executed. Later
     /// sentences are posted as Unicode behind its still-unacknowledged ⌘V, so they
@@ -143,9 +184,17 @@ enum TextInjector {
     }
 
     /// Puts `text` on the pasteboard and sends ⌘V, restoring the previous contents after.
-    static func paste(_ text: String, targetPID: pid_t) {
+    static func paste(_ text: String, targetPID: pid_t, replacing replacement: PasteReplacement? = nil) {
         guard !text.isEmpty else { return }
+        DictationDiagnostics.record("paste_requested", texts: ["text": text], fields: ["targetPID": String(targetPID)])
         let pasteboard = NSPasteboard.general
+        let fallbackText = replacement?.fallbackText ?? text
+        let canTypeFallback = pasteMayUseUnicodeFallback(text, isReplacement: replacement != nil)
+        func fallback() {
+            if canTypeFallback {
+                if writeIsStillSafe(targetPID) { type(text) }
+            } else { copyToClipboard(fallbackText) }
+        }
 
         // Only the app is compared. Clicking around inside the same app still means
         // "paste it where my caret is": the caret this utterance froze seconds ago has
@@ -153,12 +202,20 @@ enum TextInjector {
         // the whole transcript to the clipboard for an ordinary click. The caret that
         // does matter is captured fresh below, for the restore proof.
         guard writeIsStillSafe(targetPID) else {
-            copyToClipboard(text)
+            copyToClipboard(fallbackText)
             return
         }
 
         if var pending = pendingRestore,
            pasteboard.changeCount == pending.changeCount {
+            guard canTypeFallback else {
+                // The old Cmd-V may still need this clipboard. Preserve the full
+                // correction for recovery and leave the existing live text intact.
+                pending.deferredClipboardText += fallbackText
+                pendingRestore = pending
+                DictationDiagnostics.record("paste_deferred", fields: ["reason": "previous_paste_pending"])
+                return
+            }
             // Do not overwrite a clipboard that an earlier synthetic ⌘V may not have
             // consumed yet. Queue this sentence as Unicode events behind that ⌘V;
             // CGEvent ordering preserves both sentences even when the target's main
@@ -198,8 +255,8 @@ enum TextInjector {
             // keeps it behind that ⌘V — and record it as fallback text: if the
             // target rejects synthetic typing, it becomes recoverable from the
             // clipboard the moment the hold lifts.
-            unprovenPaste?.fallbackText += text
-            if writeIsStillSafe(targetPID) {
+            unprovenPaste?.fallbackText += fallbackText
+            if canTypeFallback, writeIsStillSafe(targetPID) {
                 type(text)
             }
             return
@@ -231,9 +288,7 @@ enum TextInjector {
             // Someone else wrote the board mid-flight; it must not be clobbered.
             // Keyboard focus is unaffected by that, so fall back to typing while
             // the target is still frontmost rather than dropping the sentence.
-            if writeIsStillSafe(targetPID) {
-                type(text)
-            }
+            fallback()
             return
         }
         guard targetIsUnmoved(pasteAnchor, targetPID: targetPID) else {
@@ -241,17 +296,14 @@ enum TextInjector {
             // previously hung target rides along instead of being dropped — it is
             // text the user already spoke, and the clipboard is the only place left
             // where it can still surface.
-            replaceClipboard(with: deferredSeed + text)
+            replaceClipboard(with: deferredSeed + fallbackText)
             return
         }
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
             if let saved { restore(saved, to: pasteboard) }
-            if writeIsStillSafe(targetPID) {
-                type(text)
-            } else {
-                replaceClipboard(with: deferredSeed + text)
-            }
+            if canTypeFallback, writeIsStillSafe(targetPID) { type(text) }
+            else { replaceClipboard(with: deferredSeed + fallbackText) }
             return
         }
         let ourChangeCount = pasteboard.changeCount
@@ -263,17 +315,57 @@ enum TextInjector {
         guard targetIsUnmoved(pasteAnchor, targetPID: targetPID) else {
             // Focus moved while the board was being written. Leaving `text` on the
             // board is the intended fail-closed result — one Cmd-V recovers it.
+            if replacement != nil { copyToClipboard(fallbackText) }
             return
         }
         guard pasteboard.changeCount == ourChangeCount else {
             // Another writer won the board, so `text` is no longer on it either.
             // Without this it would be neither pasted, nor typed, nor recoverable.
-            if writeIsStillSafe(targetPID) {
-                type(text)
-            }
+            fallback()
             return
         }
-        postKey(vKeyCode, flags: .maskCommand)
+
+        // Capture the range the paste will REPLACE, not the old caret. Otherwise
+        // post-paste verification expects the deleted suffix to still exist.
+        var restoreAnchor = pasteAnchor
+        if let replacement, let anchor = pasteAnchor, let selection = anchor.selection {
+            guard let range = replacementSelection(selection, deletedUTF16: replacement.deletedText.utf16.count) else {
+                copyToClipboard(fallbackText)
+                return
+            }
+            restoreAnchor = TextInjectionTarget(element: anchor.element, processIdentifier: anchor.processIdentifier,
+                selection: range, writeEpoch: anchor.writeEpoch)
+        }
+
+        let deleteCount = replacement?.deletedText.count ?? 0
+        // Allocate every event before authorizing a destructive operation. No AX
+        // calls, pasteboard writes, or allocations sit between the delete and Cmd-V.
+        let pastePosted = commitPreparedPaste(prepare: { () -> ([[CGEvent]], [CGEvent])? in
+            var keys: [[CGEvent]] = []
+            for _ in 0..<deleteCount {
+                guard let pair = makeKeyEvents(deleteKeyCode) else { return nil }
+                keys.append(pair)
+            }
+            guard let pastePair = makeKeyEvents(vKeyCode, flags: .maskCommand) else { return nil }
+            return (keys, pastePair)
+        }, authorize: {
+            (replacement?.authorize() ?? true)
+                && pasteboard.changeCount == ourChangeCount
+                && writeIsStillSafe(targetPID)
+        }, post: { prepared in
+            let (keys, pastePair) = prepared
+            for pair in keys { postPreparedKey(pair) }
+            postPreparedKey(pastePair)
+        })
+        guard pastePosted else {
+            DictationDiagnostics.record("paste_aborted_before_delete")
+            copyToClipboard(fallbackText)
+            return
+        }
+        if replacement != nil {
+            DictationDiagnostics.record("paste_replacement_posted_unverified", fields: ["deletedCharacters": String(deleteCount)])
+        }
+        DictationDiagnostics.record("paste_key_posted_unverified", fields: ["posted": String(pastePosted)])
 
         // There is no acknowledgement for a synthetic ⌘V. Restoring after a fixed
         // delay can therefore race a busy target: it may process the queued key only
@@ -373,13 +465,14 @@ enum TextInjector {
             changeCount: ourChangeCount,
             targetPID: targetPID,
             pastedText: text,
-            anchor: pasteAnchor,
+            anchor: restoreAnchor,
             deferredClipboardText: deferredSeed,
             task: task
         )
     }
 
     static func copyToClipboard(_ text: String) {
+        DictationDiagnostics.record("clipboard_fallback_requested", texts: ["text": text])
         guard !text.isEmpty else { return }
         let pasteboard = NSPasteboard.general
         if var pending = pendingRestore,
@@ -736,6 +829,9 @@ enum TextInjector {
         // range. Accepting a suffix of a larger response lets a broken AX control
         // "prove" text at some unrelated location and makes the following backspaces
         // destructive.
+        DictationDiagnostics.record("ax_before_caret_read", texts: ["expected": text, "actual": actual], fields: [
+            "selectionLocation": String(selection.location), "selectionLength": String(selection.length)
+        ])
         return actual.utf16.count == expectedLength && actual == text
     }
 
@@ -777,6 +873,9 @@ enum TextInjector {
         ) == .success, let actual = actualValue as? String else {
             return false
         }
+        DictationDiagnostics.record("ax_original_range_read", texts: ["expected": text, "actual": actual], fields: [
+            "selectionLocation": String(currentSelection.location), "selectionLength": String(currentSelection.length)
+        ])
         return actual.utf16.count == text.utf16.count && actual == text
     }
 
@@ -905,7 +1004,10 @@ enum TextInjector {
         writeEpoch &+= 1
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-        else { return }
+        else {
+            DictationDiagnostics.record("unicode_event_creation_failed")
+            return
+        }
 
         var buffer = units
         for event in [down, up] {
@@ -914,19 +1016,30 @@ enum TextInjector {
             event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: &buffer)
             event.post(tap: .cgSessionEventTap)
         }
+        DictationDiagnostics.record("unicode_chunk_posted_unverified", texts: ["chunk": String(decoding: units, as: UTF16.self)])
     }
 
-    private static func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
-        writeEpoch &+= 1
+    @discardableResult
+    private static func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) -> Bool {
+        guard let events = makeKeyEvents(keyCode, flags: flags) else { return false }
+        postPreparedKey(events)
+        return true
+    }
+
+    private static func makeKeyEvents(_ keyCode: CGKeyCode, flags: CGEventFlags = []) -> [CGEvent]? {
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
-        else { return }
-
+        else { return nil }
         for event in [down, up] {
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: kWhisperSyntheticMarker)
-            event.post(tap: .cgSessionEventTap)
         }
+        return [down, up]
+    }
+
+    private static func postPreparedKey(_ events: [CGEvent]) {
+        writeEpoch &+= 1
+        for event in events { event.post(tap: .cgSessionEventTap) }
     }
 
     static func chunked(_ units: [UniChar]) -> [[UniChar]] {

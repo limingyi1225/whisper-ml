@@ -68,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        DictationDiagnostics.startup()
+
         // Direct mode no longer exists. Remove the upstream OpenAI key older builds
         // stored before opening any network path; the relay device token is untouched.
         let hadLegacyUpstreamCredential = KeychainStore.hasLegacyUpstreamCredential()

@@ -709,6 +709,40 @@ final class DictationController {
         )
     }
 
+    private func beginDiagnostics(queued: Bool) {
+        let pid = injectionAnchor?.processIdentifier
+        let app = pid.flatMap { NSRunningApplication(processIdentifier: $0) }
+        DictationDiagnostics.begin(fields: [
+            "targetPID": pid.map { String($0) } ?? "unknown",
+            "targetApp": app?.bundleIdentifier ?? "unknown",
+            "queued": String(queued),
+            "liveTyping": String(utteranceTypesWhileSpeaking)
+        ])
+        trace("initial_input_state")
+    }
+
+    /// Reuses state we already have. Extra synchronous AX probes here would change
+    /// the timing of the very delete/type race these diagnostics are investigating.
+    private func trace(_ event: String, texts: [String: String] = [:], fields: [String: String] = [:]) {
+        guard DictationDiagnostics.isRecording else { return }
+        var values = fields
+        values["phase"] = phase == .recording ? "recording" : phase == .finalizing ? "finalizing" : "other"
+        values["generation"] = String(utteranceGeneration)
+        values["frontmostPID"] = NSWorkspace.shared.frontmostApplication.map { String($0.processIdentifier) } ?? "unknown"
+        values["hasFieldIdentity"] = String(injectionTarget != nil)
+        values["originalSelectionLocation"] = injectionTarget?.selection.map { String($0.location) } ?? "unknown"
+        values["originalSelectionLength"] = injectionTarget?.selection.map { String($0.length) } ?? "unknown"
+        values["abandoned"] = String(injectionAbandoned)
+        values["liveSuppressed"] = String(liveInjectionSuppressed)
+        values["lastForeignInputAt"] = hotKey.lastForeignInputAt.map { String($0.timeIntervalSince1970) } ?? "none"
+        let counters = Self.currentLiveInjectionInputEpoch()
+        values["keyDownCounter"] = String(counters.keyDown)
+        values["leftClickCounter"] = String(counters.leftMouseDown)
+        values["rightClickCounter"] = String(counters.rightMouseDown)
+        values["otherClickCounter"] = String(counters.otherMouseDown)
+        DictationDiagnostics.record(event, texts: texts, fields: values)
+    }
+
     /// Called after the user grants Accessibility, or changes the trigger key.
     func restartHotKey() {
         hotKey.stop(cancellationCause: .monitoringLost(
@@ -1050,6 +1084,8 @@ final class DictationController {
         injectionTarget = identity.target
         injectionAbandoned = false
 
+        beginDiagnostics(queued: false)
+
         client.beginUtterance()
 
         switch start {
@@ -1076,6 +1112,7 @@ final class DictationController {
     }
 
     private func endRecording() {
+        trace("key_released", texts: ["typed": injectedText])
         gestureOwnsCapture = false
         let stopped = audio.stop()
         let captureFailed = stopped.captureFailed
@@ -1131,6 +1168,7 @@ final class DictationController {
 
     private func handlePartialSnapshot(_ snapshot: String) {
         guard phase == .recording || phase == .finalizing else { return }
+        trace("provider_partial", texts: ["snapshot": snapshot])
         accumulatedPartial = snapshot
         emitPartial()
     }
@@ -1183,8 +1221,20 @@ final class DictationController {
         )
         guard stable != injectedText else { return }
 
+        // A newline inside a synthetic Unicode run can leave the editor's caret
+        // before the final characters of that run. Keep the last proven live prefix;
+        // the final will replace its suffix through one clipboard paste.
+        guard !TextInjector.requiresPaste(stable) else {
+            liveInjectionSuppressed = true
+            trace("partial_deferred", fields: ["reason": "multiline_requires_final_paste"])
+            return
+        }
+
         let shared = Self.commonPrefixLength(injectedText, stable)
         let deleteCount = injectedText.count - shared
+        trace("partial_plan", texts: ["typed": injectedText, "stable": stable], fields: [
+            "sharedCharacters": String(shared), "deleteCharacters": String(deleteCount)
+        ])
         guard deleteCount <= Self.maxLiveRevisionCharacters else {
             log.info("interim rewrote \(deleteCount) typed characters; leaving the sentence to the final")
             return
@@ -1476,6 +1526,7 @@ final class DictationController {
         }
         if !addition.isEmpty { TextInjector.type(addition) }
         injectedText = stable
+        trace("partial_posting_finished", texts: ["believedTyped": injectedText])
     }
 
     /// The part of the hypothesis that has stopped moving: what two consecutive
@@ -1548,6 +1599,7 @@ final class DictationController {
     }
 
     private func handleCompleted(_ transcript: String) {
+        trace("provider_final", texts: ["raw": transcript])
         let final = normalize(transcript)
 
         // The completed transcript is authoritative — when it comes back empty,
@@ -1881,6 +1933,7 @@ final class DictationController {
         captureInterruptionNotice = interruptionNotice
         phase = .finalizing
 
+        beginDiagnostics(queued: true)
         client.beginUtterance()
         if !audio.isEmpty { client.appendAudio(audio) }
         client.commitUtterance()
@@ -1913,8 +1966,12 @@ final class DictationController {
 
     /// Emits the finished text and returns to idle.
     private func finish(with text: String?, confirmsCleanup: Bool = false) {
+        trace("finish_input", texts: ["text": text ?? "", "typed": injectedText], fields: [
+            "confirmsCleanup": String(confirmsCleanup)
+        ])
         let interruptionNotice = captureInterruptionNotice
         defer {
+            DictationDiagnostics.end(reason: "finish")
             partialText = ""
             accumulatedPartial = ""
             injectedText = ""
@@ -1950,6 +2007,7 @@ final class DictationController {
             }
         }
 
+        trace("delivery_final", texts: ["text": text, "typed": injectedText])
         let canPostSyntheticEvents = Permissions.hasAccessibility
             && !Permissions.isSecureInputEnabled
         if utteranceIsRehearsal {
@@ -2021,6 +2079,7 @@ final class DictationController {
         // so whitespace-only differences are left alone. Checked before the anchor:
         // nothing meaningful is missing, so it should not touch the clipboard either.
         guard typed.ignoringWhitespace != final.ignoringWhitespace else {
+            trace("rewrite_skipped", fields: ["reason": "whitespace_only"])
             log.info("whitespace-only difference; leaving typed text as is")
             return
         }
@@ -2036,6 +2095,7 @@ final class DictationController {
               let targetPID = injectionAnchor.processIdentifier,
               injectionAnchor == current,
               injectionTarget.map(TextInjector.targetIsStillFocused) ?? true else {
+            trace("rewrite_fallback", fields: ["reason": "anchor_or_focus_changed"])
             log.info("focus moved since the text was typed; full transcript copied to clipboard")
             TextInjector.copyToClipboard(final)
             return
@@ -2059,13 +2119,29 @@ final class DictationController {
         // append-only rule would have done; if it is the norm, refusing the delete
         // would send most sentences to the clipboard.
         let opaqueField = injectionTarget == nil
+        trace("final_rewrite_plan", texts: ["typed": typed, "final": final, "addition": addition], fields: [
+            "sharedCharacters": String(shared), "deleteCharacters": String(deleteCount)
+        ])
         log.notice("rewriting from char \(shared): -\(deleteCount) +\(addition.count) opaque=\(opaqueField)")
+
+        if TextInjector.requiresPaste(addition) {
+            trace("multiline_rewrite_uses_paste")
+            TextInjector.paste(addition, targetPID: targetPID, replacing: .init(
+                deletedText: String(typed.dropFirst(shared)),
+                fallbackText: final,
+                authorize: { [self] in
+                    multilineReplacementIsAuthorized(typed: typed, targetPID: targetPID)
+                }
+            ))
+            return
+        }
 
         if deleteCount > 0 {
             guard Self.pointerInputStayedUnchanged(
                 since: injectionPointerEpoch,
                 now: Self.currentLiveInjectionInputEpoch()
             ) else {
+                trace("rewrite_fallback", fields: ["reason": "pointer_changed"])
                 log.warning("a click landed during this utterance; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
@@ -2084,6 +2160,10 @@ final class DictationController {
                     typed,
                     expectedProcessIdentifier: targetPID
                 )
+            trace("final_text_proof", fields: [
+                "matches": typedTextProof.map { String($0) } ?? "unknown",
+                "hasOriginalSelectionProof": String(hasOriginalSelectionProof)
+            ])
             guard Self.rewriteMayDelete(
                 typedTextStillBeforeCaret: typedTextProof,
                 sameElementStillFocused: injectionTarget.flatMap {
@@ -2094,6 +2174,7 @@ final class DictationController {
                 // autocorrect, input-method composition) so backspacing by our original
                 // count would cross into the user's text, or the control offers no text
                 // proof that can safely authorize deletion.
+                trace("rewrite_fallback", fields: ["reason": "text_proof_rejected"])
                 log.warning("the document no longer agrees that our text is before the caret; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
@@ -2111,6 +2192,9 @@ final class DictationController {
                         typed,
                         expectedProcessIdentifier: targetPID
                     )
+            trace("final_text_recheck", fields: [
+                "matches": recheckedTextProof.map { String($0) } ?? "unknown"
+            ])
             guard Self.rewriteMayStillDelete(
                 firstTextProof: typedTextProof,
                 recheckedTextProof: recheckedTextProof,
@@ -2118,11 +2202,13 @@ final class DictationController {
                     TextInjector.focusedElementMatches($0.element)
                 }
             ) else {
+                trace("rewrite_fallback", fields: ["reason": "text_recheck_rejected"])
                 log.warning("focus moved while the document was being read; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
             }
             guard destructiveWriteIsStillAuthorized(epochBeforeAXWork: epochBeforeAXWork) else {
+                trace("rewrite_fallback", fields: ["reason": "input_changed_during_proof"])
                 log.warning("input arrived while the final delete was being authorized; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
@@ -2146,6 +2232,7 @@ final class DictationController {
             guard Self.finalAdditionMayType(
                 originalFieldOwnershipProof: ownershipProof
             ) else {
+                trace("rewrite_fallback", fields: ["reason": "suffix_ownership_rejected"])
                 log.warning("the original field cannot be proven before final suffix typing; copying corrected transcript")
                 TextInjector.copyToClipboard(final)
                 return
@@ -2154,8 +2241,41 @@ final class DictationController {
         if !addition.isEmpty {
             TextInjector.type(addition)
         }
+        trace("final_posting_finished", fields: ["editorAcknowledgement": "unavailable"])
     }
 
+
+    /// Runs only after the pasteboard and keyboard events are ready. Preparation
+    /// can block; the last input/ownership check must follow it, not precede it.
+    private func multilineReplacementIsAuthorized(typed: String, targetPID: pid_t) -> Bool {
+        let epoch = Self.currentLiveInjectionInputEpoch()
+        guard !injectionAbandoned,
+              let anchor = injectionAnchor,
+              anchor.processIdentifier == targetPID,
+              anchor == currentAnchor(),
+              injectionTarget.map(TextInjector.targetIsStillFocused) ?? true else { return false }
+        func textProof() -> Bool? {
+            if let target = injectionTarget, target.selection != nil {
+                return TextInjector.matchesInjectedTextAtOriginalSelection(typed, target: target)
+            }
+            return TextInjector.matchesTextImmediatelyBeforeCaret(typed, expectedProcessIdentifier: targetPID)
+        }
+        let first = textProof()
+        guard Self.rewriteMayDelete(typedTextStillBeforeCaret: first,
+            sameElementStillFocused: injectionTarget.flatMap { TextInjector.focusedElementMatches($0.element) }) else {
+            return false
+        }
+        let second = first == nil ? nil : textProof()
+        trace("multiline_replacement_proof", fields: [
+            "first": first.map { String($0) } ?? "unknown",
+            "second": second.map { String($0) } ?? "unknown"
+        ])
+        guard Self.rewriteMayStillDelete(firstTextProof: first, recheckedTextProof: second,
+            sameElementStillFocused: injectionTarget.flatMap { TextInjector.focusedElementMatches($0.element) }) else {
+            return false
+        }
+        return destructiveWriteIsStillAuthorized(epochBeforeAXWork: epoch)
+    }
 
     static func commonPrefixLength(_ lhs: String, _ rhs: String) -> Int {
         var count = 0
@@ -2191,6 +2311,9 @@ final class DictationController {
     }
 
     private func handleFailure(_ message: String) {
+        // Error descriptions can contain remote payloads; keep only pipeline state.
+        trace("utterance_failed", texts: ["typed": injectedText])
+        DictationDiagnostics.end(reason: "failure")
         log.error("dictation failed: \(message)")
         let displayMessage = captureInterruptionNotice ?? Self.friendlyMessage(message)
         captureInterruptionNotice = nil
