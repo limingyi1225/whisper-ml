@@ -367,6 +367,10 @@ server.on("upgrade", (request, socket, head) => {
               + ` audio_rms=${record.audioRMS}`
               + ` age_ms=${record.ageMs}`
               + ` chars=${record.chars}`
+              + (Number.isInteger(record.finalMs) ? ` final_ms=${record.finalMs}` : "")
+              + (Number.isInteger(record.lateFinalMs)
+                ? ` late_final_ms=${record.lateFinalMs}`
+                : "")
             : "")
           + "\n",
         ),

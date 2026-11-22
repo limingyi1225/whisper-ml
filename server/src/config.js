@@ -57,6 +57,9 @@ const DEFAULTS = Object.freeze({
   // Two missed sweeps' worth of silence. The app pings every 20 s, so a client that
   // is merely idle always answers well inside this.
   clientHeartbeatIntervalMs: 25_000,
+  // Keeps an idle Gemini session from being aborted at 60 s; see the bridge. Zero
+  // switches it off without a deploy if the provider ever changes what it means.
+  geminiIdleKeepaliveMs: 25_000,
   // Heartbeats are intentionally suspended while a target send buffer is congested.
   // Bound that exemption separately: continued drain progress renews it, but a frozen
   // half-open TCP target must not retain a bridge and paid upstream forever.
@@ -77,6 +80,16 @@ function positiveInteger(env, name, fallback) {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(env, name, fallback) {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
   }
   return value;
 }
@@ -367,6 +380,11 @@ export function loadConfig(env = process.env) {
       env,
       "CLIENT_HEARTBEAT_INTERVAL_MS",
       DEFAULTS.clientHeartbeatIntervalMs,
+    ),
+    geminiIdleKeepaliveMs: nonNegativeInteger(
+      env,
+      "GEMINI_IDLE_KEEPALIVE_MS",
+      DEFAULTS.geminiIdleKeepaliveMs,
     ),
     backpressureStallTimeoutMs: positiveInteger(
       env,

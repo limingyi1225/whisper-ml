@@ -316,10 +316,24 @@ final 才换全角并去空格。而 SMART 模式的本职就是回头删口头�
 如果后续 hypothesis 要改写已上屏内容，只有在 Accessibility 能够前后两次证明光标前文字
 完全等于 Whisper 已注入的前缀时才会回删；无法证明就停止实时注入，等 final 安全收尾。
 
-Relay 把 `generationComplete` / `turnComplete` 当作 provider response boundary，但 Gemini
-不保证它们与 `inputTranscription` 的顺序，所以会再等一个可重置的短 quiet period 收齐迟到的
-final segment。只有拿到 final 却一直等不到 boundary 的异常 fallback，才会在交付文字后强制
-更换 session，避免迟到的上一句混进下一句。
+Relay 把 `generationComplete` / `turnComplete` 当作 provider response boundary。实测 137 轮，
+Gemini 总是先发唯一一帧 `inputTranscription`、紧接着（0–14 ms）才是 boundary，所以 boundary
+到达时 final 已在手就立刻交付。文档并不保证这个顺序，因此 boundary 先到而 final 还没来时，
+仍然等一个可重置的短 quiet period 收齐迟到的 final segment——这份等待只在异常时才付。
+
+**SMART 的 final 是整个 session 的累计文本，所以一句话用一个 Gemini session。** 同一个
+session 里第二句的 final 会带着第一句一起回来（interim 不会）。这是 Google 写明的行为，
+没有开关，只有新 session 能清零；原样上屏就是「把上一句又说了一遍」。Relay 因此在每个
+有回答的 turn 交付后都带上 `session_replacement_required` 并关闭连接。客户端把它当作正常
+换线：不报错、不退避、立刻重连，换线期间按下的录音先缓冲，session ready 后补发。界面上
+的连接状态（菜单栏图标、设置、首次引导读的是同一个值）也不跟着闪——从「已连接」掉下来要
+持续 2 秒才显示；已经在显示的断线状态照实跟随，恢复则立刻显示。
+
+**空闲的 Gemini session 60 秒就被掐掉。** 没有流量时 Google 以 1008 关闭 session，没有
+任何预告帧，WebSocket ping 也不算流量。Relay 在没有 turn 的时候每 25 秒发一次
+`realtimeInput.audioStreamEnd`：实测它不产生回帧、不影响下一句，session 却能一直活着
+（`GEMINI_IDLE_KEEPALIVE_MS`，设 0 关闭）。静音的迷你 turn 也能保活，但会污染下一句的
+转写，不要用。
 
 **OpenAI 备用的便宜模型换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
 20 个 delta，`gpt-transcribe` 是 **0 个**。注意不能看 delta 总数——两者总数几乎一样

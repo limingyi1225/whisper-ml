@@ -18,10 +18,26 @@ const GEMINI_SESSION_SECONDS = 10 * 60;
 const DEFAULT_FINAL_FALLBACK_DELAY_MS = 1_500;
 // Gemini documents inputTranscription as independent of the model turn, so a
 // generationComplete/turnComplete frame is not an ordering barrier for the final
-// transcript. Keep a short, resettable quiet period after that boundary: it preserves
-// the measured low-latency completion path without clearing the turn before a final
-// transcription frame that was already in flight arrives.
+// transcript. Keep a short, resettable quiet period after that boundary — but only for
+// the shape it exists for, a boundary that arrives with no final in hand yet.
+//
+// Measured against the live service on 2026-11-21, 137 turns from half a second to
+// 85 s: exactly one inputTranscription frame, then generationComplete in the very next
+// frame 0–14 ms later (median 0), never the other way round and never a text frame
+// after the boundary. Waiting out this grace on every one of those put a quarter of a
+// second between releasing the key and the final text, for nothing. With the final
+// already in hand the turn now completes at once; see `scheduleProviderBoundaryFinish`.
 const DEFAULT_BOUNDARY_REORDER_GRACE_MS = 250;
+// Measured 2026-11-21: Gemini aborts a Live session that has carried nothing for 60 s
+// (close 1008 "The operation was aborted.", no warning frame). A warm session is idle
+// by definition, so every one of them died there — over 90 % of all connections the
+// relay ever closed — and each device spent its day in error → backoff → reconnect.
+// A WebSocket ping does not count as traffic. `audioStreamEnd` does: sent every 20 s
+// it kept an idle session alive for the 150 s tested, produced no frame, cost no audio,
+// and the sentence spoken afterwards transcribed exactly as on a fresh session. A silent
+// turn also keeps the session alive, but Gemini answers it and the next transcript
+// carries the debris. Zero disables it.
+const DEFAULT_IDLE_KEEPALIVE_MS = 25_000;
 // Measured against the live service: a turn whose audio contains no speech gets no
 // inputTranscription and no generationComplete — Gemini simply never answers it. The
 // fallback above cannot help, because it is only ever armed by a serverContent frame.
@@ -151,6 +167,7 @@ export function bridgeGeminiRealtime(
   let turn = null;
   let finalTimer = null;
   let silentTurnTimer = null;
+  let idleKeepalive = null;
   let downstreamAlive = true;
   let upstreamAlive = true;
   let downstreamTargetBackpressured = false;
@@ -168,7 +185,7 @@ export function bridgeGeminiRealtime(
   const publishTurn = (record) => {
     try { onTurn?.(record); } catch { /* diagnostics never own transport teardown */ }
   };
-  const reportTurnEnd = (outcome, chars = 0) => {
+  const reportTurnEnd = (outcome, chars = 0, { answered = false } = {}) => {
     if (!turn || turn.reported) return;
     turn.reported = true;
     publishTurn({
@@ -179,6 +196,17 @@ export function bridgeGeminiRealtime(
       audioRMS: Math.round(turnAudioRMS(turn)),
       ageMs: Math.max(0, Date.now() - turn.openedAt),
       chars,
+      // Commit → the moment this turn was answered: the wait the user feels after
+      // releasing the key, as far as the relay can see it. Only for a turn that *was*
+      // answered — one that timed out or was abandoned has no such moment, and its
+      // five seconds of waiting would pass for a slow final in any average of these.
+      finalMs: answered && turn.committedAt !== null
+        ? Math.max(0, Date.now() - turn.committedAt)
+        : null,
+      // Set only if a final transcript arrived *after* the provider's boundary — the
+      // one ordering the boundary grace exists for, and never yet observed. If this
+      // ever shows up in the log, that is the evidence to act on.
+      lateFinalMs: turn.lateFinalMs,
     });
   };
   const closeBoth = (code = 1011, reason = "relay closed") => {
@@ -190,6 +218,7 @@ export function bridgeGeminiRealtime(
     publishEnd(reason);
     clearTimeout(finalTimer);
     clearTimeout(silentTurnTimer);
+    clearInterval(idleKeepalive);
     if (downstream.readyState === WebSocket.OPEN) downstream.close(code, reason);
     if (upstream.readyState === WebSocket.OPEN
         || upstream.readyState === WebSocket.CONNECTING) upstream.close(code, reason);
@@ -201,6 +230,7 @@ export function bridgeGeminiRealtime(
     publishEnd(reason);
     clearTimeout(finalTimer);
     clearTimeout(silentTurnTimer);
+    clearInterval(idleKeepalive);
     if (downstream.readyState === WebSocket.OPEN
         || downstream.readyState === WebSocket.CONNECTING) downstream.terminate();
     if (upstream.readyState === WebSocket.OPEN
@@ -287,6 +317,7 @@ export function bridgeGeminiRealtime(
     reportTurnEnd(
       usedInterimFallback ? "partial_fallback" : outcome,
       [...transcript].length,
+      { answered: true },
     );
     const completed = turn;
     turn = null;
@@ -300,10 +331,13 @@ export function bridgeGeminiRealtime(
       session_replacement_required: isolateProvider,
     });
     if (isolateProvider) {
-      // Gemini gives transcription frames no provider turn id. If the fallback timer,
-      // rather than turnComplete/generationComplete, chose the boundary, a later frame
-      // could still belong to this turn. Retire both sides after delivering the text so
-      // the app reconnects to a fresh provider session before it can start another turn.
+      // Every answered turn retires its provider session, for two reasons that both
+      // come down to one session being one document. Gemini gives transcription frames
+      // no provider turn id, so a frame that arrives late could only be adopted by the
+      // next turn. And in SMART mode the final is not this turn's text at all but the
+      // whole session's so far — see `scheduleProviderBoundaryFinish`. Close both sides
+      // after delivering the text so the app reconnects to a fresh provider session
+      // before it can start another turn.
       closeBoth(1012, closeReason);
     }
   };
@@ -389,10 +423,11 @@ export function bridgeGeminiRealtime(
     isolateProvider,
     delayMs,
     fallbackToInterim = false,
+    closeReason,
   }) => {
     clearTimeout(finalTimer);
     finalTimer = setTimeout(
-      () => finishTurn({ isolateProvider, fallbackToInterim }),
+      () => finishTurn({ isolateProvider, fallbackToInterim, closeReason }),
       delayMs,
     );
   };
@@ -404,10 +439,28 @@ export function bridgeGeminiRealtime(
   const scheduleProviderBoundaryFinish = () => {
     if (!turn) return;
     turn.responseBoundarySeen = true;
+    // A final that was already in hand when the boundary arrived, with no newer
+    // interim behind it, is the whole answer: the grace has nothing left to wait for.
+    // Once a final has turned up *after* the boundary the order is the unusual one,
+    // more may be in flight behind it, and every frame restarts the full grace.
+    const finalInHand = turn.lateFinalMs === null
+      && turn.finalParts.length > 0
+      && turn.latestInterimSnapshot === null;
     scheduleTurnFinish({
-      isolateProvider: false,
-      delayMs: config.geminiBoundaryReorderGraceMs ?? DEFAULT_BOUNDARY_REORDER_GRACE_MS,
+      // Measured 2026-11-21, and documented by Google for SMART mode: the final is the
+      // cumulative transcript of the *session*, not of the turn. A second sentence on
+      // the same session came back as the first sentence plus the second (3, 13, 33,
+      // 63 … characters for turns of 3, 10, 20, 30), and the app typed it as given —
+      // the previous sentence, again, in front of the new one. Interims are per-turn,
+      // so nothing looked wrong until the key was released. There is no setting that
+      // turns this off and no message that resets it; a new session is the only fresh
+      // document. So an answered turn always takes its session with it.
+      isolateProvider: true,
+      delayMs: finalInHand
+        ? 0
+        : config.geminiBoundaryReorderGraceMs ?? DEFAULT_BOUNDARY_REORDER_GRACE_MS,
       fallbackToInterim: true,
+      closeReason: "gemini turn completed",
     });
   };
   const scheduleLocalEmptyFinish = () => scheduleTurnFinish({
@@ -430,6 +483,9 @@ export function bridgeGeminiRealtime(
       openedAt: Date.now(),
       reported: false,
       responseBoundarySeen: false,
+      committedAt: null,
+      boundaryAt: null,
+      lateFinalMs: null,
       // Deferred until the first audio frame. Measured: activityStart followed by
       // activityEnd with nothing between them makes Gemini close the entire session
       // with 1007 "Precondition check failed" — so a press that captured no audio
@@ -531,6 +587,7 @@ export function bridgeGeminiRealtime(
       }
       turn.active = false;
       turn.committed = true;
+      turn.committedAt = Date.now();
       turn.lastEventID = event.event_id;
       sendDownstream({
         type: "input_audio_buffer.committed",
@@ -635,12 +692,26 @@ export function bridgeGeminiRealtime(
       });
       sendDownstream({ type: "session.updated" });
       replayQueuedEvents(false);
+      const keepaliveMs = config.geminiIdleKeepaliveMs ?? DEFAULT_IDLE_KEEPALIVE_MS;
+      if (keepaliveMs > 0 && idleKeepalive === null && !settled) {
+        idleKeepalive = setInterval(() => {
+          // Only between sentences. A turn in progress is its own traffic, and nothing
+          // may be slipped into the stream of one that is waiting for its final.
+          if (settled || turn) return;
+          sendUpstream(geminiRealtimeInput({ audioStreamEnd: true }));
+        }, keepaliveMs);
+        idleKeepalive.unref?.();
+      }
       return;
     }
     const content = message.serverContent;
     if (!content || !turn || turn.cancelled) return;
     const responseComplete = content.turnComplete === true
       || content.generationComplete === true;
+    // Taken before this frame is applied: a final that shares its frame with the
+    // boundary is not late.
+    const boundaryPrecededThisFrame = turn.responseBoundarySeen;
+    if (responseComplete && turn.boundaryAt === null) turn.boundaryAt = Date.now();
     // A response boundary stops the no-response watchdog immediately. Other frames
     // re-arm it only after their transcription evidence has been recorded below, so a
     // short spoken turn gets the ordinary deadline rather than the quiet-tap deadline.
@@ -682,7 +753,19 @@ export function bridgeGeminiRealtime(
     // one-step provider was adopted to reclaim.
     const finalText = content.inputTranscription?.text;
     if (typeof finalText === "string") {
-      turn.finalParts.push(finalText);
+      if (boundaryPrecededThisFrame && turn.boundaryAt !== null) {
+        turn.lateFinalMs = Math.max(0, Date.now() - turn.boundaryAt);
+      }
+      // Google documents a SMART final as the complete text so far, to *replace* what
+      // came before; the segments this bridge was first measured against were deltas,
+      // to append. A frame that begins with everything already collected is the
+      // former. Appending it would say the start of a long sentence twice.
+      const collected = turn.finalParts.join("");
+      if (collected.length > 0 && finalText.startsWith(collected)) {
+        turn.finalParts = [finalText];
+      } else {
+        turn.finalParts.push(finalText);
+      }
       // A final segment supersedes the mutable interim suffix. A later interim will
       // rebuild the whole snapshot from this now-authoritative prefix.
       turn.latestInterimSnapshot = null;
