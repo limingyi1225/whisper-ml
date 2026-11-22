@@ -91,6 +91,16 @@ function relayError(message, code, eventID, sessionReplacementRequired = false) 
   return JSON.stringify({ type: "error", error });
 }
 
+/// An out-of-money project is not refused at the handshake. Google accepts the socket
+/// and then closes it about 100 ms after `setup` with a plain 1011, the explanation only
+/// in the close reason: "Your prepayment credits are depleted. Please go to AI Studio…"
+/// (seen 2026-11-21). Dropping that reason left every device on a bare 连接失败 with a
+/// healthy /healthz and a valid token, which points at everything except the cause.
+export function geminiCreditsDepleted(reason) {
+  const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason ?? "");
+  return /credits?\b[^.]*\bdepleted|prepayment|billing/i.test(text);
+}
+
 export function geminiSetupFromSessionUpdate(event) {
   const transcription = event?.session?.audio?.input?.transcription;
   if (transcription?.model !== GEMINI_MODEL) return null;
@@ -709,7 +719,24 @@ export function bridgeGeminiRealtime(
     }
     setImmediate(() => closeBoth(1011, "gemini connection failed"));
   });
-  upstream.on("close", (code) => closeBoth(safeCloseCode(code), "gemini upstream closed"));
+  upstream.on("close", (code, reason) => {
+    if (geminiCreditsDepleted(reason)) {
+      if (downstream.readyState === WebSocket.OPEN) {
+        downstream.send(relayError(
+          // "Billing" is load-bearing: it is the word RealtimeClient keys on to treat
+          // an error as connection-wide and stop retrying, the same way the handshake
+          // message above carries "authentication".
+          "Gemini 额度用完了，去 AI Studio 的 Billing 充值后再按一次就恢复",
+          "relay_gemini_credits_depleted",
+          undefined,
+          true,
+        ));
+      }
+      setImmediate(() => closeBoth(1011, "gemini credits depleted"));
+      return;
+    }
+    closeBoth(safeCloseCode(code), "gemini upstream closed");
+  });
   downstream.on("close", (code) => closeBoth(safeCloseCode(code, 1000), "client closed"));
   downstream.on("error", () => closeBoth(1011, "client connection failed"));
 

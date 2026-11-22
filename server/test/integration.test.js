@@ -1163,6 +1163,74 @@ test("a fallback-finalized Gemini turn retires the uncertain provider boundary",
   }
 });
 
+test("a Gemini project that is out of credit tells the app so instead of just hanging up", async () => {
+  // What Google actually does (2026-11-21): accept the socket, then close 1011 right
+  // after `setup`, with the only explanation in the close reason.
+  const depleted = "Your prepayment credits are depleted. Please go to AI Studio at "
+    + "https://ai.studio/projects to manage your project and billi";
+  let upstreamReason = depleted;
+  const upstreamServer = http.createServer();
+  const upstreamWSS = new WebSocketServer({ server: upstreamServer });
+  upstreamWSS.on("connection", (socket) => {
+    socket.on("message", () => socket.close(1011, upstreamReason));
+  });
+  const upstreamPort = await listen(upstreamServer);
+
+  const ends = [];
+  const relayServer = http.createServer();
+  const relayWSS = new WebSocketServer({ server: relayServer });
+  relayWSS.on("connection", (downstream) => {
+    bridgeGeminiRealtime(downstream, {
+      ...baseConfig,
+      geminiLiveURL: `ws://127.0.0.1:${upstreamPort}/live`,
+    }, { onEnd: (reason) => ends.push(reason) });
+  });
+  const relayPort = await listen(relayServer);
+
+  const connect = async (sessionID) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+    const events = [];
+    let closeCode = null;
+    socket.on("message", (data) => events.push(JSON.parse(data.toString("utf8"))));
+    socket.on("close", (code) => { closeCode = code; });
+    await new Promise((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    socket.send(JSON.stringify(geminiSessionUpdate(sessionID)));
+    assert.ok(await waitUntil(() => closeCode !== null));
+    return { socket, events, closeCode };
+  };
+
+  let first;
+  let second;
+  try {
+    first = await connect("whisper-session-depleted");
+    assert.equal(first.closeCode, 1011);
+    const error = first.events.find((event) => event.type === "error")?.error;
+    assert.equal(error?.code, "relay_gemini_credits_depleted");
+    assert.match(error.message, /Gemini 额度用完了/);
+    // RealtimeClient stops retrying only when the message carries this word.
+    assert.match(error.message, /billing/i);
+    assert.deepEqual(ends, ["gemini credits depleted"]);
+
+    // Any other provider-side close keeps its old, unexplained shape.
+    upstreamReason = "internal error";
+    second = await connect("whisper-session-other-close");
+    assert.equal(second.closeCode, 1011);
+    assert.ok(!second.events.some((event) => event.type === "error"));
+    assert.deepEqual(ends, ["gemini credits depleted", "gemini upstream closed"]);
+  } finally {
+    first?.socket.close();
+    second?.socket.close();
+    for (const socket of relayWSS.clients) socket.terminate();
+    for (const socket of upstreamWSS.clients) socket.terminate();
+    relayWSS.close();
+    upstreamWSS.close();
+    await close(relayServer);
+    await close(upstreamServer);
+  }
+});
 
 test("a Gemini response boundary waits for independently ordered final transcripts", async () => {
   // Measured against the live service: gemini-3.5-transcribe-live closes a
