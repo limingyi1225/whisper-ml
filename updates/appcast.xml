@@ -9,6 +9,24 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.18</title>
+            <pubDate>Sun, 22 Nov 2026 12:07:38 -0500</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.18</link>
+            <sparkle:version>19</sparkle:version>
+            <sparkle:shortVersionString>1.18</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[麦克风没声音、文字去了剪贴板，现在都会直接告诉你。
+
+- **麦克风没有声音**：录了一秒以上却全是静音时，松手立刻显示「麦克风没有声音」。以前要等五秒，然后只摇一下头，看不出问题出在麦克风。
+- **说话前点过别处**：还没上屏任何字的时候，在同一个 app 里点了别的位置，这句话现在直接贴到光标所在处，不再悄悄放进剪贴板。
+- **文字进了剪贴板会说一声**：实在没法上屏时，胶囊显示「已复制，按 ⌘V 粘贴」；已经上屏了一部分的，显示「完整内容已复制」。
+- **菜单栏不再闪「未连接」**：每句话结束后会换一条新连接，这一两秒的切换不再显示成断线。
+
+服务器这次也一起更新了，不装这个版本也已生效：不会再把上一句话重复打出来，松手到出字快了约四分之一秒，空闲时不再每分钟断线重连一次。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.18/Whisper-1.18-19.dmg" length="3366285" type="application/octet-stream" sparkle:edSignature="6EOEZfo0jFo+O3NiuZOz1AynnSTtQT6oIrBfJP6h9YTaatgxB7B01FrgZMmxqU61l45kUBXuxjmbhYyOPd6CAQ=="/>
+        </item>
+        <item>
             <title>1.17</title>
             <pubDate>Mon, 21 Sep 2026 19:38:47 -0400</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.17</link>
@@ -215,6 +233,6 @@ Adds optional local dictation diagnostics, disabled by default, with bounded log
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: qu8ebHbF/r17zOVQ5CPAVnGaedHUvKbmvF17xdnAtCrVukAeC3YerkhNkWI+fJKXrA+6CIE5pFtRLdmH0t4PCA==
-length: 17577
+edSignature: v/BHBbQmCeH6SUIuktAPy3RHrC7LnBo65LL1R9acW92znhFuH6GeGpmpTS3cO3bpX+U+KFymx03HHfFH2J/xCw==
+length: 19312
 -->
