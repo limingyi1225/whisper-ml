@@ -541,4 +541,137 @@ import Testing
             hasFrozenIdentity: false
         ))
     }
+
+    /// Measured 2026-11-21: three sentences in a row were 4–5 s of audio with every
+    /// sample at zero. The provider never answers that, the relay times out after five
+    /// seconds, and the timeout is a wordless failure — so nothing ever said "microphone".
+    @Test func aCaptureThatNeverLeavesZeroIsADeadMicrophoneNotAQuietSpeaker() {
+        let second = AudioCapture.bytesPerSecond
+        #expect(!DictationController.pcm16HasSignal(Data(count: second)))
+
+        // One count either side of zero is a converter rounding, not a voice.
+        var rounding = Data(count: 8)
+        rounding[0] = 0x01
+        rounding[2] = 0xFF
+        rounding[3] = 0xFF
+        #expect(!DictationController.pcm16HasSignal(rounding))
+
+        // A quiet room is still a room.
+        var quietRoom = Data(count: 8)
+        quietRoom[4] = 0x03
+        #expect(DictationController.pcm16HasSignal(quietRoom))
+        var negative = Data(count: 8)
+        negative[6] = 0xFD
+        negative[7] = 0xFF
+        #expect(DictationController.pcm16HasSignal(negative))
+
+        // A trailing odd byte is not a sample, and a slice is not sample-aligned.
+        #expect(!DictationController.pcm16HasSignal(Data([0, 0, 7])))
+        #expect(!DictationController.pcm16HasSignal(Data([9, 0, 0, 0, 0]).dropFirst()))
+        #expect(DictationController.pcm16HasSignal(Data([0, 9, 0, 0, 0]).dropFirst()))
+
+        #expect(DictationController.captureWasDigitalSilence(
+            audioBytes: second,
+            heardSignal: false
+        ))
+        #expect(DictationController.captureWasDigitalSilence(
+            audioBytes: second * 5,
+            heardSignal: false
+        ))
+        // An input still waking up delivers zeros too; a brief press is not proof.
+        #expect(!DictationController.captureWasDigitalSilence(
+            audioBytes: second - 2,
+            heardSignal: false
+        ))
+        #expect(!DictationController.captureWasDigitalSilence(
+            audioBytes: second * 5,
+            heardSignal: true
+        ))
+
+        // The words are the whole point: this one must never collapse into the shake.
+        let message = DictationController.silentMicrophoneMessage
+        #expect(DictationController.friendlyMessage(message) == message)
+        #expect(!DictationController.failureIsWordless(message))
+    }
+
+    /// Measured 2026-11-16: a click into the field 1.35 s after the key went down stopped
+    /// live typing before it had typed anything, and the whole sentence then went to the
+    /// clipboard with nothing on screen. With no text of ours to defend, the sentence
+    /// follows the paste-mode rule instead.
+    @Test func aSentenceThatWasNeverTypedLiveIsPastedWhereTheCaretIsNow() {
+        #expect(DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: true,
+            targetPID: 400,
+            ownPID: 77,
+            frontmostPID: 400
+        ))
+        // Text of ours is on screen: its position still has to be proven.
+        #expect(!DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: false,
+            targetPID: 400,
+            ownPID: 77,
+            frontmostPID: 400
+        ))
+        // The user left for another app, or there is no app at all.
+        #expect(!DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: true,
+            targetPID: 400,
+            ownPID: 77,
+            frontmostPID: 500
+        ))
+        #expect(!DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: true,
+            targetPID: 400,
+            ownPID: 77,
+            frontmostPID: nil
+        ))
+        #expect(!DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: true,
+            targetPID: nil,
+            ownPID: 77,
+            frontmostPID: 400
+        ))
+        // Never into Whisper's own windows, exactly as paste mode refuses.
+        #expect(!DictationController.untypedFinalMayPasteAtCaret(
+            typedIsEmpty: true,
+            targetPID: 77,
+            ownPID: 77,
+            frontmostPID: 77
+        ))
+    }
+
+    @Test func aSentenceSentToTheClipboardSaysSoInWords() {
+        let untyped = DictationController.clipboardFallbackNotice(hadLiveText: false)
+        let partlyTyped = DictationController.clipboardFallbackNotice(hadLiveText: true)
+        #expect(untyped.contains("⌘V"))
+        // Part of the sentence is already on screen; pasting would repeat it.
+        #expect(!partlyTyped.contains("⌘V"))
+        #expect(untyped != partlyTyped)
+        for notice in [untyped, partlyTyped] {
+            #expect(!DictationController.failureIsWordless(notice))
+            #expect(DictationController.friendlyMessage(notice) == notice)
+        }
+    }
+
+    @Test func theReconnectAfterEachSentenceDoesNotLookLikeAnOutage() {
+        typealias Status = RealtimeClient.Status
+        func showsAtOnce(_ status: Status, shown: Status) -> Bool {
+            DictationController.connectionStatusShowsImmediately(status, shown: shown)
+        }
+        // The session is retired after a sentence: 已连接 stays up while it reconnects,
+        // through every state the client passes on the way.
+        #expect(!showsAtOnce(.disconnected, shown: .ready))
+        #expect(!showsAtOnce(.connecting, shown: .ready))
+        #expect(!showsAtOnce(.failed("连接中断"), shown: .ready))
+        // Ready is never held back — before the clock runs out or after a real outage.
+        #expect(showsAtOnce(.ready, shown: .ready))
+        #expect(showsAtOnce(.ready, shown: .connecting))
+        #expect(showsAtOnce(.ready, shown: .failed("连接中断")))
+        // An outage already on screen is followed live. In the guide someone has just
+        // pasted a token and is waiting to learn whether it works.
+        #expect(showsAtOnce(.connecting, shown: .disconnected))
+        #expect(showsAtOnce(.failed("Token 无效"), shown: .connecting))
+        // Longer than a healthy reconnect including the one-second backoff.
+        #expect(DictationController.connectionOutageRevealDelay > 1.5)
+    }
 }

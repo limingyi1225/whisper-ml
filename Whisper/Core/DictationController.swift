@@ -55,7 +55,23 @@ final class DictationController {
     /// the sweeping light had got to, which only the elapsed time since this can say.
     private(set) var settledAt: Date?
 
-    var connectionStatus: RealtimeClient.Status { client.status }
+    /// The connection status as the UI shows it — the menu bar, Settings and the
+    /// first-run guide all read this, and none of them reads the client's own status.
+    ///
+    /// Every answered sentence retires its relay session and opens a fresh one, because
+    /// a Gemini SMART final is the transcript of the whole session (see README). So the
+    /// client leaves `.ready` for a few hundred milliseconds after each sentence, and
+    /// that is the connection doing its job. An icon that dims and grows a slash, or a
+    /// row that turns orange, right as the text lands would say the opposite twenty
+    /// times a minute. `.ready` is therefore held through a drop until the drop has
+    /// lasted `connectionOutageRevealDelay`. An outage that is already showing is
+    /// followed as it changes, and `.ready` comes back the moment it is true.
+    private(set) var connectionStatus: RealtimeClient.Status = .disconnected
+    @ObservationIgnored private var connectionOutageReveal: DispatchWorkItem?
+    /// Longer than a reconnect that is going well (well under a second, plus the one
+    /// second of backoff after a dropped socket), short enough that a real outage is
+    /// on the icon before the next sentence would fail.
+    static let connectionOutageRevealDelay: TimeInterval = 2
 
     /// Set while the first-run guide is showing its 试一下 step.
     ///
@@ -109,6 +125,10 @@ final class DictationController {
     /// Bumped per utterance so a cleanup call that is still in flight when the user
     /// moves on cannot deliver its result into the next one.
     @ObservationIgnored private var utteranceGeneration = 0
+    /// How much captured audio this utterance has handed to the transcriber, and
+    /// whether any of it rose above digital silence. See `captureWasDigitalSilence`.
+    @ObservationIgnored private var utteranceAudioBytes = 0
+    @ObservationIgnored private var utteranceHeardSignal = false
     @ObservationIgnored private var polishTask: Task<Void, Never>?
     /// The raw transcript held while cleanup runs, so it can still be emitted if the
     /// user starts speaking again before cleanup finishes.
@@ -301,7 +321,7 @@ final class DictationController {
     private init() {
         audio.onChunk = { [weak self] data in
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.client.appendAudio(data) }
+                MainActor.assumeIsolated { self?.forwardCapturedAudio(data) }
             }
         }
         audio.onLevel = { [weak self] level in
@@ -331,6 +351,58 @@ final class DictationController {
         client.onFailure = { [weak self] message in
             self?.handleFailure(message)
         }
+        observeConnectionStatus()
+    }
+
+    // MARK: - Connection status as shown
+
+    /// Whether a change of the client's status goes on screen at once. Only a drop
+    /// out of `.ready` is held back. Everything else is immediate — in particular
+    /// 连接中 → 连接失败 in the guide, where someone is waiting to learn whether the
+    /// token they just pasted works.
+    static func connectionStatusShowsImmediately(
+        _ status: RealtimeClient.Status,
+        shown: RealtimeClient.Status
+    ) -> Bool {
+        status.isReady || !shown.isReady
+    }
+
+    private func observeConnectionStatus() {
+        connectionStatusChanged()
+        withObservationTracking {
+            _ = client.status
+        } onChange: { [weak self] in
+            // `onChange` runs before the new value is stored; read it on the next turn.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.observeConnectionStatus() }
+            }
+        }
+    }
+
+    private func connectionStatusChanged() {
+        let status = client.status
+        if Self.connectionStatusShowsImmediately(status, shown: connectionStatus) {
+            connectionOutageReveal?.cancel()
+            connectionOutageReveal = nil
+            if connectionStatus != status { connectionStatus = status }
+            return
+        }
+        // Ready on screen, not ready underneath: one clock per drop, however many
+        // states the client passes through on its way back.
+        guard connectionOutageReveal == nil else { return }
+        let reveal = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.connectionOutageReveal = nil
+                let status = self.client.status
+                if self.connectionStatus != status { self.connectionStatus = status }
+            }
+        }
+        connectionOutageReveal = reveal
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.connectionOutageRevealDelay,
+            execute: reveal
+        )
     }
 
     // MARK: - Lifecycle
@@ -1071,6 +1143,8 @@ final class DictationController {
         queuedGestureFailureMessage = nil
         utteranceGeneration += 1
         utteranceStart = Date()
+        utteranceAudioBytes = 0
+        utteranceHeardSignal = false
         utteranceIsRehearsal = identity.isRehearsal
         // A rehearsal types nothing, so it must not stream deltas either — that is the
         // path that puts characters on screen before the key is even released.
@@ -1105,7 +1179,7 @@ final class DictationController {
             includePreroll: true,
             nextPrerollCapacitySeconds: 1
         )
-        if !preroll.isEmpty { client.appendAudio(preroll) }
+        if !preroll.isEmpty { forwardCapturedAudio(preroll) }
 
         startMaxDurationTimer()
         log.info("recording started")
@@ -1138,10 +1212,67 @@ final class DictationController {
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.utteranceGeneration == generation else { return }
+                // Decided here, behind the last chunk, for the same reason the commit
+                // is: the tail of the capture is still on its way through this queue.
+                if self.phase == .finalizing,
+                   Self.captureWasDigitalSilence(
+                       audioBytes: self.utteranceAudioBytes,
+                       heardSignal: self.utteranceHeardSignal
+                   ) {
+                    // Measured: the provider never answers a turn like this, the relay
+                    // gives up on it after five seconds, and that timeout is one of the
+                    // wordless failures — so a dead input looked like a service that was
+                    // slow three sentences in a row. Nothing was said that a transcript
+                    // could hold; say what is wrong instead of sending it.
+                    self.trace("capture_was_silent", fields: [
+                        "audioBytes": String(self.utteranceAudioBytes)
+                    ])
+                    self.client.cancelUtterance()
+                    self.handleFailure(Self.silentMicrophoneMessage)
+                    return
+                }
                 self.client.commitUtterance()
             }
         }
         log.info("recording stopped after \(Date().timeIntervalSince(self.utteranceStart ?? Date()))s")
+    }
+
+    /// Every captured chunk passes through here on its way to the transcriber.
+    private func forwardCapturedAudio(_ data: Data) {
+        utteranceAudioBytes += data.count
+        if !utteranceHeardSignal, Self.pcm16HasSignal(data) {
+            utteranceHeardSignal = true
+        }
+        client.appendAudio(data)
+    }
+
+    static let silentMicrophoneMessage = "麦克风没有声音"
+
+    /// Whether a PCM16 chunk holds anything a microphone could have produced.
+    ///
+    /// A working input is never exactly silent — a quiet room still leaves a noise
+    /// floor several counts wide. A muted or dead one keeps delivering buffers on
+    /// schedule with every sample at zero, which is why neither the capture-failure
+    /// path nor `verifyCaptureResumed` notices it: both count buffers, not content.
+    /// One count either side of zero is allowed for a converter's rounding.
+    static func pcm16HasSignal(_ data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            var offset = 0
+            while offset + 1 < raw.count {
+                let sample = raw.loadUnaligned(fromByteOffset: offset, as: Int16.self)
+                if sample > 1 || sample < -1 { return true }
+                offset += 2
+            }
+            return false
+        }
+    }
+
+    /// A whole second of capture without a single sample above the floor is a dead
+    /// microphone, not a quiet speaker. Shorter than that is left to the ordinary
+    /// path: some inputs spend their first few hundred milliseconds delivering zeros
+    /// while they wake, and a brief press can end inside that.
+    static func captureWasDigitalSilence(audioBytes: Int, heardSignal: Bool) -> Bool {
+        !heardSignal && audioBytes >= AudioCapture.bytesPerSecond
     }
 
     private func startMaxDurationTimer() {
@@ -1970,6 +2101,10 @@ final class DictationController {
             "confirmsCleanup": String(confirmsCleanup)
         ])
         let interruptionNotice = captureInterruptionNotice
+        // A sentence that could not be put at the caret is handed to the clipboard, and
+        // until now nothing said so: the pill finished as if the text had landed.
+        let clipboardFallbacksBefore = TextInjector.clipboardFallbackCount
+        let hadLiveText = !injectedText.isEmpty
         defer {
             DictationDiagnostics.end(reason: "finish")
             partialText = ""
@@ -1988,6 +2123,8 @@ final class DictationController {
             phase = .idle
             if let interruptionNotice {
                 showError(interruptionNotice)
+            } else if TextInjector.clipboardFallbackCount != clipboardFallbacksBefore {
+                showError(Self.clipboardFallbackNotice(hadLiveText: hadLiveText))
             }
         }
 
@@ -2045,6 +2182,13 @@ final class DictationController {
         if confirmsCleanup { markSettled() }
     }
 
+    /// What the pill says when a sentence went to the clipboard instead of the caret.
+    /// With part of it already typed, a paste would repeat that part — so the words
+    /// say what the clipboard holds rather than what to press.
+    static func clipboardFallbackNotice(hadLiveText: Bool) -> String {
+        hadLiveText ? "完整内容已复制" : "已复制，按 ⌘V 粘贴"
+    }
+
     /// Says that cleanup is done, for a beat after it is.
     ///
     /// Only on the cleanup path, and only where text was actually emitted. Without
@@ -2095,6 +2239,23 @@ final class DictationController {
               let targetPID = injectionAnchor.processIdentifier,
               injectionAnchor == current,
               injectionTarget.map(TextInjector.targetIsStillFocused) ?? true else {
+            // Everything this guard defends is text of ours that is already on screen.
+            // When live typing never produced any — a click into the field after the
+            // key went down is enough to stop it — there is nothing to defend, and the
+            // sentence is in exactly the position a paste-mode sentence is in: deliver
+            // it the way that mode does. Measured: without this the whole sentence went
+            // to the clipboard and nothing at all appeared.
+            if Self.untypedFinalMayPasteAtCaret(
+                typedIsEmpty: typed.isEmpty,
+                targetPID: self.injectionAnchor?.processIdentifier,
+                ownPID: ProcessInfo.processInfo.processIdentifier,
+                frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier
+            ), let targetPID = self.injectionAnchor?.processIdentifier {
+                trace("rewrite_fallback", fields: ["reason": "nothing_typed_paste_at_caret"])
+                log.info("live typing never started; pasting the transcript at the caret")
+                TextInjector.paste(final, targetPID: targetPID)
+                return
+            }
             trace("rewrite_fallback", fields: ["reason": "anchor_or_focus_changed"])
             log.info("focus moved since the text was typed; full transcript copied to clipboard")
             TextInjector.copyToClipboard(final)
@@ -2244,6 +2405,18 @@ final class DictationController {
         trace("final_posting_finished", fields: ["editorAcknowledgement": "unavailable"])
     }
 
+
+    /// The rule `finish` applies to a sentence that was never typed live: same app,
+    /// and not this one. `TextInjector.paste` re-proves the app before it writes.
+    static func untypedFinalMayPasteAtCaret(
+        typedIsEmpty: Bool,
+        targetPID: pid_t?,
+        ownPID: pid_t,
+        frontmostPID: pid_t?
+    ) -> Bool {
+        guard typedIsEmpty, let targetPID, targetPID != ownPID else { return false }
+        return targetPID == frontmostPID
+    }
 
     /// Runs only after the pasteboard and keyboard events are ready. Preparation
     /// can block; the last input/ownership check must follow it, not precede it.

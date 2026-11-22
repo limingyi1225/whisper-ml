@@ -316,6 +316,7 @@ enum TextInjector {
             // Focus moved while the board was being written. Leaving `text` on the
             // board is the intended fail-closed result — one Cmd-V recovers it.
             if replacement != nil { copyToClipboard(fallbackText) }
+            else { clipboardFallbackCount &+= 1 }
             return
         }
         guard pasteboard.changeCount == ourChangeCount else {
@@ -470,6 +471,17 @@ enum TextInjector {
             task: task
         )
     }
+
+    /// Bumped each time the pasteboard is handed a transcript that did not reach the
+    /// caret — the one outcome the user has to be told about, because nothing on screen
+    /// shows it. The controller compares it across a delivery to know whether to say so.
+    ///
+    /// Counted where it becomes true rather than where it is asked for: in
+    /// `replaceClipboard`, which every such hand-off goes through, and at the one exit
+    /// of `paste` that deliberately leaves its own text on the board. A copy that is
+    /// only *deferred* behind an earlier unproven paste is not counted — the board does
+    /// not hold it yet, and "press ⌘V" would paste the earlier sentence instead.
+    private(set) static var clipboardFallbackCount = 0
 
     static func copyToClipboard(_ text: String) {
         DictationDiagnostics.record("clipboard_fallback_requested", texts: ["text": text])
@@ -917,6 +929,7 @@ enum TextInjector {
     }
 
     private static func replaceClipboard(with text: String) {
+        clipboardFallbackCount &+= 1
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
