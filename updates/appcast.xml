@@ -9,6 +9,21 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>Whisper 的稳定版更新</description>
         <language>zh-CN</language>
         <item>
+            <title>1.19</title>
+            <pubDate>Sun, 22 Nov 2026 22:29:24 -0500</pubDate>
+            <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.19</link>
+            <sparkle:version>20</sparkle:version>
+            <sparkle:shortVersionString>1.19</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[Whisper 1.19
+
+- 新增转写模型 Soniox v6，可以在设置里自己选。它出字更快，但不做整理：说了什么就出什么。默认仍是 Gemini。
+- 移除了两个 OpenAI 模型。之前选了它们的，升级后会自动改用 Gemini。
+- 修复：用出字快的模型时，句子最后几个字偶尔没有打出来、只提示“完整内容已复制”的问题。
+]]></description>
+            <enclosure url="https://github.com/limingyi1225/whisper-ml/releases/download/v1.19/Whisper-1.19-20.dmg" length="3368333" type="application/octet-stream" sparkle:edSignature="3IeR18fy7OdN7Al33dmfSbtxfRG48RL7N/MHCd0qDL4YOtWZLesK6KAxcGxqvL+ATAupphEmLa7MH4yFETEFDA=="/>
+        </item>
+        <item>
             <title>1.18</title>
             <pubDate>Sun, 22 Nov 2026 12:07:38 -0500</pubDate>
             <link>https://github.com/limingyi1225/whisper-ml/releases/tag/v1.18</link>
@@ -233,6 +248,6 @@ Adds optional local dictation diagnostics, disabled by default, with bounded log
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: v/BHBbQmCeH6SUIuktAPy3RHrC7LnBo65LL1R9acW92znhFuH6GeGpmpTS3cO3bpX+U+KFymx03HHfFH2J/xCw==
-length: 19312
+edSignature: PrcnJ1anGN/kj0iwVBlbd+3XKAXxmTT7A+R2urZMnxg6u0Nv9o97aOgaBIs3CMAFdZVxL2H4QChvuqZigW9MBA==
+length: 20471
 -->
