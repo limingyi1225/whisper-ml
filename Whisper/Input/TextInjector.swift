@@ -856,14 +856,30 @@ enum TextInjector {
         _ text: String,
         target: TextInjectionTarget
     ) -> Bool {
-        guard focusedElementMatches(target.element) == true,
-              let originalSelection = target.selection,
-              let currentSelection = selectedTextRange(of: target.element),
-              selectionMatches(
-                snapshot: originalSelection,
-                current: currentSelection,
-                insertedUTF16Count: text.utf16.count
-              ) else {
+        // Each refusal says which reading produced it. A bare `false` left the one
+        // failure that mattered undiagnosable: the log showed the proof refused and not
+        // whether the field, the caret or the text had disagreed.
+        guard focusedElementMatches(target.element) == true else {
+            DictationDiagnostics.record("ax_original_range_rejected", fields: ["reason": "element_not_focused"])
+            return false
+        }
+        guard let originalSelection = target.selection else { return false }
+        guard let currentSelection = selectedTextRange(of: target.element) else {
+            DictationDiagnostics.record("ax_original_range_rejected", fields: ["reason": "selection_unreadable"])
+            return false
+        }
+        guard selectionMatches(
+            snapshot: originalSelection,
+            current: currentSelection,
+            insertedUTF16Count: text.utf16.count
+        ) else {
+            DictationDiagnostics.record("ax_original_range_rejected", fields: [
+                "reason": "caret_not_where_predicted",
+                "originalLocation": String(originalSelection.location),
+                "insertedUTF16": String(text.utf16.count),
+                "selectionLocation": String(currentSelection.location),
+                "selectionLength": String(currentSelection.length)
+            ])
             return false
         }
 

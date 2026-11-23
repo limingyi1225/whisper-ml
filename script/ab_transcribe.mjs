@@ -8,6 +8,11 @@
 // numbers can be retaken against whatever the app is actually pointed at, and so the
 // keywords/languages questions get decided by data rather than by the docs' adjectives.
 //
+// Since 1.19 the app offers neither OpenAI model, so this no longer measures anything a
+// user can select: it is the record of how the OpenAI numbers in the README were taken,
+// and the tool to retake them if that route ever comes back. `delay` in particular is a
+// field the app has stopped sending.
+//
 // It talks to OpenAI directly, never through the relay: the relay's allowlist is
 // derived from the Swift enum, so a model that has been swapped out is no longer
 // reachable that way — and comparing the new model against the old one is the entire
@@ -16,7 +21,8 @@
 // What it deliberately copies from the app, because a benchmark that does not is
 // measuring something else:
 //
-//   - the session config from `RealtimeClient.sendSessionUpdate`, field for field;
+//   - the session config `RealtimeClient.sendSessionUpdate` sent for those models,
+//     field for field;
 //   - 24 kHz mono PCM16, the format `AudioCapture` converts to;
 //   - ~2048-byte appends, which is what one 2048-frame tap at a 48 kHz input becomes
 //     after conversion;

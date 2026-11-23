@@ -65,15 +65,6 @@ private struct DictationSettingsTab: View {
                     }
                 }
                 .onChange(of: settings.transcriptionModel) { controller.reconnect() }
-
-                if settings.transcriptionModel.supportsTranscriptionDelay {
-                    Picker("延迟", selection: $settings.transcriptionDelay) {
-                        ForEach(TranscriptionDelay.allCases) { delay in
-                            Text(delay.displayName).tag(delay)
-                        }
-                    }
-                    .onChange(of: settings.transcriptionDelay) { controller.reconnect() }
-                }
             }
 
             Section("文本") {

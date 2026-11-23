@@ -91,8 +91,16 @@ open -n --env WHISPER_INJECTION_SELFTEST=2 --env WHISPER_SELFTEST_APP=TextEdit /
 > ——`UserDefaults` 里存的 `"fn"` 解析不出对应的枚举值，就走了默认值，App 不会提示。
 > 如果你按住 Fn 发现没反应，去设置里重新挑一个键即可。
 
-文本整理始终开启，不再有单独开关。Gemini 由 SMART 转写在同一次请求中完成；
-OpenAI 备用模式才会在转写后调用 Luna。人名和术语的处理分两层：
+转写模型有两个，在设置里自己选：**Gemini 3.5 Transcribe Live**（默认）和 **Soniox v6**。
+文本整理没有单独开关，跟着模型走：Gemini 由 SMART 转写在同一次请求中完成整理；Soniox
+不做整理——选它就是为了快，说了什么就出什么，口头禅和改口都会原样留下。
+
+> 模型列表里原来还有 **OpenAI Live** 和 **OpenAI Transcribe**，1.19 去掉了。之前选了它们的
+> 机器升级后会**静默回落到 Gemini**——`UserDefaults` 里存的模型名解析不出对应的枚举值，
+> 就走了默认值，App 不会提示。
+
+人名和术语的处理分两层。第一条是 Gemini 整理时做的，实测也都是在 Gemini 上测的，Soniox 上
+没有测过；「常用词汇」两个模型都会收到：
 
 - **明显是英文名音译的，不用配置就会转成原名**：「凯文和艾米明天过来」→「Kevin 和 Amy
   明天过来」，「我跟莎拉聊过了」→「我跟 Sarah 聊过了」。中文名字（于诗禾、小明）、公司
@@ -102,9 +110,8 @@ OpenAI 备用模式才会在转写后调用 Luna。人名和术语的处理分�
   `赵砚辞`，「赵言词老师」会修成「赵砚辞老师」；写了 `Xcode`，「我用 ex code 打开」会
   修成 Xcode。
 
-没有单独的「出字方式」开关：Gemini 和 OpenAI Live 都会边说边上屏，OpenAI Transcribe
-则是松手后一次上屏。Gemini 只提交相邻 hypothesis 一致的稳定前缀，见下面
-「Gemini 的中间结果可以改写」。
+没有单独的「出字方式」开关：两个模型都会边说边上屏，而且都只提交相邻两次中间结果一致的
+稳定前缀，见下面「Gemini 的中间结果可以改写」。
 
 ## 结构
 
@@ -123,7 +130,7 @@ Whisper/
     ├── Onboarding.swift           第一次打开的引导窗口
     └── SettingsView.swift
 DictationKit/                    本地 SwiftPM 包，见下
-server/                          可选的自托管 Relay（Gemini/OpenAI WebSocket + OpenAI 备用整理）
+server/                          可选的自托管 Relay（Gemini / Soniox WebSocket；OpenAI 线路与整理接口仍在，已不可选）
 ```
 
 ### DictationKit
@@ -160,7 +167,7 @@ async 函数跑在哪个 executor 上。`DictationKit/Package.swift` 里记了�
 ## 代理模式（本机不放上游 API Key）
 
 Relay 是**唯一**的连接方式。Mac 上不存任何上游 API Key，只持有 Keychain 中一枚可撤销的
-设备 Token；Gemini / OpenAI 的 Key 只存在服务器上。流量走已经配置好的
+设备 Token；Gemini / Soniox / OpenAI 的 Key 只存在服务器上。流量走已经配置好的
 `https://limingyi.com/whisper-relay`。
 
 名字里没有「大陆」是有意的：它解决的是**本机不放上游 Key**，无 VPN 可用只是其中一个
@@ -172,7 +179,10 @@ Token 复制给别人——不管对方在哪个国家。
 它已经删掉了。默认路径换成 Gemini 之后直连就无路可走（Gemini 的直连鉴权从来没做），
 留着只是让每个碰路由、设置界面和首次引导的改动都要多照顾一条走不通的分支。
 
-Relay 同时覆盖 Gemini/OpenAI Realtime WebSocket，以及 OpenAI 备用模式松手后的 HTTPS 整理。
+Relay 覆盖 Gemini 和 Soniox 两条 Realtime WebSocket 线路。OpenAI 的 WebSocket 线路和
+松手后的 HTTPS 整理接口（`/v1/polish`）代码还在，但 Whisper 里已经没有能选到它们的模型，
+默认的模型 allowlist 里也没有 gpt 模型，所以 OpenAI 的转写线路默认走不通。这些代码这次没删，
+只是为了让去掉模型的这次改动小一点；之后会连同整条 OpenAI 线路一起删掉。
 设置发生变化时，如果当前有一句正在转写，应用会等它结束再重连，不会中途换线路或重放音频。
 
 启动 Relay：
@@ -182,7 +192,9 @@ cd server
 npm install
 npm run generate-token
 cp .env.example .env
-# 编辑 .env：填 GEMINI_API_KEY 和 OPENAI_API_KEY，并把生成出来的 hash 填入
+# 编辑 .env：填 GEMINI_API_KEY 和 OPENAI_API_KEY（后者现在只有 /v1/polish 用，但仍是
+# 启动必填项）；SONIOX_API_KEY 可选，不填则 Soniox 线路不可用，其余照常。再把生成出来的
+# hash 填入
 # RELAY_DEVICE_TOKEN_HASHES。普通本机启动保持两个 enrollment 路径为注释状态；
 # 它们是 systemd 部署选项，不应指向本机通常不存在的 /var/lib 和 /run 目录。
 npm test
@@ -271,7 +283,7 @@ header。`GET /healthz`（或 `<前缀>/healthz`）可用于健康检查；发�
 
 ### 边界与自查
 
-Relay 只允许本 App 使用的三个转写模型、固定的 OpenAI 备用整理模型和有限的请求形状；另外限制每设备并发、
+Relay 只允许本 App 使用的两个转写模型、固定的整理模型和有限的请求形状；另外限制每设备并发、
 单轮音频大小和整理频率。上限不是随手取的整数，是按 App 自己那 610 秒音频缓冲推出来的——改
 客户端缓冲时对应改 `CLIENT_MAX_TURN_AUDIO_BYTES`。上行拥塞时 Relay 会暂停读取来施加背压，
 而不是掐断连接，否则丢掉的正是排队补录机制要保住的那句话。Relay 每 25 秒 ping 一次 Mac，
@@ -335,7 +347,41 @@ session 里第二句的 final 会带着第一句一起回来（interim 不会）
 （`GEMINI_IDLE_KEEPALIVE_MS`，设 0 关闭）。静音的迷你 turn 也能保活，但会污染下一句的
 转写，不要用。
 
-**OpenAI 备用的便宜模型换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
+**Soniox 线路一句话一条流，空闲时不开流。** Soniox（`stt-rt-v6`）按**流的时长**计费，
+不是按流里的音频：一条开着的流哪怕只在发 keepalive 也在计费，而 App 的连接是全天常驻的。
+所以 Relay 在 App 连上时只建好并鉴权 Soniox 的 WebSocket，**不发 start 消息**（没开流的
+连接只要每 40 秒内有消息就不会被关，Relay 每 15 秒发一次 `ping`）；这一句的第一块音频到了
+才开流，松手时发 `finalize` 加一个空文本帧结束流，收到 `<fin>` 或 `finished` 就交付，
+然后和 Gemini 一样带上 `session_replacement_required` 关闭连接，App 立刻重连预热下一句。
+松手（commit）之后 Relay 不再发任何中间结果，这一句剩下的字都由最终结果一次带回来。实测 App
+这边最后一次中间结果和最终结果只隔 5～10 毫秒：刚按中间结果敲完键，就拿着最终结果去问文档
+光标在哪，而那次按键还没落进去。那两条是 Soniox 同一帧里出来的，还是相隔几毫秒的两帧，没有
+直接观察过；这条规则不依赖是哪一种。改完之后的间隔还没量，App 自己那 300 毫秒的等待仍然是
+兜底。
+
+语言固定成中英两种：`language_hints: ["zh", "en"]` 加 `language_hints_strict: true`，
+也就是既偏向这两种，也要求不要输出别的语言。Soniox 文档说 strict 是尽力而为、单语言时
+最稳；中英混说如果因此变差，在服务器 `.env` 里设 `SONIOX_LANGUAGE_HINTS_STRICT=0` 即可，
+不用发版。`context` 只是背景描述（听写场景、简体中文夹英文），不是指令通道——Soniox 不会
+删口头禅和改口误。App 也**故意不**在它后面接 Luna：整理要多等将近一秒，比 Soniox 省下的
+还多，而选这条线路就是为了快。所以 Soniox 的结果是原话。常用词汇走 `context.terms`，
+没有整理那一层兜底。
+
+**这条线路对着真实服务量过一次（2026-11-22，一句 6.7 秒的合成中英混合语音）。** 未开流的
+连接保持 45 秒，3 个 ping 全部有回应；strict 加两种语言的 start 消息被接受；`finalize` 后
+49 ms 收到 `<fin>`、199 ms 收到 `finished`，`<fin>` 之后没有再出现非 final 的 token。
+经公网 Relay 走完整协议：commit 到 completed 173 ms，中间结果 29 次，转写一字不差。
+样本只有一句，而且是合成语音：它说明协议和延迟站得住，不说明真人口语的准确率。重测：
+
+```bash
+SONIOX_API_KEY=... node server/scripts/soniox-smoke.mjs 一段录音.m4a
+```
+
+**下面标着「OpenAI」的几条说的是一条已经选不到的线路。** OpenAI 的两个转写模型在 1.19
+从模型列表里去掉了，但 `TranscriptPolisher`、`.openAI` provider、Relay 的 OpenAI bridge 和
+`/v1/polish` 还在代码里，之后会一起删掉。在那之前这几条留着，因为它们是那些代码的设计依据。
+
+**OpenAI 的便宜模型换不来实时上屏。** 实测同一段音频：`gpt-live-transcribe` 在 commit 前发出
 20 个 delta，`gpt-transcribe` 是 **0 个**。注意不能看 delta 总数——两者总数几乎一样
 （23 vs 24），差别全在时间上：便宜那档把每一个 delta 都堆到 commit 之后才发，那时人已经
 松手了。所以出字方式不是一个独立选项，而是模型能力的直接结果。
@@ -346,7 +392,7 @@ session 里第二句的 final 会带着第一句一起回来（interim 不会）
 是不够的：上一轮超时取消后，它的迟到事件可能抢在新一轮前面到达、把自己的 id 认领成新一轮
 的 id，于是旧句子结束了新录音，真正的新结果反被丢弃。所以放弃的轮次会进 retired 名单。
 
-**OpenAI 备用路径的转写和整理必须分开做。** 非 realtime 模型确实支持 `prompt` 参数，看起来可以让它
+**OpenAI 路径的转写和整理必须分开做。** 非 realtime 模型确实支持 `prompt` 参数，看起来可以让它
 "边转写边整理"。实测不行：同一段音频、同一个模型，唯一变量是加不加整理 prompt，加了之后
 `deadline`→`dead line`、`backend`→`button`、`Kevin`→`Kelvin`，而且口头禅还没删干净
 （gpt-4o-mini-transcribe 更是完全无视）。`prompt` 在 Whisper 系列里是词汇/风格偏置，
@@ -358,7 +404,7 @@ session 里第二句的 final 会带着第一句一起回来（interim 不会）
 限制没有了。实测同一段音频、唯一变量是这个字段：不加是「李**明**一」「赵**云熙**」，加了是
 「李**铭**一」「赵**芸溪**」，首字延迟没变化。
 
-在 OpenAI 备用路径里，整理那侧的词表仍留着，因为 keywords 是概率偏置不是保证。
+在 OpenAI 路径里，整理那侧的词表仍留着，因为 keywords 是概率偏置不是保证。
 Gemini 路径只把这份词表发给 SMART 转写，不做第二次改写。
 
 **词表的校验规则比看起来重要。** 它以前只喂整理模型，一条烂词最多少修一个字；现在它进了
@@ -379,7 +425,8 @@ Gemini 路径只把这份词表发给 SMART 转写，不做第二次改写。
 
 **OpenAI Live 开头几个字的语言识别错，用 `delay` 调。** 流式模型必须在听完整句之前就吐字，开头
 天然缺上下文。`delay` 就是控制吐字前先听多久的旋钮，实测首字返回时间：minimal 737ms、
-low 811ms、medium 1250ms、high 1937ms。设置里叫「出字前先听多久」。
+low 811ms、medium 1250ms、high 1937ms。这个旋钮只对 OpenAI Live 有意义，已随它一起从
+设置里去掉；存下来的值暂时还留着，会和 OpenAI 线路一起删。
 
 **改写已上屏的文字前必须确认光标还在原处。** 整理是异步的，那 1.5 秒里用户可能已经点了
 别处、继续打字或切了 App。此时再按「删 N 个字符」去重写，删掉的就是别人的文字。所以松手
@@ -390,7 +437,7 @@ low 811ms、medium 1250ms、high 1937ms。设置里叫「出字前先听多久�
 全部重打——差异出现在句首就等于整句重写，看起来就是"闪一下"。而 realtime 模型会在中文
 句号后面加个空格、整理模型又会把它去掉，正好制造句首差异。所以纯空格差异直接跳过不改。
 
-**OpenAI 备用的整理模型固定为 gpt-5.6-luna，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
+**OpenAI 路径的整理模型固定为 gpt-5.6-luna，不暴露选项。** 8 轮交替实测过一批候选（gpt-5.4-mini
 中位 1.68s 但出现过 4.70s；gpt-5.6 系列中位都在 1.7s 上下、尾部收敛），档位之间的差距
 在噪音以内，不值得一个设置项，最终按当前客户端档位定为 luna 并写死。
 
@@ -424,7 +471,7 @@ caret 级检查必然产生假阴性。丢句风险由超时路径兜底：目�
 到来的重试。现在的做法是**在出队之前**先探一次路由：探失败就一次性清空整个队列、只报一条
 错（并说明丢了几句），而不是逐句出队、逐句销毁音频、逐句弹同一条错误提示。
 
-**OpenAI 备用的整理挂掉时会提示一次，但不影响出字。** 整理失败一律回退到原始转写，文字照常上屏——
+**OpenAI 路径的整理挂掉时会提示一次，但不影响出字。** 整理失败一律回退到原始转写，文字照常上屏——
 但如果失败原因是**会一直失败**的那种（API Key 无效、额度不足、地区被拒），静默就等于每句
 话都白白失去整理而屏幕上毫无线索。所以这类原因会在文字落地**之后**弹一次提示条（不是错误
 路径，句子已经交付了），同一个原因不重复弹，下次整理成功就清空标记。超时、5xx、限流这类

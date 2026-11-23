@@ -12,42 +12,70 @@ import Foundation
 // in the app, as extensions: the package has no business holding UI copy, and
 // keeping it out means no localisation lives down here.
 
+/// No selectable model uses `.openAI` any more. The provider, `TranscriptPolisher`, the
+/// polish path and the relay's OpenAI bridge stay only to keep the change that removed
+/// the models small; they are to be removed together in a follow-up.
 public enum TranscriptionProvider: String, Sendable {
     case openAI = "openai"
     case gemini
+    case soniox
 
+    /// Whether a finished transcript takes the separate text pass before it is delivered.
+    ///
+    /// Gemini SMART cleans up inside the transcription turn, so nothing is left to do.
+    /// Soniox does no cleanup at all and is deliberately left that way: it is the route
+    /// chosen for speed, and the text pass costs about a second after the key is
+    /// released — more than Soniox saves. Its sentences are delivered as spoken, filler
+    /// words included. Only the OpenAI route pays for the pass.
     public var requiresSeparatePolish: Bool { self == .openAI }
+
+    /// Whether a turn's `item_id` comes from the provider or is made up by the relay.
+    ///
+    /// OpenAI names every event with the item it belongs to, so a turn that was given
+    /// up on can be retired by id and the socket kept. Gemini and Soniox results carry
+    /// no turn identity at all — the relay synthesizes one for the app's benefit — so
+    /// once audio has reached them, only a fresh session can prove that a late result
+    /// is not from the abandoned sentence.
+    public var identifiesTurnsItself: Bool { self == .openAI }
+
+    /// Whether the final transcript arrives exactly as the interims were written.
+    ///
+    /// Soniox delivers the sentence as spoken, with no cleanup inside the turn or after
+    /// it, so its final can carry the interims' own artifacts — a stray space after `。`
+    /// is the measured one. Gemini SMART's final has already been cleaned, and is
+    /// delivered untouched.
+    public var finalIsUncleaned: Bool { self == .soniox }
 }
 
 public enum TranscriptionModel: String, CaseIterable, Sendable {
     case geminiLive = "gemini-3.5-transcribe-live"
-    case liveTranscribe = "gpt-live-transcribe"
-    case transcribe = "gpt-transcribe"
+    case sonioxLive = "stt-rt-v6"
 
     public var provider: TranscriptionProvider {
         switch self {
         case .geminiLive: .gemini
-        case .liveTranscribe, .transcribe: .openAI
+        case .sonioxLive: .soniox
         }
     }
 
-    /// Measured on identical audio: the live model emitted 20 deltas before
-    /// `input_audio_buffer.commit`, the other zero. Delta *count* is not the
-    /// discriminator — both emitted about the same number overall (23 and 24) —
-    /// only their timing is. gpt-transcribe holds every one of them until the turn
-    /// is committed, by which point the key is already up and there is nothing left
-    /// to type into. Retake with `script/ab_transcribe.mjs`.
-    /// Gemini also types while speaking, but its stream needs different handling:
-    /// its interim is a revisable snapshot rather than an append-only delta, so the
-    /// controller types only what two consecutive hypotheses agree on and takes back
-    /// the rest with backspaces. See `DictationController.emitPartial`.
-    public var supportsLiveTyping: Bool { self == .liveTranscribe || self == .geminiLive }
-
-    /// OpenAI's latency/context knob has no Gemini equivalent.
-    public var supportsTranscriptionDelay: Bool { self == .liveTranscribe }
+    /// Whether the model returns words while the key is still down.
+    ///
+    /// Both models do. Each interim is a snapshot of the whole sentence so far rather
+    /// than an append-only delta: Gemini may rewrite what it already sent, and Soniox
+    /// sends the tokens it has marked final followed by a tail it may still revise. The
+    /// controller therefore types only what two consecutive snapshots agree on and takes
+    /// back the rest with backspaces. See `DictationController.emitPartial`.
+    ///
+    /// The property stays for a model that cannot: one that holds every word until the
+    /// turn is committed has nothing to type into by then, and is pasted once at the end.
+    public var supportsLiveTyping: Bool { true }
 }
 
 /// How much audio the model hears before it commits to words.
+///
+/// No remaining model reads this. It stays, with the protocol requirement below, only
+/// to keep the change that removed the OpenAI models small, and goes with the rest of
+/// the OpenAI route in a follow-up.
 public enum TranscriptionDelay: String, CaseIterable, Sendable {
     case minimal, low, medium, high, xhigh
 }

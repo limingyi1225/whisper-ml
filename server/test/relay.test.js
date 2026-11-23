@@ -47,6 +47,15 @@ const baseEnv = {
   GEMINI_API_KEY: "test-gemini-key",
   RELAY_DEVICE_TOKEN_HASHES: tokenDigest(token),
 };
+// No shipped default allowlists an OpenAI model any more — no app build can select one —
+// but the OpenAI bridge and the validation in front of it are still shipped code. The
+// tests that exercise them opt in explicitly, the way a deployment wanting that route
+// would have to.
+const openAIRouteEnv = {
+  ...baseEnv,
+  ALLOWED_TRANSCRIPTION_MODELS:
+    "gemini-3.5-transcribe-live,stt-rt-v6,gpt-live-transcribe,gpt-transcribe",
+};
 
 test("deploy mutations share the flock owner's SSH connection and fail closed", () => {
   const script = readFileSync(
@@ -295,9 +304,11 @@ test("values spliced into a remote shell are checked before they get there", () 
     ["model", "gpt-5.6'; id > /tmp/OWNED; echo '", "REJECT"],
     ["model", "gpt-5.6 luna", "REJECT"],
     ["model", "", "REJECT"],
-    ["gemini-key", "ordinary-key_value", "accept"],
-    ["gemini-key", "key\rwith-hidden-return", "REJECT"],
-    ["gemini-key", "", "REJECT"],
+    // One guard for every credential written into the EnvironmentFile: Gemini's and
+    // Soniox's both pass through it.
+    ["api-key", "ordinary-key_value", "accept"],
+    ["api-key", "key\rwith-hidden-return", "REJECT"],
+    ["api-key", "", "REJECT"],
     ["gemini-provenance", "SAME", "retained"],
     ["gemini-provenance", "DIFFERENT", "updated"],
     ["gemini-provenance", "warning-on-stdout", "REJECT"],
@@ -647,13 +658,16 @@ test("defaults are loopback-bound and derived from the client's audio buffer", (
   assert.equal(config.maxTotalTranscriptionBytesPerDay, 48_000 * 43_200);
   assert.equal(config.maxPolishRequestsPerDevicePerDay, 1_000);
   assert.equal(config.maxTotalPolishRequestsPerDay, 6_000);
-  assert.deepEqual(
-    [...config.allowedOpenAITranscriptionModels],
-    ["gpt-live-transcribe", "gpt-transcribe"],
-  );
+  // The two models the app can select. Nothing reaches the OpenAI bridge by default.
+  assert.deepEqual([...config.allowedOpenAITranscriptionModels], []);
   assert.deepEqual(
     [...config.allowedGeminiTranscriptionModels],
     ["gemini-3.5-transcribe-live"],
+  );
+  assert.deepEqual([...config.allowedSonioxTranscriptionModels], ["stt-rt-v6"]);
+  assert.deepEqual(
+    [...loadConfig(openAIRouteEnv).allowedOpenAITranscriptionModels],
+    ["gpt-live-transcribe", "gpt-transcribe"],
   );
 
   const overridden = loadConfig({
@@ -768,7 +782,7 @@ test("polish requests are restricted to the allowlisted shape", () => {
 });
 
 test("Realtime validation permits transcription but rejects arbitrary sessions", () => {
-  const config = loadConfig(baseEnv);
+  const config = loadConfig(openAIRouteEnv);
   const state = { turnAudioBytes: 0 };
   const sessionUpdate = Buffer.from(JSON.stringify({
     type: "session.update",
@@ -800,7 +814,7 @@ test("Realtime validation permits transcription but rejects arbitrary sessions",
 });
 
 test("Realtime model validation is scoped to the selected provider", () => {
-  const config = loadConfig(baseEnv);
+  const config = loadConfig(openAIRouteEnv);
   const sessionUpdate = (model) => Buffer.from(JSON.stringify({
     type: "session.update",
     session: {
@@ -841,7 +855,7 @@ test("Realtime model validation is scoped to the selected provider", () => {
 });
 
 test("Realtime validation bounds the keywords list", () => {
-  const config = loadConfig(baseEnv);
+  const config = loadConfig(openAIRouteEnv);
   const state = { turnAudioBytes: 0 };
   const withKeywords = (keywords) => Buffer.from(JSON.stringify({
     type: "session.update",

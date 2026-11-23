@@ -24,6 +24,13 @@ import {
   FixedWindowRateLimiter,
 } from "./rate-limit.js";
 import { bridgeRealtime, revokeDownstream } from "./realtime.js";
+import { bridgeSonioxRealtime } from "./soniox-realtime.js";
+
+const REALTIME_BRIDGES = Object.freeze({
+  openai: bridgeRealtime,
+  gemini: bridgeGeminiRealtime,
+  soniox: bridgeSonioxRealtime,
+});
 
 const config = loadConfig();
 const enrollmentRegistry = config.enrollmentRegistryFile
@@ -240,7 +247,7 @@ server.on("upgrade", (request, socket, head) => {
   const provider = url.searchParams.get("provider") || "openai";
   if (routePath(url, config.basePath) !== "/v1/realtime"
       || url.searchParams.get("intent") !== "transcription"
-      || !new Set(["openai", "gemini"]).has(provider)) {
+      || !Object.hasOwn(REALTIME_BRIDGES, provider)) {
     socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     return;
   }
@@ -347,7 +354,24 @@ server.on("upgrade", (request, socket, head) => {
     // dies and every other user's session goes with it. One bad connection should cost
     // one connection.
     try {
-      const bridge = provider === "gemini" ? bridgeGeminiRealtime : bridgeRealtime;
+      if (provider === "soniox" && !config.sonioxAPIKey) {
+        // The route exists but this deployment was never given a key for it. Said over
+        // the socket rather than as a 404, so the app shows the reason instead of
+        // "版本对不上"; "API Key" is the phrase that stops its retry ladder.
+        downstream.send(JSON.stringify({
+          type: "error",
+          error: {
+            message: "转发服务器还没有配置 Soniox API Key（SONIOX_API_KEY is not set）",
+            type: "relay_error",
+            code: "relay_soniox_not_configured",
+          },
+        }));
+        session.end = "soniox-not-configured";
+        downstream.once("close", (code) => release(code));
+        downstream.close(1011, "soniox not configured");
+        return;
+      }
+      const bridge = REALTIME_BRIDGES[provider];
       session.upstream = bridge(downstream, config, {
         consumeAudio: (bytes) => transcriptionDailyUsage.take(deviceID, bytes),
         onEnd: (reason) => { session.end = auditConnectionEnd(reason); },
@@ -364,7 +388,7 @@ server.on("upgrade", (request, socket, head) => {
           + (record.event === "end"
             ? ` outcome=${record.outcome}`
               + ` audio_bytes=${record.audioBytes}`
-              + ` audio_rms=${record.audioRMS}`
+              + (Number.isInteger(record.audioRMS) ? ` audio_rms=${record.audioRMS}` : "")
               + ` age_ms=${record.ageMs}`
               + ` chars=${record.chars}`
               + (Number.isInteger(record.finalMs) ? ` final_ms=${record.finalMs}` : "")

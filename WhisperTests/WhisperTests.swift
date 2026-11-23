@@ -926,18 +926,40 @@ import Testing
 }
 
 @Suite struct SettingsTableTests {
-    @Test func streamingModelsTypeLiveAndOnlyOpenAIExposesDelay() {
-        // Both streaming models type as you speak; they differ in how. Gemini's
-        // interim is a revisable snapshot, so the controller types only the prefix two
-        // hypotheses agree on and takes revisions back with backspaces. Only OpenAI has
-        // a latency knob to expose.
+    @Test func bothSelectableModelsTypeWhileSpeaking() {
+        // Two models, and the picker shows exactly these. Both type as you speak from a
+        // revisable snapshot, so the controller types only the prefix two hypotheses
+        // agree on and takes revisions back with backspaces.
+        #expect(TranscriptionModel.allCases == [.geminiLive, .sonioxLive])
         #expect(TranscriptionModel.geminiLive.supportsLiveTyping)
-        #expect(TranscriptionModel.liveTranscribe.supportsLiveTyping)
-        #expect(!TranscriptionModel.transcribe.supportsLiveTyping)
-        #expect(!TranscriptionModel.geminiLive.supportsTranscriptionDelay)
-        #expect(TranscriptionModel.liveTranscribe.supportsTranscriptionDelay)
+        #expect(TranscriptionModel.sonioxLive.supportsLiveTyping)
         #expect(TranscriptionModel.geminiLive.provider == .gemini)
-        #expect(TranscriptionModel.liveTranscribe.provider == .openAI)
+        #expect(TranscriptionModel.sonioxLive.provider == .soniox)
+        // The raw value is the provider's own model id: the relay's allowlist is
+        // derived from these strings, and Soniox is sent this one verbatim.
+        #expect(TranscriptionModel.sonioxLive.rawValue == "stt-rt-v6")
+        // Adding a model must not move the default.
+        #expect(TranscriptionModel(rawValue: "no-such-model") == nil)
+        #expect(TranscriptionModel.allCases.first == .geminiLive)
+        // Each is offered under its own name; neither is presented as a fallback.
+        #expect(TranscriptionModel.allCases.map(\.displayName)
+            == ["Gemini 3.5 Transcribe Live", "Soniox v6"])
+    }
+
+    /// The two OpenAI models left the picker in 1.19. An install that had one selected
+    /// still has that string in its defaults: it has to mean Gemini from now on, not a
+    /// crash and not an empty picker.
+    @Test func aStoredModelThatNoLongerExistsMeansGemini() {
+        #expect(TranscriptionModel(rawValue: "gpt-live-transcribe") == nil)
+        #expect(TranscriptionModel(rawValue: "gpt-transcribe") == nil)
+        #expect(AppSettings.storedTranscriptionModel("gpt-live-transcribe") == .geminiLive)
+        #expect(AppSettings.storedTranscriptionModel("gpt-transcribe") == .geminiLive)
+        // The oldest key value of all, and a build that has never stored one.
+        #expect(AppSettings.storedTranscriptionModel("gpt-realtime-whisper") == .geminiLive)
+        #expect(AppSettings.storedTranscriptionModel(nil) == .geminiLive)
+        // A choice that still exists is kept.
+        #expect(AppSettings.storedTranscriptionModel("stt-rt-v6") == .sonioxLive)
+        #expect(AppSettings.storedTranscriptionModel("gemini-3.5-transcribe-live") == .geminiLive)
     }
 }
 
@@ -1225,6 +1247,8 @@ import Testing
             == "wss://relay.example.com/whisper/v1/realtime?intent=transcription&provider=openai")
         #expect(ServiceRoute.relayRealtimeURL(baseURL: base, provider: .gemini).absoluteString
             == "wss://relay.example.com/whisper/v1/realtime?intent=transcription&provider=gemini")
+        #expect(ServiceRoute.relayRealtimeURL(baseURL: base, provider: .soniox).absoluteString
+            == "wss://relay.example.com/whisper/v1/realtime?intent=transcription&provider=soniox")
     }
 
     /// The deployed relay is published under a path prefix, so these are the exact
@@ -1287,7 +1311,7 @@ import Testing
         let logged = "route=\(route)"
         #expect(!logged.contains("relay_super-secret-token"))
         // Still has to be worth logging: provider and host are the facts that matter.
-        #expect(logged.contains("openai"))
+        #expect(logged.contains("gemini"))
         #expect(logged.contains("relay.example.com"))
     }
 
@@ -1582,6 +1606,68 @@ import Testing
         ) == .abandonTarget)
     }
 
+    @Test func aFieldThatLooksDifferentRightAfterOurKeystrokeIsReadAgain() {
+        // The measured case: one character typed, 33 ms later the field "is another".
+        #expect(DictationController.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: false,
+            hasLiveMutation: true,
+            keystrokeMayStillBeInFlight: true
+        ))
+        // Past the window the answer is taken at its word and typing stops as before.
+        #expect(!DictationController.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: false,
+            hasLiveMutation: true,
+            keystrokeMayStillBeInFlight: false
+        ))
+        // A match and a silence are not mismatches, and have their own handling.
+        #expect(!DictationController.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: true,
+            hasLiveMutation: true,
+            keystrokeMayStillBeInFlight: true
+        ))
+        #expect(!DictationController.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: nil,
+            hasLiveMutation: true,
+            keystrokeMayStillBeInFlight: true
+        ))
+        // Nothing typed yet: no keystroke of ours can be the cause.
+        #expect(!DictationController.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: false,
+            hasLiveMutation: false,
+            keystrokeMayStillBeInFlight: true
+        ))
+    }
+
+    @Test func anUncleanedFinalLosesStraySpacesAndKeepsItsPunctuation() {
+        func final(_ text: String) -> String {
+            DictationController.deliverableFinal(text, provider: .soniox)
+        }
+        // Soniox's final as it arrives, and the text live typing had already put down.
+        #expect(final("好了。 我们现在测试一下。") == "好了。我们现在测试一下。")
+        #expect(final("一 二 三") == "一二三")
+        // A space next to Latin text is not an artifact.
+        #expect(final("好了，我们用 Soniox 试一下。 OK 吗？") == "好了，我们用 Soniox 试一下。 OK 吗？")
+        #expect(final("version 1.10, ok") == "version 1.10, ok")
+        // The provider's punctuation is its decision, even directly after a CJK character.
+        #expect(final("报告.pdf 发你了") == "报告.pdf 发你了")
+        #expect(final("等等...") == "等等...")
+        // The default form, the one interims are typed under, still widens.
+        #expect(DictationController.normalizeCJKTypography("你好!") == "你好！")
+    }
+
+    /// Only Soniox's final is touched. Gemini SMART's is already clean and goes out
+    /// exactly as it arrived — a space it put between two Chinese words was meant — and
+    /// so does a final that is about to be handed to a cleanup pass.
+    @Test func everyOtherFinalIsDeliveredExactlyAsItArrived() {
+        let spaced = "姓名 电话 地址"
+        #expect(DictationController.deliverableFinal(spaced, provider: .gemini) == spaced)
+        #expect(DictationController.deliverableFinal(spaced, provider: .openAI) == spaced)
+        #expect(DictationController.deliverableFinal(spaced, provider: nil) == spaced)
+        #expect(DictationController.deliverableFinal(spaced, provider: .soniox) == "姓名电话地址")
+        let afterStop = "好了。 我们现在测试一下。"
+        #expect(DictationController.deliverableFinal(afterStop, provider: .gemini) == afterStop)
+    }
+
     @Test func finalSuffixTypingRefusesOnlyAContradictedField() {
         #expect(DictationController.finalAdditionMayType(
             originalFieldOwnershipProof: true
@@ -1594,6 +1680,43 @@ import Testing
         // here would send an accepted sentence to the clipboard instead.
         #expect(DictationController.finalAdditionMayType(
             originalFieldOwnershipProof: nil
+        ))
+    }
+
+    @Test func aDocumentAskedTooSoonAfterAKeystrokeIsAskedAgain() {
+        let posted: TimeInterval = 1_000
+        // The measured failure: the final arrived 9.8 ms after the last live keystroke
+        // and the document still had its caret one character back.
+        #expect(DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: posted,
+            nowUptime: posted + 0.0098
+        ))
+        #expect(DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: posted,
+            nowUptime: posted
+        ))
+        // Past the window the document's answer stands, so the wait is bounded. Posted at
+        // zero so the boundary is exact: (1000 + 0.3) - 1000 is 0.29999999999995 in
+        // floating point, which is still inside the window.
+        #expect(!DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: 0,
+            nowUptime: DictationController.liveKeystrokeSettleWindow
+        ))
+        // The slower providers: nothing is in flight 300–500 ms later, and nothing
+        // waits.
+        #expect(!DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: posted,
+            nowUptime: posted + 0.4
+        ))
+        // No live keystroke this utterance, so no keystroke to wait for.
+        #expect(!DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: nil,
+            nowUptime: posted
+        ))
+        // A reading from before the keystroke is not evidence about it.
+        #expect(!DictationController.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: posted,
+            nowUptime: posted - 1
         ))
     }
 

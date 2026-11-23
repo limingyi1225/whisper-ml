@@ -61,8 +61,9 @@ valid_model_list() {
 # EnvironmentFile is line-oriented. A carriage return is just as destructive as a
 # newline here: it leaves a visually plausible assignment whose value includes an
 # invisible byte. Keep this a function so the deploy decision tests execute the exact
-# guard used by the shipping script.
-valid_gemini_key_shape() {
+# guard used by the shipping script. It binds every credential this script writes into
+# that file, whichever provider issued it.
+valid_api_key_shape() {
   [ -n "$1" ] \
     && [ "${#1}" -le 512 ] \
     && [[ "$1" != *$'\n'* ]] \
@@ -446,10 +447,18 @@ fi
 GEMINI_DEPLOY_KEY="${GEMINI_API_KEY:-}"
 GEMINI_KEY_PROVENANCE=retained
 if [ -n "$GEMINI_DEPLOY_KEY" ]; then
-  if ! valid_gemini_key_shape "$GEMINI_DEPLOY_KEY"; then
+  if ! valid_api_key_shape "$GEMINI_DEPLOY_KEY"; then
     echo "!! GEMINI_API_KEY has an invalid shape" >&2
     exit 2
   fi
+fi
+# Optional, and written the same way into the same file, so it gets the same check — and
+# gets it here, before the lock and the backup: a bad value should fail the run, not a
+# deploy that then needs rolling back.
+SONIOX_DEPLOY_KEY="${SONIOX_API_KEY:-}"
+if [ -n "$SONIOX_DEPLOY_KEY" ] && ! valid_api_key_shape "$SONIOX_DEPLOY_KEY"; then
+  echo "!! SONIOX_API_KEY has an invalid shape" >&2
+  exit 2
 fi
 
 # One owner covers the whole mutable transaction, including verification and any
@@ -577,6 +586,37 @@ if [ -n "$GEMINI_DEPLOY_KEY" ]; then
   echo "    updated from this deploy's environment"
 else
   echo "    existing remote credential retained"
+fi
+
+# The Soniox route is optional: the relay starts without a key and answers that route
+# with "还没有配置 Soniox API Key". So unlike Gemini there is no retained credential to
+# verify before the backup, and a missing key is not an error — it is simply written when
+# a deploy supplies one and retained otherwise. Same channel as the Gemini key: stdin over
+# the locked SSH session, never argv, never echoed. The EnvironmentFile is part of the
+# backup, so a rollback also restores whatever key was there before.
+echo "==> provisioning Soniox credential (optional)"
+if [ -n "$SONIOX_DEPLOY_KEY" ]; then
+  printf '%s\n' "$SONIOX_DEPLOY_KEY" | remote_ssh "set -e
+    umask 077
+    IFS= read -r SONIOX_VALUE
+    test -n \"\$SONIOX_VALUE\"
+    sed -i '/^SONIOX_API_KEY=/d' $ENV_FILE
+    printf 'SONIOX_API_KEY=%s\n' \"\$SONIOX_VALUE\" >> $ENV_FILE"
+  echo "    updated from this deploy's environment"
+elif remote_ssh "grep -q '^SONIOX_API_KEY=.' $ENV_FILE"; then
+  echo "    existing remote credential retained"
+else
+  # Exit 1 is the remote `grep` saying there is no such line. Anything else is the
+  # transport or the lock (ssh 255, our lost-lease 74) and says nothing about the file:
+  # reporting that as "none configured" would print a reassuring line over a deploy
+  # that has just lost its connection.
+  SONIOX_KEY_STATUS=$?
+  if [ "$SONIOX_KEY_STATUS" -eq 1 ]; then
+    echo "    none configured — Soniox stays unavailable until a deploy sets SONIOX_API_KEY"
+  else
+    echo "!! could not determine whether a Soniox credential is configured (exit $SONIOX_KEY_STATUS)" >&2
+    false
+  fi
 fi
 
 echo "==> provisioning the reloadable allowlist"

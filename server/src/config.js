@@ -66,6 +66,22 @@ const DEFAULTS = Object.freeze({
   backpressureStallTimeoutMs: 60_000,
 });
 
+/// What the Soniox bridge runs on when nothing says otherwise, in one place: `loadConfig`
+/// applies these, and the bridge falls back to the same values when it is handed a config
+/// without them.
+export const SONIOX_DEFAULTS = Object.freeze({
+  // Soniox closes a connection that has not started a stream after 40 s of silence.
+  // Fifteen leaves two missed sends of margin.
+  prestartKeepaliveMs: 15_000,
+  languageHints: Object.freeze(["zh", "en"]),
+  languageHintsStrict: true,
+});
+/// The idle keepalive cannot be switched off or stretched past Soniox's 40 s limit: either
+/// one has Soniox close every idle socket, and each device then reconnects in a loop for
+/// as long as it is running. A value outside this range is pulled to the nearest end
+/// rather than refused, so a typo costs a slightly different interval and not the relay.
+const SONIOX_PRESTART_KEEPALIVE_RANGE_MS = Object.freeze({ min: 1_000, max: 30_000 });
+
 export { CLIENT_MAX_TURN_AUDIO_BYTES, CLIENT_MAX_TURN_WIRE_BYTES };
 
 function required(env, name) {
@@ -92,6 +108,16 @@ function nonNegativeInteger(env, name, fallback) {
     throw new Error(`${name} must be a non-negative integer`);
   }
   return value;
+}
+
+function clampedInteger(env, name, fallback, { min, max }) {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an integer`);
+  }
+  return Math.min(max, Math.max(min, value));
 }
 
 function audioBytesPerDay(env, name, fallbackSeconds) {
@@ -221,6 +247,24 @@ export function allowlistDigest(hashes) {
     .slice(0, 16);
 }
 
+/// `0`/`false`/`off`/`no` switch a default-on option off; anything else leaves it on, so
+/// a typo cannot silently disable something that was never asked to change.
+function enabledUnlessDisabled(env, name) {
+  const raw = env[name]?.trim().toLowerCase();
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
+/// ISO 639-1 codes for Soniox's `language_hints`, e.g. "zh,en".
+function languageHints(env, name, fallback) {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const hints = raw.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  if (hints.length === 0 || hints.some((hint) => !/^[a-z]{2,3}$/.test(hint))) {
+    throw new Error(`${name} must be a comma-separated list of language codes`);
+  }
+  return Object.freeze(hints);
+}
+
 function commaSeparatedSet(raw) {
   return new Set(
     raw
@@ -248,7 +292,7 @@ export function loadConfig(env = process.env) {
   });
   const allowedTranscriptionModels = commaSeparatedSet(
     env.ALLOWED_TRANSCRIPTION_MODELS
-    || "gemini-3.5-transcribe-live,gpt-live-transcribe,gpt-transcribe",
+    || "gemini-3.5-transcribe-live,stt-rt-v6",
   );
   // The public query chooses the provider before the session.update frame arrives.
   // Keep the deployment's single allowlist as the source of truth, but derive a
@@ -259,6 +303,9 @@ export function loadConfig(env = process.env) {
   );
   const allowedGeminiTranscriptionModels = new Set(
     [...allowedTranscriptionModels].filter((model) => model.startsWith("gemini-")),
+  );
+  const allowedSonioxTranscriptionModels = new Set(
+    [...allowedTranscriptionModels].filter((model) => model.startsWith("stt-rt-")),
   );
 
   return Object.freeze({
@@ -271,6 +318,10 @@ export function loadConfig(env = process.env) {
     basePath: normalizeBasePath(env.RELAY_BASE_PATH) || DEFAULTS.basePath,
     openAIAPIKey: required(env, "OPENAI_API_KEY"),
     geminiAPIKey: required(env, "GEMINI_API_KEY"),
+    // Optional, unlike the two above: a relay that was deployed before the Soniox
+    // route existed must keep starting. Without a key the route answers with a clear
+    // error instead of the relay refusing to boot.
+    sonioxAPIKey: env.SONIOX_API_KEY?.trim() || "",
     openAIRealtimeURL: endpointURL(
       env,
       "OPENAI_REALTIME_URL",
@@ -289,10 +340,29 @@ export function loadConfig(env = process.env) {
       "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
       ["wss:", "ws:"],
     ),
+    sonioxRealtimeURL: endpointURL(
+      env,
+      "SONIOX_REALTIME_URL",
+      "wss://stt-rt.soniox.com/transcribe-websocket",
+      ["wss:", "ws:"],
+    ),
+    sonioxLanguageHints: languageHints(
+      env,
+      "SONIOX_LANGUAGE_HINTS",
+      SONIOX_DEFAULTS.languageHints,
+    ),
+    sonioxLanguageHintsStrict: enabledUnlessDisabled(env, "SONIOX_LANGUAGE_HINTS_STRICT"),
+    sonioxPrestartKeepaliveMs: clampedInteger(
+      env,
+      "SONIOX_PRESTART_KEEPALIVE_MS",
+      SONIOX_DEFAULTS.prestartKeepaliveMs,
+      SONIOX_PRESTART_KEEPALIVE_RANGE_MS,
+    ),
     deviceTokenHashes,
     allowedTranscriptionModels,
     allowedOpenAITranscriptionModels,
     allowedGeminiTranscriptionModels,
+    allowedSonioxTranscriptionModels,
     allowedPolishModels: commaSeparatedSet(
       env.ALLOWED_POLISH_MODELS || "gpt-5.6-luna",
     ),

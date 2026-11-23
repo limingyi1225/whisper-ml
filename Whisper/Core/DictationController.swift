@@ -94,6 +94,8 @@ final class DictationController {
 
     /// What we have actually typed into the target app this utterance.
     @ObservationIgnored private var injectedText = ""
+    /// When live typing last posted a keystroke; see `liveKeystrokeMayStillBeInFlight`.
+    @ObservationIgnored private var lastLiveKeystrokeUptime: TimeInterval?
     /// Exact AX identity disappeared after this utterance had already typed something.
     /// Retrying then could resume in another same-app control, so live typing stays off
     /// until the authoritative final reconciles the text already emitted.
@@ -540,6 +542,59 @@ final class DictationController {
 
     static func liveInjectionRetryDeadline(afterProbeAt uptime: TimeInterval) -> TimeInterval {
         uptime + liveInjectionRetryInterval
+    }
+
+    /// How long a keystroke this app posted may still be on its way into the target.
+    static let liveKeystrokeSettleWindow: TimeInterval = 0.3
+    /// Each poll is three cross-process AX reads against the app being waited on, on the
+    /// thread that is trying to take the keystroke in. The shortest gap at which a proof
+    /// has been seen to pass is 30 ms, so asking more often than this only adds load.
+    private static let liveKeystrokeSettlePollInterval: TimeInterval = 0.025
+
+    /// Whether a document that disagrees with what we typed may simply not have caught
+    /// up yet.
+    ///
+    /// Posting a keystroke is not the target receiving it. Every ownership proof asks
+    /// the document where its caret is, and a document asked too soon answers with the
+    /// caret one keystroke behind — which reads exactly like a caret the user moved.
+    /// Measured (2026-11-22, Claude desktop, Soniox): 23 proofs in one sentence passed,
+    /// each at least 30 ms after the keystroke before it; the final arrived 9.8 ms after
+    /// the last one, its proof failed, and the closing five characters went to the
+    /// clipboard instead of the field. Nothing had moved: no click, no key, same app.
+    ///
+    /// The slower providers hid this, because their final takes 300–500 ms and no
+    /// keystroke is that young by then. Soniox finishes in under 100 ms.
+    ///
+    /// Inside the window a "no" is therefore not yet evidence, and the caller asks again
+    /// rather than acting on it. Outside it the answer stands.
+    static func liveKeystrokeMayStillBeInFlight(
+        postedAtUptime: TimeInterval?,
+        nowUptime: TimeInterval
+    ) -> Bool {
+        guard let postedAtUptime else { return false }
+        let age = nowUptime - postedAtUptime
+        return age >= 0 && age < liveKeystrokeSettleWindow
+    }
+
+    /// Whether a "that is not the field" answer should be asked again rather than obeyed.
+    ///
+    /// `focusedElementMatches` answering `false` normally ends live typing for the
+    /// sentence, and the final then goes to the clipboard. But an app rebuilds its
+    /// accessibility tree around text just typed into it, and for a moment the focused
+    /// element is a fresh proxy for the same field. Measured (2026-11-22, Claude
+    /// desktop): 33 ms after the first character went into an empty composer the answer
+    /// was `false`, with no click, no key and the same app in front — one character
+    /// typed, the other twenty-nine never were, and all thirty went to the clipboard.
+    ///
+    /// Only while a keystroke of ours can still be causing it. With nothing typed there
+    /// is no such cause and `focusMismatchMayDeferToFinalPaste` already covers that case;
+    /// past the window the answer is taken at its word, as before.
+    static func fieldIdentityMismatchMayBeUnsettled(
+        exactElementFocused: Bool?,
+        hasLiveMutation: Bool,
+        keystrokeMayStillBeInFlight: Bool
+    ) -> Bool {
+        exactElementFocused == false && hasLiveMutation && keystrokeMayStillBeInFlight
     }
 
     static func shouldConfirmStagedLiveInjectionTarget(
@@ -1011,6 +1066,7 @@ final class DictationController {
                     partialText = ""
                     accumulatedPartial = ""
                     injectedText = ""
+                    lastLiveKeystrokeUptime = nil
                     liveInjectionSuppressed = false
                     liveInjectionRetryNotBeforeUptime = nil
                     liveInjectionRecoveryAttempts = 0
@@ -1130,6 +1186,7 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        lastLiveKeystrokeUptime = nil
         liveInjectionSuppressed = false
         liveInjectionRetryNotBeforeUptime = nil
         liveInjectionRecoveryAttempts = 0
@@ -1316,11 +1373,11 @@ final class DictationController {
 
     /// Types whatever part of the utterance has stopped moving but is not yet on screen.
     ///
-    /// Both live models reach this now, by different routes. `gpt-live-transcribe`
-    /// accumulates append-only deltas, so its hypothesis only ever grows. Gemini's is a
-    /// revisable snapshot: measured against the live service, `好。` → `好,` → `好, 现在`
-    /// — it rewrites punctuation it already emitted, and SMART mode's whole job is to go
-    /// back and delete filler words and false starts.
+    /// Both models reach this with a revisable snapshot of the whole sentence. Gemini,
+    /// measured against the live service: `好。` → `好,` → `好, 现在` — it rewrites
+    /// punctuation it already emitted, and SMART mode's whole job is to go back and
+    /// delete filler words and false starts. Soniox never changes a token it has marked
+    /// final, but the tail behind those is replaced wholesale by every frame.
     ///
     /// Two rules make that stream typeable. Only the prefix two consecutive hypotheses
     /// agree on is typed, so most revisions land in text that was never on screen; and
@@ -1383,12 +1440,14 @@ final class DictationController {
         // that partial speech is typed into a different field in the same app.
         guard let injectionAnchor, let current = currentAnchor() else {
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "target_app_gone"])
             log.info("the frozen app disappeared; stopping injection")
             return
         }
         let anchorUnchanged = injectionAnchor == current
         guard anchorUnchanged else {
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "app_or_foreign_input_changed"])
             log.info("the frozen field moved or foreign input arrived; stopping injection")
             return
         }
@@ -1397,6 +1456,7 @@ final class DictationController {
             now: Self.currentLiveInjectionInputEpoch()
         ) else {
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "pointer_click_during_utterance"])
             log.info("a click landed during this utterance; stopping injection")
             return
         }
@@ -1481,6 +1541,7 @@ final class DictationController {
         // mutate afterwards. Re-check every queried path immediately before disposition.
         if performedBlockingAXQuery, injectionAnchor != currentAnchor() {
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "anchor_changed_during_identity_check"])
             log.info("the input anchor changed while checking field identity; stopping injection")
             return
         }
@@ -1495,7 +1556,22 @@ final class DictationController {
             // stale local anchor even if the foreground PID stayed the same.
             injectionAbandoned = true
             pendingLiveInjectionTarget = nil
+            trace("live_injection_abandoned", fields: ["reason": "input_counter_moved_during_identity_check"])
             log.info("hardware input arrived while checking field identity; stopping injection")
+            return
+        }
+        if Self.fieldIdentityMismatchMayBeUnsettled(
+            exactElementFocused: exactElementFocused,
+            hasLiveMutation: !injectedText.isEmpty,
+            keystrokeMayStillBeInFlight: Self.liveKeystrokeMayStillBeInFlight(
+                postedAtUptime: lastLiveKeystrokeUptime,
+                nowUptime: ProcessInfo.processInfo.systemUptime
+            )
+        ) {
+            // Nothing is typed in this turn and nothing is given up: the next interim
+            // reads the field again, and the final's own proofs still have to pass.
+            trace("partial_deferred", fields: ["reason": "field_identity_unsettled_after_keystroke"])
+            log.info("the field's identity has not settled after our keystroke; deferring this partial")
             return
         }
         if Self.focusMismatchMayDeferToFinalPaste(
@@ -1572,6 +1648,12 @@ final class DictationController {
             return
         case .abandonTarget:
             injectionAbandoned = true
+            // The two places that log this sentence used to be told apart only by
+            // elimination. This one is the field's identity, not the app or the input.
+            trace("live_injection_abandoned", fields: [
+                "reason": "field_identity_contradicted",
+                "exactElementFocused": exactElementFocused.map { String($0) } ?? "unknown"
+            ])
             log.info("the frozen field moved or foreign input arrived; stopping injection")
             return
         }
@@ -1581,7 +1663,20 @@ final class DictationController {
                 injectedText,
                 target: injectionTarget
            ) {
+            if Self.liveKeystrokeMayStillBeInFlight(
+                postedAtUptime: lastLiveKeystrokeUptime,
+                nowUptime: ProcessInfo.processInfo.systemUptime
+            ) {
+                // Two interims back to back: the document has not taken in the keystroke
+                // the first one posted. Abandoning here would send the whole rest of the
+                // sentence to the clipboard for a caret that is merely late. Nothing is
+                // typed in this turn; the next interim, or the final, asks again.
+                trace("partial_deferred", fields: ["reason": "previous_keystroke_in_flight"])
+                log.info("the previous live keystroke has not landed yet; deferring this partial")
+                return
+            }
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "ownership_proof_rejected"])
             log.info("the live insertion caret no longer owns its original range; stopping injection")
             return
         }
@@ -1591,6 +1686,7 @@ final class DictationController {
                   !Permissions.isSecureInputEnabled,
                   injectionAnchor.processIdentifier != nil else {
                 injectionAbandoned = true
+                trace("live_injection_abandoned", fields: ["reason": "revision_has_no_inspection_path"])
                 log.warning("interim revision has no safe text-inspection path; stopping live injection")
                 return
             }
@@ -1631,12 +1727,14 @@ final class DictationController {
             ), Permissions.hasAccessibility,
                !Permissions.isSecureInputEnabled else {
                 injectionAbandoned = true
+                trace("live_injection_abandoned", fields: ["reason": "interim_text_unproven_before_delete"])
                 log.warning("the document cannot prove the interim text before the caret; stopping live injection")
                 return
             }
             // Last, because the guard above can block inside its own autoclosure.
             guard destructiveWriteIsStillAuthorized(epochBeforeAXWork: epochBeforeAXWork) else {
                 injectionAbandoned = true
+                trace("live_injection_abandoned", fields: ["reason": "input_arrived_while_authorizing_delete"])
                 log.warning("input arrived while the interim delete was being authorized; stopping live injection")
                 return
             }
@@ -1652,11 +1750,13 @@ final class DictationController {
             // Revalidate the independent input counters after the last such query and
             // immediately before the append-only mutation.
             injectionAbandoned = true
+            trace("live_injection_abandoned", fields: ["reason": "input_counter_moved_during_range_proof"])
             log.info("hardware input arrived while proving the insertion range; stopping injection")
             return
         }
         if !addition.isEmpty { TextInjector.type(addition) }
         injectedText = stable
+        lastLiveKeystrokeUptime = ProcessInfo.processInfo.systemUptime
         trace("partial_posting_finished", texts: ["believedTyped": injectedText])
     }
 
@@ -1685,7 +1785,14 @@ final class DictationController {
     ///
     /// Both rules require a CJK neighbour, so Latin text keeps its ordinary spacing
     /// and its ASCII punctuation — `用 GPT 测试` keeps both of its spaces.
-    static func normalizeCJKTypography(_ text: String) -> String {
+    ///
+    /// With `widensPunctuation: false` only the space rule runs, and only before a CJK
+    /// character. That is the form an authoritative final gets: a stray space between
+    /// two CJK characters is an artifact, but its punctuation is the provider's
+    /// decision — widening there turned `报告.pdf` into `报告。pdf` and `等等...` into
+    /// `等等。。。` in the delivered text, where before the raw final had put the ASCII
+    /// form back.
+    static func normalizeCJKTypography(_ text: String, widensPunctuation: Bool = true) -> String {
         let characters = Array(text)
         var result = ""
         result.reserveCapacity(characters.count)
@@ -1695,11 +1802,12 @@ final class DictationController {
             if character == " ",
                let previous = result.last, Self.isCJK(previous),
                let next = characters[(index + 1)...].first(where: { $0 != " " }),
-               Self.isCJK(next) || Self.fullwidthPunctuation[next] != nil {
+               Self.isCJK(next) || (widensPunctuation && Self.fullwidthPunctuation[next] != nil) {
                 index += 1
                 continue
             }
-            if let fullwidth = Self.fullwidthPunctuation[character],
+            if widensPunctuation,
+               let fullwidth = Self.fullwidthPunctuation[character],
                let previous = result.last, Self.isCJK(previous) {
                 result.append(fullwidth)
                 index += 1
@@ -1755,10 +1863,13 @@ final class DictationController {
             }
         }
 
+        let routeIsUnpolished = utteranceRoute.map { !$0.provider.requiresSeparatePolish } ?? false
+        let delivered = Self.deliverableFinal(final, provider: utteranceRoute?.provider)
+
         // Someone is already speaking the next sentence: emit this one as-is rather
         // than spending another 1.5s on cleanup while they wait.
         if startWhenSettled {
-            finish(with: final.isEmpty ? nil : final)
+            finish(with: delivered.isEmpty ? nil : delivered)
             startDeferredIfPending()
             return
         }
@@ -1769,8 +1880,8 @@ final class DictationController {
             return
         }
 
-        if let route = utteranceRoute, !route.provider.requiresSeparatePolish {
-            finish(with: final, confirmsCleanup: true)
+        if routeIsUnpolished {
+            finish(with: delivered, confirmsCleanup: true)
             return
         }
 
@@ -1821,6 +1932,25 @@ final class DictationController {
             // wipe the notice off the pill in the same frame it went up.
             if let notice, !captureWasInterrupted { self.reportPolishFailure(notice) }
         }
+    }
+
+    /// The provider's final in the form it is delivered and reconciled against.
+    ///
+    /// A provider that delivers the sentence as spoken has no cleanup pass, inside the
+    /// turn or after it, so nothing else will bring its final into line with what live
+    /// typing put on screen — and live typing wrote it under `normalizeCJKTypography`.
+    /// Measured on Soniox (2026-11-22): its final kept a space after one `。` (not after
+    /// the next), the typed text had none, and a sentence that should have ended in a
+    /// four-character append became −24 +29 from that full stop, with the space bound
+    /// for the document as well. Spaces only — the final's punctuation is left as the
+    /// provider wrote it.
+    ///
+    /// Every other final is delivered untouched: Gemini SMART's is already clean, and a
+    /// route with its own cleanup pass hands that pass the raw text.
+    static func deliverableFinal(_ final: String, provider: TranscriptionProvider?) -> String {
+        provider?.finalIsUncleaned == true
+            ? normalizeCJKTypography(final, widensPunctuation: false)
+            : final
     }
 
     /// Holds the new dictation until the previous transcript lands, then starts it.
@@ -2044,6 +2174,7 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        lastLiveKeystrokeUptime = nil
         liveInjectionSuppressed = false
         liveInjectionRetryNotBeforeUptime = nil
         liveInjectionRecoveryAttempts = 0
@@ -2110,6 +2241,7 @@ final class DictationController {
             partialText = ""
             accumulatedPartial = ""
             injectedText = ""
+            lastLiveKeystrokeUptime = nil
             liveInjectionSuppressed = false
             liveInjectionRetryNotBeforeUptime = nil
             liveInjectionRecoveryAttempts = 0
@@ -2269,6 +2401,10 @@ final class DictationController {
             return
         }
 
+        // Every branch below asks the document to confirm what live typing put there.
+        // Let the last of it arrive first.
+        awaitLastLiveKeystroke(typed: typed)
+
         let shared = Self.commonPrefixLength(typed, final)
         let deleteCount = typed.count - shared
         let addition = String(Array(final)[shared...])
@@ -2406,6 +2542,60 @@ final class DictationController {
     }
 
 
+    /// Holds the final back until the target has taken in the last live keystroke, for
+    /// at most what is left of `liveKeystrokeSettleWindow`.
+    ///
+    /// Only where waiting can change the answer: a field that publishes a text range, a
+    /// keystroke young enough to be in flight, and a document that does not yet agree.
+    /// Every other sentence passes straight through, and a sentence that does wait was
+    /// headed for the clipboard without it.
+    ///
+    /// This blocks the main actor rather than yielding it. Yielding would let the next
+    /// partial, a key press or a reconnect run against an utterance that is half
+    /// finished; the AX reads this sits between already block for longer.
+    ///
+    /// It proves nothing by itself. When it returns, the caller's own proofs run exactly
+    /// as before and still refuse a field that does not agree.
+    private func awaitLastLiveKeystroke(typed: String) {
+        guard let target = injectionTarget, target.selection != nil,
+              Self.liveKeystrokeMayStillBeInFlight(
+                postedAtUptime: lastLiveKeystrokeUptime,
+                nowUptime: ProcessInfo.processInfo.systemUptime
+              ),
+              !TextInjector.matchesInjectedTextAtOriginalSelection(typed, target: target) else {
+            return
+        }
+        let startedUptime = ProcessInfo.processInfo.systemUptime
+        var landed = false
+        while Self.liveKeystrokeMayStillBeInFlight(
+            postedAtUptime: lastLiveKeystrokeUptime,
+            nowUptime: ProcessInfo.processInfo.systemUptime
+        ) {
+            Thread.sleep(forTimeInterval: Self.liveKeystrokeSettlePollInterval)
+            // Only the pointer counters can end the wait early. They are written by the
+            // WindowServer and can be read while this thread sleeps; the keyboard counter
+            // is no use, because our own keystroke is what is being waited for and it
+            // moves that counter. The anchor comparison is kept, but it cannot see an app
+            // switch or a foreign key from in here: the frontmost app and the tap's
+            // last-input time are both refreshed by the run loop this is blocking. The
+            // proofs the caller runs after the wait are what decide.
+            guard injectionAnchor == currentAnchor(),
+                  Self.pointerInputStayedUnchanged(
+                    since: injectionPointerEpoch,
+                    now: Self.currentLiveInjectionInputEpoch()
+                  ) else { break }
+            if TextInjector.matchesInjectedTextAtOriginalSelection(typed, target: target) {
+                landed = true
+                break
+            }
+        }
+        let waitedMs = Int(((ProcessInfo.processInfo.systemUptime - startedUptime) * 1000).rounded())
+        trace("final_settle_wait", fields: ["landed": String(landed), "waitedMs": String(waitedMs)])
+        // `notice`, so `log show` still has it hours later: this line is the measurement
+        // of whether the window is long enough.
+        log.notice("waited \(waitedMs) ms for the last live keystroke to land: \(landed)")
+    }
+
     /// The rule `finish` applies to a sentence that was never typed live: same app,
     /// and not this one. `TextInjector.paste` re-proves the app before it writes.
     static func untypedFinalMayPasteAtCaret(
@@ -2506,6 +2696,7 @@ final class DictationController {
         partialText = ""
         accumulatedPartial = ""
         injectedText = ""
+        lastLiveKeystrokeUptime = nil
         liveInjectionSuppressed = false
         liveInjectionRetryNotBeforeUptime = nil
         liveInjectionRecoveryAttempts = 0

@@ -461,16 +461,16 @@ public final class RealtimeClient {
         case replaceSession
     }
 
-    /// Gemini finals do not identify the turn they belong to. Once any audio has
-    /// reached that provider, only a fresh session can prove that a late completion
-    /// is not from the cancelled sentence. Reconnect locally and immediately instead
-    /// of waiting for Relay to close the socket after a clear. OpenAI events do carry
-    /// item ids, so a known turn can still be retired in place.
+    /// Gemini and Soniox finals do not identify the turn they belong to. Once any
+    /// audio has reached such a provider, only a fresh session can prove that a late
+    /// completion is not from the cancelled sentence. Reconnect locally and immediately
+    /// instead of waiting for Relay to close the socket after a clear. OpenAI events do
+    /// carry item ids, so a known turn can still be retired in place.
     static func cancellationStrategy(
         provider: TranscriptionProvider,
         hasKnownItemID: Bool
     ) -> CancellationStrategy {
-        if provider == .gemini { return .replaceSession }
+        guard provider.identifiesTurnsItself else { return .replaceSession }
         return hasKnownItemID ? .clearCurrentTurn : .replaceSession
     }
 
@@ -480,18 +480,19 @@ public final class RealtimeClient {
         case replaceSession
     }
 
-    /// A Gemini `item_id` is synthesized by Relay for client correlation; it does not
-    /// prove that Google's activity ended. If its final never arrives, retiring that id
-    /// only locally leaves Relay's turn open and makes the next activity boundary tear
-    /// down the socket. Replace and preheat the session immediately instead. OpenAI's
-    /// authoritative item ids still allow a known turn to be retired in place.
+    /// A Gemini or Soniox `item_id` is synthesized by Relay for client correlation; it
+    /// does not prove that the provider's turn ended. If its final never arrives,
+    /// retiring that id only locally leaves Relay's turn open and makes the next turn
+    /// boundary tear down the socket. Replace and preheat the session immediately
+    /// instead. OpenAI's authoritative item ids still allow a known turn to be retired
+    /// in place.
     static func responseTimeoutStrategy(
         provider: TranscriptionProvider,
         commitPending: Bool,
         hasKnownItemID: Bool
     ) -> ResponseTimeoutStrategy {
         if commitPending { return .discardPendingCommit }
-        if provider == .openAI, hasKnownItemID { return .retireCurrentTurn }
+        if provider.identifiesTurnsItself, hasKnownItemID { return .retireCurrentTurn }
         return .replaceSession
     }
 
@@ -516,24 +517,10 @@ public final class RealtimeClient {
         )
         var transcription: [String: Any] = ["model": model.rawValue]
 
-        // `delay` controls how much audio the model hears before committing to words.
-        // Time-to-first-word measured on gpt-realtime-whisper, the model this
-        // replaced: minimal 737ms, low 811ms, medium 1250ms, high 1937ms — the shape
-        // of the tradeoff carries over, the numbers themselves want re-measuring on
-        // gpt-live-transcribe before the settings pane quotes them. It only exists on
-        // the streaming model; the other rejects it, and eating that round trip on
-        // every connect just delays the first sentence.
-        if model.supportsTranscriptionDelay {
-            transcription["delay"] = settings.transcriptionDelay.rawValue
-        }
         // The vocabulary, biasing recognition itself rather than repairing it after.
-        // Both current models accept this; gpt-realtime-whisper had no such slot, which
-        // is why the list used to reach only the cleanup pass. Repairing after the fact
-        // works, but it costs a visible flash — measured on "我叫李铭一", the raw
-        // transcript says 李明一, so live typing puts the wrong name on screen and
-        // `reconcile` corrects it ~0.9s later — and it fails outright whenever cleanup
-        // is switched off or times out, since every TranscriptPolisher failure path
-        // returns the raw text unchanged.
+        // The relay hands the same list to each provider in its own form: Gemini's
+        // `customVocabulary`, Soniox's `context.terms`. Without it a name is typed wrong
+        // first — measured on "我叫李铭一", the unbiased transcript says 李明一.
         //
         // Empty lists are not sent at all: an empty array is a different request from
         // an absent field, and there is nothing to bias towards.
@@ -541,15 +528,10 @@ public final class RealtimeClient {
         if !keywords.isEmpty {
             transcription["keywords"] = keywords
         }
-        // Language is deliberately not sent: the speech here is mixed zh/en and
-        // auto-detection handles that better than pinning one language. `languages`
-        // now takes a list, so ["zh", "en"] is no longer the same bet as pinning one —
-        // an open question, and `script/ab_transcribe.mjs` has an arm for it.
-        //
-        // `prompt` is not sent. Both current models accept it, but using it as an
-        // instruction channel measurably degraded transcription accuracy on the gpt-4o
-        // models (backend→button, Kevin→Kelvin on identical audio). Cleanup belongs in
-        // a separate text pass, see TranscriptPolisher.
+        // Nothing else rides in this frame. Language is the relay's to decide per
+        // provider, and there is no instruction channel: used as one, `prompt`
+        // measurably degraded transcription accuracy on the OpenAI models this frame
+        // was first shaped for (backend→button, Kevin→Kelvin on identical audio).
         for field in unsupportedFields { transcription.removeValue(forKey: field) }
 
         send([

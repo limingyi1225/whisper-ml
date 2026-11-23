@@ -1,10 +1,10 @@
 import DictationKit
 import Foundation
 
-// TranscriptionModel and TranscriptionDelay live in DictationKit, because
-// ServiceRoute and RealtimeClient are the code that acts on them. What stays here is everything the package has no business holding:
-// the display copy, which is localised, and Identifiable, which exists for
-// SwiftUI.
+// TranscriptionModel lives in DictationKit, because ServiceRoute and RealtimeClient
+// are the code that acts on it. What stays here is everything the package has no
+// business holding: the display copy, which is localised, and Identifiable, which
+// exists for SwiftUI.
 
 enum TriggerKey: String, CaseIterable, Identifiable {
     case rightCommand, leftCommand, rightOption, leftOption
@@ -60,23 +60,7 @@ extension TranscriptionModel: @retroactive Identifiable {
     var displayName: String {
         switch self {
         case .geminiLive: "Gemini 3.5 Transcribe Live"
-        case .liveTranscribe: "OpenAI Live（备用）"
-        case .transcribe: "OpenAI Transcribe（备用）"
-        }
-    }
-}
-
-extension TranscriptionDelay: @retroactive Identifiable {
-    public var id: String { rawValue }
-
-    /// Measured time from audio start to the first delta on this machine's connection.
-    var displayName: String {
-        switch self {
-        case .minimal: return "最短 · 首字约 0.7 秒"
-        case .low: return "短 · 首字约 0.8 秒"
-        case .medium: return "中 · 首字约 1.3 秒"
-        case .high: return "长 · 首字约 1.9 秒"
-        case .xhigh: return "最长"
+        case .sonioxLive: "Soniox v6"
         }
     }
 }
@@ -89,16 +73,19 @@ final class AppSettings: DictationSettingsProviding {
     private let store = UserDefaults.standard
 
     var triggerKey: TriggerKey { didSet { store.set(triggerKey.rawValue, forKey: Key.triggerKey) } }
+    /// No remaining model reads this and nothing in the UI sets it. It stays because
+    /// `DictationSettingsProviding` still requires it, and goes when the OpenAI route is
+    /// removed from DictationKit in a follow-up.
     var transcriptionDelay: TranscriptionDelay { didSet { store.set(transcriptionDelay.rawValue, forKey: Key.transcriptionDelay) } }
     var transcriptionModel: TranscriptionModel { didSet { store.set(transcriptionModel.rawValue, forKey: Key.transcriptionModel) } }
 
     /// There is no separate "output mode" choice: picking the model already decides
-    /// this. A streaming model types as you speak; the others cannot return a word
-    /// before you let go, so they paste once at the end.
+    /// this. Both current models stream, so both type as you speak; a model that could
+    /// not return a word before you let go would paste once at the end.
     var typesWhileSpeaking: Bool { transcriptionModel.supportsLiveTyping }
-    /// Legacy preference retained so older installed builds and Wink can still read
-    /// their previous setting. The current Whisper UI keeps cleanup on permanently:
-    /// Gemini does it in SMART mode and OpenAI fallback uses TranscriptPolisher.
+    /// Legacy preference. Nothing in Whisper reads it and there is no switch for it:
+    /// Gemini cleans up inside its SMART turn and Soniox is delivered as spoken. The
+    /// stored value is kept for now and goes with the OpenAI route in a follow-up.
     var polishEnabled: Bool { didSet { store.set(polishEnabled, forKey: Key.polishEnabled) } }
     /// Drop the full stop the models like to end every utterance with. Done in code
     /// rather than by prompting: the realtime transcriber adds one too, so a prompt
@@ -114,10 +101,10 @@ final class AppSettings: DictationSettingsProviding {
     /// This box is the whole list — nothing rides behind it, and the app never writes
     /// into it on its own initiative. Biasing is not free: `customVocabulary` raises a
     /// term's prior, so a noisy or clipped stretch of audio that merely sounds close
-    /// gets pulled onto it, and neither Gemini nor OpenAI exposes a strength knob to
-    /// soften that. Only a term the user typed is worth that cost, and only a term they
-    /// can see is one they can delete once it starts firing on words nobody said. An
-    /// empty box biases nothing.
+    /// gets pulled onto it, and Gemini exposes no strength knob to soften that. Only a
+    /// term the user typed is worth that cost, and only a term they can see is one they
+    /// can delete once it starts firing on words nobody said. An empty box biases
+    /// nothing.
     var vocabulary: String { didSet { store.set(vocabulary, forKey: Key.vocabulary) } }
 
     /// The vocabulary as the transcription session and the cleanup pass see it.
@@ -170,21 +157,32 @@ final class AppSettings: DictationSettingsProviding {
         static let vocabulary = "vocabulary"
     }
 
+    /// What a stored model name means today. A name this build does not know — one from
+    /// a newer build, or one of the removed OpenAI models — is Gemini, not an error.
+    static func storedTranscriptionModel(_ raw: String?) -> TranscriptionModel {
+        raw.flatMap(TranscriptionModel.init(rawValue:)) ?? .geminiLive
+    }
+
     private init() {
         let trigger = store.string(forKey: Key.triggerKey)
         triggerKey = trigger.flatMap(TriggerKey.init(rawValue:)) ?? .rightCommand
         let delay = store.string(forKey: Key.transcriptionDelay)
         transcriptionDelay = delay.flatMap(TranscriptionDelay.init(rawValue:)) ?? .low
-        let model = store.string(forKey: Key.transcriptionModel)
-        transcriptionModel = model.flatMap(TranscriptionModel.init(rawValue:)) ?? .geminiLive
+        transcriptionModel = Self.storedTranscriptionModel(
+            store.string(forKey: Key.transcriptionModel)
+        )
         polishEnabled = store.object(forKey: Key.polishEnabled) as? Bool ?? true
         stripTrailingPeriod = store.bool(forKey: Key.stripTrailingPeriod)
         vocabulary = store.string(forKey: Key.vocabulary) ?? ""
         adoptGeminiDefaultIfNeeded()
     }
 
-    /// One intentional migration: an existing install moves to Gemini once, but
-    /// selecting an OpenAI fallback afterwards remains sticky on every later launch.
+    /// One intentional migration: an existing install moves to Gemini once; whatever
+    /// model is chosen afterwards remains sticky on every later launch.
+    ///
+    /// The OpenAI models that could once be chosen here are gone. A stored
+    /// `gpt-live-transcribe` or `gpt-transcribe` no longer parses, so `init` has already
+    /// resolved it to Gemini before this runs — see `storedTranscriptionModel`.
     private func adoptGeminiDefaultIfNeeded() {
         guard !store.bool(forKey: Key.adoptedGeminiDefault) else { return }
         transcriptionModel = .geminiLive

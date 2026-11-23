@@ -27,6 +27,11 @@ const baseConfig = loadConfig({
   OPENAI_API_KEY: "server-only-openai-key",
   GEMINI_API_KEY: "server-only-gemini-key",
   RELAY_DEVICE_TOKEN_HASHES: tokenDigest(token),
+  // No shipped default allowlists an OpenAI model any more — no app build can select
+  // one — but the OpenAI bridge is still shipped code, and most of this file exercises
+  // it. It opts in explicitly, the way a deployment wanting that route would have to.
+  ALLOWED_TRANSCRIPTION_MODELS:
+    "gemini-3.5-transcribe-live,stt-rt-v6,gpt-live-transcribe,gpt-transcribe",
 });
 
 function listen(server) {

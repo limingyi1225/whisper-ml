@@ -80,7 +80,7 @@ public struct ServiceRoute: CustomStringConvertible {
     public let credential: String
 
     public init(
-        transcriptionModel: TranscriptionModel = .liveTranscribe,
+        transcriptionModel: TranscriptionModel = .geminiLive,
         realtimeURL: URL,
         polishURL: URL,
         credential: String
